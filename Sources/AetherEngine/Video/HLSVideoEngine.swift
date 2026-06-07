@@ -304,7 +304,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// parallel.
     private let restartLock = NSLock()
 
-    /// A2 read-ahead gate state: the explicit-seek epoch + pending target used
+    /// Read-ahead gate state: the explicit-seek epoch + pending target used
     /// to suppress the stale clock during an async `AVPlayer.seek`. Guarded by
     /// `seekStateLock` so `beginSeek` (MainActor), `updatePlayhead` (periodic
     /// clock) and `resolveSeek` (seek completion) are safe regardless of thread.
@@ -325,7 +325,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private let hdr10PlusLock = NSLock()
 
     /// Fires if the CURRENT producer aborts mid-session under sustained memory
-    /// pressure (A1 escalation). AetherEngine wires this to do a session-scoped
+    /// pressure (escalation). AetherEngine wires this to do a session-scoped
     /// orderly teardown + surface `.error` rather than risk a jetsam kill. The
     /// call site in `makeProducer` already guards producer-currentness, so a
     /// stale/leaked producer's abort never reaches here.
@@ -1054,7 +1054,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         public let segmentCacheBytes: Int
         public let producerPacketsWritten: Int
         public let avioBytesFetched: Int64
-        /// DIAGNOSTIC (leak hunt): bytes the AVIO reader currently HOLDS in its
+        /// DIAGNOSTIC: bytes the AVIO reader currently HOLDS in its
         /// buffers (vs lifetime `avioBytesFetched`). Small + flat ⇒ the network
         /// reader is not the anonymous-memory retainer.
         public let avioHeldBytes: Int
@@ -1182,7 +1182,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prov.extendVisibleWindow(toCover: idx)
     }
 
-    // MARK: - A2 read-ahead gate playhead (clock + explicit-seek driven)
+    // MARK: - Read-ahead gate playhead (clock + explicit-seek driven)
 
     /// Register an explicit (transport-bar) seek with the read-ahead gate.
     /// Bumps the epoch, snaps the playhead to the target (so the producer can
@@ -1655,7 +1655,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         let restartStart = DispatchTime.now()
 
-        // DIAGNOSTIC (leak hunt): memory + AVIO-held snapshot at each restart so
+        // DIAGNOSTIC: memory + AVIO-held snapshot at each restart so
         // successive fast-forwards reveal whether resident/anonymous memory steps
         // up per restart, and whether the AVIO reader is the retainer.
         EngineLog.emit(
@@ -2518,6 +2518,17 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     ///     the segment-server side.
     private static let forwardWaitWindow = 8
 
+    /// Backward audio-handover lead-in: on an out-of-range restart, start the
+    /// producer this many segments BEFORE the requested index so AVPlayer's
+    /// backward gapless-audio refetch hits cache instead of triggering a restart
+    /// storm (see the restart site in the provider). Must be ≤ `forwardWaitWindow`
+    /// so AVPlayer's wait for the requested index stays inside the forward window
+    /// while the producer fills up to it (no forward re-restart). Trade-off: a
+    /// larger value covers a deeper handover but adds seek latency (the producer
+    /// fills the lead-in before reaching the target). Device-tune: lower if seeks
+    /// feel sluggish, raise if a residual storm remains.
+    private static let restartBackwardLeadIn = 8
+
     // MARK: - Sliding-window EVENT playlist state
 
     /// Segments visible in /media.m3u8 are `[0, visibleHighWater]`.
@@ -2827,12 +2838,26 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         }
 
         if needsRestart, let restart = restartHandler {
+            // Backward audio-handover lead-in (fixes the restart STORM). After a
+            // forward seek AVPlayer refetches several segments BACKWARD from the
+            // target for gapless audio. A forward-only producer restarted exactly
+            // at `index` leaves those below the fresh cache range, so each backward
+            // refetch triggers ANOTHER restart that clears the cache — a storm
+            // that walks the index down and strands AVPlayer in "loading"
+            // (observed 520→510). Start the producer `restartBackwardLeadIn`
+            // segments earlier so the handover hits cache. leadIn ≤ forwardWaitWindow
+            // so AVPlayer's wait for `index` stays inside the forward window (it
+            // does NOT trigger a forward re-restart while the producer fills up to
+            // `index`). `lastRestartIndex` is set to the lead-in base so the
+            // stale/cold-start heuristics above stay consistent with where the
+            // producer actually starts.
+            let restartBase = max(0, index - Self.restartBackwardLeadIn)
             EngineLog.emit(
-                "[HLSVideoEngine] seg\(index): out-of-range fetch (cache.range=\(range.map { "\($0.0)..\($0.1)" } ?? "empty") highWater=\(highWater)), restarting producer",
+                "[HLSVideoEngine] seg\(index): out-of-range fetch (cache.range=\(range.map { "\($0.0)..\($0.1)" } ?? "empty") highWater=\(highWater)), restarting producer at \(restartBase) (leadIn=\(index - restartBase))",
                 category: .session
             )
-            lastRestartIndex = index
-            restart(index)
+            lastRestartIndex = restartBase
+            restart(restartBase)
             // Reset cache's high-water AFTER `restart(index)` returns.
             // restart() is synchronous: it calls `old.stop()` then
             // `waitForFinish` so the old producer has fully exited

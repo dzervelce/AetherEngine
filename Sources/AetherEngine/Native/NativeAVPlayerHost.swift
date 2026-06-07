@@ -557,7 +557,7 @@ final class NativeAVPlayerHost {
     }
 
     /// Transport-bar seek variant that reports completion + the ACTUAL landed
-    /// playlist time, so `HLSVideoEngine`'s A2 read-ahead gate can resolve its
+    /// playlist time, so `HLSVideoEngine`'s read-ahead gate can resolve its
     /// pending-seek epoch precisely (`AVPlayer.seek` is async and the periodic
     /// clock mirror lags). The plain `seek(to:)` above is kept for startup /
     /// reload callers that don't drive the gate. The completion fires on the

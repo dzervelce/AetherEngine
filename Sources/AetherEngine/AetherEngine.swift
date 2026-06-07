@@ -1270,7 +1270,7 @@ public final class AetherEngine: ObservableObject {
                 self.nativeClockSeconds = value
                 self.currentTime = value + self.playlistShiftSeconds
                 self.sourceTime = self.currentTime
-                // A2: feed the producer's read-ahead gate the REAL playback
+                // feed the producer's read-ahead gate the REAL playback
                 // position. `value` is the raw 0-based AVPlayer/playlist clock —
                 // the same space as the segment plan's startSeconds — so it maps
                 // directly (do NOT add playlistShiftSeconds here).
@@ -1706,7 +1706,7 @@ public final class AetherEngine: ObservableObject {
             // yet — AVPlayer either fails the seek or stalls until the
             // playlist's periodic refresh catches up.
             //
-            // A2: register the explicit seek with the read-ahead gate
+            // register the explicit seek with the read-ahead gate
             // (epoch + pending-seek snap) and thread the epoch through the
             // seek completion so the gate resolves precisely. Only create
             // pending state when a host exists to drive the completion.

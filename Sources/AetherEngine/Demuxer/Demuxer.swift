@@ -66,7 +66,7 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.cumulativeBytesFetched ?? 0
     }
 
-    /// DIAGNOSTIC (leak hunt): bytes the AVIO reader currently holds in its own
+    /// DIAGNOSTIC: bytes the AVIO reader currently holds in its own
     /// buffers (vs lifetime fetched). Surfaced through DiagnosticStats so the
     /// memprobe can show whether the network reader is the anonymous-memory
     /// retainer. Zero for `file://` / custom sources.

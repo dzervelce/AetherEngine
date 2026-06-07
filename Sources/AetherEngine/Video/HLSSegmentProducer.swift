@@ -242,12 +242,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var loggedFirstDtsDrop = false
     private var loggedFirstAudioDtsBump = false
 
-    /// DIAGNOSTIC (Defect B): how many source audio packets have been fed to the
+    /// DIAGNOSTIC: how many source audio packets have been fed to the
     /// bridge, and whether the first TrueHD/MLP major-sync header has been seen.
     /// Used to learn at which packet the decoder can first sync (the ~N-frame
     /// "Stream parameters not seen" gap).
     private var bridgeAudioPktCount = 0
     private var loggedFirstAudioMajorSync = false
+
+    /// TrueHD/MLP major-sync feed gate. Until the first major-sync
+    /// packet is seen, pre-sync packets are DISCARDED instead of fed to the
+    /// decoder (which would just emit "Stream parameters not seen" and produce
+    /// nothing). Bounded by a safety cap so a source whose signature we can't
+    /// spot still gets audio. Only active when `bridge.needsMajorSyncGate`.
+    private var bridgeMajorSyncSeen = false
+    private var bridgeMajorSyncSkipped = 0
+    private static let bridgeMajorSyncSkipCap = 256
 
     /// Scan-forward + dynamic-shift state. The static `restart*Target`
     /// fields are seeded from `plan[baseIndex]` for restart sessions
@@ -343,7 +352,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// the old buffer 200 MB on its own.
     private static let bufferAheadSegments = 10
 
-    /// A2 read-ahead gate: how many segments the producer may run ahead of the
+    /// Read-ahead gate: how many segments the producer may run ahead of the
     /// REAL playhead (clock), independent of how far AVPlayer has *requested*.
     /// Bounds the producer↔player race that the request-driven `bufferAhead`
     /// alone can't (a thrashing/seeking player walks `currentTargetIndex`
@@ -351,7 +360,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// normal prefetch so it never starves.
     private static let playheadWindowSegments = 12
 
-    /// A1 footprint-pressure backstop (the hard memory bound). Park the pump
+    /// Footprint-pressure backstop (the hard memory bound). Park the pump
     /// when the process's footprint nears the tvOS jetsam limit; resume when it
     /// eases (see `runPumpLoop`). Values for a 4 GB Apple TV 4K (~2 GB per-app
     /// limit). AVPlayer's decode buffers live in a separate process
@@ -368,7 +377,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var parked = false
 
     /// Current process physical footprint in MB (the tvOS jetsam metric), via
-    /// `task_vm_info.phys_footprint`. Cheap; A1 polls it at the slice cadence.
+    /// `task_vm_info.phys_footprint`. Cheap; the backstop polls it at the slice cadence.
     /// Returns nil if the mach call fails (caller treats nil as "no pressure").
     static func physFootprintMB() -> Int? {
         var info = task_vm_info_data_t()
@@ -384,9 +393,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return Int(info.phys_footprint / 1024 / 1024)
     }
 
-    /// DIAGNOSTIC (leak hunt): one-line full memory snapshot (jetsam bucket
+    /// DIAGNOSTIC: one-line full memory snapshot (jetsam bucket
     /// breakdown + malloc-zone in-use). Logged at producer restart and around
-    /// every A1 park so we can SEE which bucket holds memory and whether
+    /// every footprint park so we can SEE which bucket holds memory and whether
     /// pausing production reclaims it. Nonisolated; cheap; safe off-main.
     static func memSnapshotLine() -> String {
         var line = ""
@@ -494,7 +503,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     var onVideoShiftKnown: (@Sendable (Int64) -> Void)?
 
     /// Fires at most once if the pump aborts under sustained memory pressure
-    /// (A1 escalation — footprint stayed at/over the high-water mark past the
+    /// (escalation — footprint stayed at/over the high-water mark past the
     /// escalation budget). The pump exits right after firing. `HLSVideoEngine`
     /// sets this and, generation+session-scoped, performs an orderly teardown
     /// and surfaces an `.error` rather than risking a jetsam kill. Mirrors the
@@ -649,7 +658,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             if cache.awaitFetchHighWater(reaching: backpressureTarget, timeout: 1.0) { break }
         }
         if checkShouldStop() { return nil }
-        // A2 read-ahead gate: also cap distance ahead of the REAL playhead
+        // Read-ahead gate: also cap distance ahead of the REAL playhead
         // (clock), which the request-driven fetch-high-water above can't bound
         // when AVPlayer thrash/seek-fetches far ahead. `floor: baseIndex` lets a
         // freshly (re)started producer emit its startup burst without waiting on
@@ -730,7 +739,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             if cache.awaitFetchHighWater(reaching: backpressureTarget, timeout: 1.0) { break }
         }
         if checkShouldStop() { return nil }
-        // A2 read-ahead gate (see allocateMuxer): cap distance ahead of the
+        // Read-ahead gate (see allocateMuxer): cap distance ahead of the
         // real playhead, floored at baseIndex for deadlock-free startup bursts.
         while !checkShouldStop() {
             if cache.awaitPlayheadWithin(produced: newIdx, floor: baseIndex, window: Self.playheadWindowSegments, timeout: 1.0) { break }
@@ -828,7 +837,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     // MARK: - Pump
 
-    /// A1 footprint-pressure backstop. Blocks (cancel-aware) while the process
+    /// Footprint-pressure backstop. Blocks (cancel-aware) while the process
     /// footprint is over the high-water mark, with hysteresis so it doesn't
     /// flap, a bounded "eased below HIGH → resume" path so it never stalls
     /// forever, and a definite escalation (clean abort via `onFatalError`) if
@@ -920,7 +929,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 stateLock.unlock()
                 if stopRequested { break readLoop }
 
-                // A1 backstop: throttle the whole pump (read + mux) while the
+                // Footprint backstop: throttle the whole pump (read + mux) while the
                 // process footprint is over the high-water mark so it can't run
                 // resident memory into a jetsam kill. Returns false if the pump
                 // must exit — stop requested mid-park, or sustained pressure
@@ -1450,13 +1459,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // video.
                 if let audio = audioConfig, pktStreamIdx == audio.sourceStreamIndex {
                     if let bridge = audio.bridge {
-                        // DIAGNOSTIC (Defect B): scan the first ~100 source audio
-                        // packets for the TrueHD/MLP major-sync word (0xF8726FBA,
-                        // near the access-unit start). Logs the first 12 packets +
-                        // the first one carrying a major sync, so we learn at which
-                        // packet the decoder can first sync — the cause of the
-                        // ~N-frame "Stream parameters not seen" startup gap.
-                        if bridgeAudioPktCount < 100 {
+                        // TrueHD/MLP major-sync handling. The decoder
+                        // can't report stream parameters until it sees a major-sync
+                        // header (0xF8726FBA near the access-unit start); some
+                        // sources don't carry one until ~97 frames in at
+                        // head-of-stream, flooding "Stream parameters not seen" and
+                        // wasting decodes. Scan once, log the first few + the first
+                        // sync (diagnostic), and — for TrueHD/MLP ONLY — DISCARD
+                        // pre-sync packets instead of feeding them (bounded by a
+                        // safety cap so a source we can't fingerprint still plays).
+                        let needGate = bridge.needsMajorSyncGate && !bridgeMajorSyncSeen
+                        if bridgeAudioPktCount < 100 || needGate {
                             let sz = Int(packet.pointee.size)
                             var hasMajorSync = false
                             if let d = packet.pointee.data, sz >= 8 {
@@ -1477,7 +1490,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                     category: .session
                                 )
                             }
-                            if bridgeAudioPktCount < 12 || hasMajorSync {
+                            if bridgeAudioPktCount < 12 {
                                 EngineLog.emit(
                                     "[HLSSegmentProducer] audio pkt#\(bridgeAudioPktCount) dts=\(packet.pointee.dts) "
                                     + "size=\(sz) key=\((packet.pointee.flags & 0x0001) != 0) majorSync=\(hasMajorSync)",
@@ -1485,6 +1498,30 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 )
                             }
                             bridgeAudioPktCount += 1
+
+                            // Gate: skip pre-major-sync packets (TrueHD/MLP only).
+                            if needGate {
+                                if hasMajorSync {
+                                    bridgeMajorSyncSeen = true
+                                    EngineLog.emit(
+                                        "[HLSSegmentProducer] audio bridge: major-sync reached after skipping "
+                                        + "\(bridgeMajorSyncSkipped) pre-sync pkt(s); feeding from here",
+                                        category: .session
+                                    )
+                                } else {
+                                    bridgeMajorSyncSkipped += 1
+                                    if bridgeMajorSyncSkipped >= Self.bridgeMajorSyncSkipCap {
+                                        bridgeMajorSyncSeen = true   // safety: stop skipping, feed normally
+                                        EngineLog.emit(
+                                            "[HLSSegmentProducer] audio bridge: no major-sync in "
+                                            + "\(bridgeMajorSyncSkipped) pkts; feeding ungated (safety cap)",
+                                            category: .session
+                                        )
+                                    } else {
+                                        continue   // discard this pre-sync packet (freed by defer)
+                                    }
+                                }
+                            }
                         }
                         let flacPackets: [UnsafeMutablePointer<AVPacket>]
                         do {

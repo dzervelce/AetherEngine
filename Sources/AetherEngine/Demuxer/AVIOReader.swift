@@ -147,7 +147,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         counterLock.unlock()
     }
 
-    /// DIAGNOSTIC (leak hunt): bytes this reader is CURRENTLY holding in its
+    /// DIAGNOSTIC: bytes this reader is CURRENTLY holding in its
     /// Swift `Data` buffers — distinct from `cumulativeBytesFetched` (lifetime).
     /// Sums the persistent-mode sliding `window`, the random-access
     /// `currentBuffer`/`prefetchBuffer`, and the `streamBuffer`. Each is read

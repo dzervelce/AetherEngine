@@ -136,6 +136,12 @@ final class AudioBridge: @unchecked Sendable {
     private let mode: Mode
     private var resampledFrame: UnsafeMutablePointer<AVFrame>?
 
+    /// True only for TrueHD/MLP sources, whose decoder needs a major-sync header
+    /// before it can produce frames. The producer reads this to skip feeding
+    /// pre-major-sync packets at head-of-stream (avoids the "Stream parameters
+    /// not seen" flood + wasted decodes). Set in `init` from the source codec.
+    private(set) var needsMajorSyncGate = false
+
     /// PTS counter for the encoder, in encoder time base. Incremented
     /// by `nb_samples` per encoded frame. FLAC encoder demands
     /// monotonically increasing PTS in 1/sample_rate units.
@@ -195,6 +201,14 @@ final class AudioBridge: @unchecked Sendable {
         default:
             isLosslessSource = false
         }
+        // TrueHD/MLP decoders need a "major sync" header before they can report
+        // stream parameters; until then they emit "Stream parameters not seen"
+        // and produce nothing. Some sources don't start with one (head-of-stream
+        // first major sync seen ~97 frames in). The producer uses this flag to
+        // skip feeding pre-major-sync packets so it doesn't flood the log / waste
+        // decodes. ONLY TrueHD/MLP — other codecs (DTS, FLAC, …) are
+        // independently decodable per frame and must never be gated.
+        needsMajorSyncGate = (srcCodecID == AV_CODEC_ID_TRUEHD || srcCodecID == AV_CODEC_ID_MLP)
         switch mode {
         case .surroundCompat:
             pcmSampleFmt = AV_SAMPLE_FMT_FLTP

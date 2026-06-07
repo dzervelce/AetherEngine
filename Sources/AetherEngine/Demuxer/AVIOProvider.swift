@@ -13,7 +13,7 @@ protocol AVIOProvider: AnyObject {
     var cumulativeBytesFetched: Int64 { get }
 
     /// DIAGNOSTIC: bytes currently HELD in the reader's own buffers (vs the
-    /// lifetime `cumulativeBytesFetched`). Used by the leak hunt to tell
+    /// lifetime `cumulativeBytesFetched`). Used to tell
     /// whether the reader retains memory. Readers that don't buffer report 0.
     var currentlyHeldBytes: Int { get }
 
