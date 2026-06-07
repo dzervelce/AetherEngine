@@ -335,13 +335,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// healthy stream (which delivers MB between real drops) always clears
     /// it and only a flapping origin accumulates.
     private static let minReconnectProgress: Int64 = 512 * 1024
-    /// Give up after this many CONSECUTIVE unproductive reconnects (a
-    /// permanent 403/410, a dead origin, or an origin that flaps without
-    /// making progress). VLC retries forever; we cap so a genuinely gone or
-    /// pathological source neither hangs the demux thread nor hammers the
-    /// CDN indefinitely. Counts unproductive reconnects, not total ones, so
-    /// a long playback over a flaky link is not penalised.
-    private static let reconnectMaxUnproductive = 12
+    /// Give up after this many CONSECUTIVE unproductive reconnects against a
+    /// PERMANENT failure (404 / 410 — a genuinely gone resource). Small: these
+    /// won't recover, so don't hammer the origin.
+    private static let permanentMaxUnproductive = 3
+    /// For TRANSIENT failures (request timeout, socket stall, 403 signed-URL
+    /// expiry, 429/503 rate-limit, 5xx, connection drop) keep reconnecting with
+    /// backoff and only give up after this long with ZERO progress. Debrid CDNs
+    /// (Real-Debrid here) time out under heavy range-seeking and recover shortly
+    /// after; giving up early froze playback for minutes (the producer EOF'd and
+    /// nothing restarted it). Retrying through the outage lets playback
+    /// auto-resume the moment the CDN responds again. Bounded so a truly dead
+    /// link still surfaces an error instead of spinning forever.
+    private static let transientGiveUpSeconds: TimeInterval = 180
 
     /// Guards every persistent-mode field below AND serves as the
     /// condition variable the demux thread and the delivery callback wait
@@ -377,6 +383,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// AetherEngine#25 also reports) instead of reconnecting forever.
     /// Demux-thread-only; no lock needed.
     private var unproductiveReconnects = 0
+    /// Wall-clock start of the current no-progress streak (nil when making
+    /// progress). Used to bound transient retrying by time, not just count.
+    /// Demux-thread-only.
+    private var unproductiveSince: Date?
     /// `cumulativeBytesFetched` snapshot at the last reconnect, to measure
     /// progress since. Demux-thread-only.
     private var bytesAtLastReconnect: Int64 = 0
@@ -772,7 +782,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 let signaled = winCond.wait(until: Date(timeIntervalSinceNow: Self.connStallTimeout))
                 winCond.unlock()
                 if !signaled {
-                    if recordReconnectAndShouldGiveUp() {
+                    // A socket stall (no data for connStallTimeout) is transient.
+                    if recordReconnectAndShouldGiveUp(permanent: false) {
                         EngineLog.emit("[AVIOReader] Persistent stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)", category: .demux)
                         return totalRead > 0 ? Int32(totalRead) : -1
                     }
@@ -787,7 +798,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // the response handler cancelled). Reconnect at the frontier with
             // backoff; honour Retry-After for 429/503.
             winCond.unlock()
-            if recordReconnectAndShouldGiveUp() {
+            // 404/410 are permanent; timeouts (status 0), expiry, 429/503, 5xx
+            // and drops are transient and retried through.
+            if recordReconnectAndShouldGiveUp(permanent: Self.isPermanentStatus(status)) {
                 EngineLog.emit("[AVIOReader] Persistent reconnect exhausted at offset \(frontier) status=\(status) (\(unproductiveReconnects) unproductive)", category: .demux)
                 return totalRead > 0 ? Int32(totalRead) : -1
             }
@@ -828,15 +841,34 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// otherwise it grows. Returns true once the streak exceeds the cap, so
     /// a dead or flapping origin neither hangs the demux thread nor hammers
     /// the CDN forever. Demux-thread-only.
-    private func recordReconnectAndShouldGiveUp() -> Bool {
+    private func recordReconnectAndShouldGiveUp(permanent: Bool) -> Bool {
         let now = cumulativeBytesFetched
         if now - bytesAtLastReconnect >= Self.minReconnectProgress {
+            // Real progress — the connection recovered; clear the streak.
             unproductiveReconnects = 0
-        } else {
-            unproductiveReconnects += 1
+            unproductiveSince = nil
+            bytesAtLastReconnect = now
+            return false
         }
+        unproductiveReconnects += 1
+        if unproductiveSince == nil { unproductiveSince = Date() }
         bytesAtLastReconnect = now
-        return unproductiveReconnects > Self.reconnectMaxUnproductive
+        if permanent {
+            // 404 / 410: genuinely gone, won't recover — give up quickly.
+            return unproductiveReconnects > Self.permanentMaxUnproductive
+        }
+        // Transient (timeout / socket stall / signed-URL expiry / 429 / 503 /
+        // 5xx / drop): keep reconnecting with backoff so playback auto-resumes
+        // when the CDN comes back; only give up after a long zero-progress
+        // window so a truly dead link still surfaces an error eventually.
+        let stalledFor = unproductiveSince.map { Date().timeIntervalSince($0) } ?? 0
+        return stalledFor > Self.transientGiveUpSeconds
+    }
+
+    /// HTTP statuses that mean the resource is permanently gone (vs a transient
+    /// timeout / rate-limit / expiry the reader should retry through).
+    private static func isPermanentStatus(_ status: Int) -> Bool {
+        status == 404 || status == 410
     }
 
     /// Sleep before a reconnect. A productive reconnect (streak 0) retries
