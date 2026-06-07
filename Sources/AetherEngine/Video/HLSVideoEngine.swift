@@ -1054,6 +1054,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         public let segmentCacheBytes: Int
         public let producerPacketsWritten: Int
         public let avioBytesFetched: Int64
+        /// DIAGNOSTIC (leak hunt): bytes the AVIO reader currently HOLDS in its
+        /// buffers (vs lifetime `avioBytesFetched`). Small + flat ⇒ the network
+        /// reader is not the anonymous-memory retainer.
+        public let avioHeldBytes: Int
         public let audioFifoSamples: Int
         /// Bytes held in AudioBridge's growable PCM buffers (FIFO +
         /// swr delay). Zero if the bridge isn't active (stream-copy
@@ -1150,6 +1154,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             segmentCacheBytes: cache?.totalBytes ?? 0,
             producerPacketsWritten: producer?.packetsWrittenCount ?? 0,
             avioBytesFetched: demuxer?.avioBytesFetched ?? 0,
+            avioHeldBytes: demuxer?.avioHeldBytes ?? 0,
             audioFifoSamples: audioBridge?.fifoSampleCount ?? 0,
             audioBridgeFifoBytes: abLive?.fifoBytes ?? 0,
             audioBridgeSwrBytes: abLive?.swrDelayBytes ?? 0,
@@ -1649,6 +1654,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         guard idx >= 0, idx < segmentPlan.count, demuxer != nil else { return }
 
         let restartStart = DispatchTime.now()
+
+        // DIAGNOSTIC (leak hunt): memory + AVIO-held snapshot at each restart so
+        // successive fast-forwards reveal whether resident/anonymous memory steps
+        // up per restart, and whether the AVIO reader is the retainer.
+        EngineLog.emit(
+            "[HLSVideoEngine] restart at idx=\(idx) memcheck: \(HLSSegmentProducer.memSnapshotLine()) "
+            + "avioHeldMB=\((demuxer?.avioHeldBytes ?? 0) / 1024 / 1024) "
+            + "avioFetchedMB=\((demuxer?.avioBytesFetched ?? 0) / 1024 / 1024)",
+            category: .session
+        )
 
         if let old = producer {
             old.stop()

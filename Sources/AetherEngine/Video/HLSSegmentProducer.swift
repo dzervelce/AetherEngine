@@ -242,6 +242,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var loggedFirstDtsDrop = false
     private var loggedFirstAudioDtsBump = false
 
+    /// DIAGNOSTIC (Defect B): how many source audio packets have been fed to the
+    /// bridge, and whether the first TrueHD/MLP major-sync header has been seen.
+    /// Used to learn at which packet the decoder can first sync (the ~N-frame
+    /// "Stream parameters not seen" gap).
+    private var bridgeAudioPktCount = 0
+    private var loggedFirstAudioMajorSync = false
+
     /// Scan-forward + dynamic-shift state. The static `restart*Target`
     /// fields are seeded from `plan[baseIndex]` for restart sessions
     /// (Int64.min for initial-start). The dynamic `firstActual*Dts`
@@ -375,6 +382,33 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         guard kr == KERN_SUCCESS else { return nil }
         return Int(info.phys_footprint / 1024 / 1024)
+    }
+
+    /// DIAGNOSTIC (leak hunt): one-line full memory snapshot (jetsam bucket
+    /// breakdown + malloc-zone in-use). Logged at producer restart and around
+    /// every A1 park so we can SEE which bucket holds memory and whether
+    /// pausing production reclaims it. Nonisolated; cheap; safe off-main.
+    static func memSnapshotLine() -> String {
+        var line = ""
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        if kr == KERN_SUCCESS {
+            line += "physFP=\(info.phys_footprint/1024/1024)MB "
+                + "vmInt=\(info.internal/1024/1024)MB "
+                + "vmCmp=\(info.compressed/1024/1024)MB "
+                + "vmExt=\(info.external/1024/1024)MB"
+        }
+        var mstats = malloc_statistics_t()
+        malloc_zone_statistics(nil, &mstats)
+        line += " mallocMB=\(mstats.size_in_use/1024/1024) mallocBlocks=\(mstats.blocks_in_use)"
+        return line
     }
 
     /// Worker queue running the read → write_frame pump. One per
@@ -810,19 +844,32 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if !parked {
             guard let mb = Self.physFootprintMB(), mb >= Self.footprintHighWaterMB else { return true }
             parked = true
+            // DIAGNOSTIC: full breakdown at park entry — baseline for "what
+            // survives a park" (does vmCmp / mallocMB drop while we're paused?).
             EngineLog.emit(
-                "[HLSSegmentProducer] memory park: physFP=\(mb)MB >= \(Self.footprintHighWaterMB)MB high-water; pausing production",
+                "[HLSSegmentProducer] memory park ENTER (>= \(Self.footprintHighWaterMB)MB high-water): \(Self.memSnapshotLine())",
                 category: .session
             )
         }
         let parkStart = DispatchTime.now()
         var easedBelowHighAt: DispatchTime?
+        var lastSnapshotAt = DispatchTime.now()
         func elapsedMs(since t: DispatchTime) -> UInt64 {
             (DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1_000_000
         }
         while parked {
             if checkShouldStop() { return false }
             let mb = Self.physFootprintMB() ?? 0
+
+            // DIAGNOSTIC: snapshot ~every 2 s WHILE parked (production stopped),
+            // so the log shows whether anything is actually reclaimed by pausing.
+            if elapsedMs(since: lastSnapshotAt) >= 2_000 {
+                lastSnapshotAt = DispatchTime.now()
+                EngineLog.emit(
+                    "[HLSSegmentProducer] memory park HOLD (\(elapsedMs(since: parkStart))ms): \(Self.memSnapshotLine())",
+                    category: .session
+                )
+            }
 
             if mb < Self.footprintLowWaterMB {
                 EngineLog.emit("[HLSSegmentProducer] memory park released: physFP=\(mb)MB < \(Self.footprintLowWaterMB)MB low-water", category: .session)
@@ -847,7 +894,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // get OOM-killed.
             if mb >= Self.footprintCriticalMB || elapsedMs(since: parkStart) >= Self.footprintAbortMs {
                 EngineLog.emit(
-                    "[HLSSegmentProducer] memory-pressure ABORT: physFP=\(mb)MB after \(elapsedMs(since: parkStart))ms parked; stopping session",
+                    "[HLSSegmentProducer] memory-pressure ABORT after \(elapsedMs(since: parkStart))ms parked (nothing reclaimed): \(Self.memSnapshotLine())",
                     category: .session
                 )
                 onFatalError?(HLSVideoEngine.HLSVideoEngineError.memoryPressureAbort)
@@ -1403,6 +1450,42 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // video.
                 if let audio = audioConfig, pktStreamIdx == audio.sourceStreamIndex {
                     if let bridge = audio.bridge {
+                        // DIAGNOSTIC (Defect B): scan the first ~100 source audio
+                        // packets for the TrueHD/MLP major-sync word (0xF8726FBA,
+                        // near the access-unit start). Logs the first 12 packets +
+                        // the first one carrying a major sync, so we learn at which
+                        // packet the decoder can first sync — the cause of the
+                        // ~N-frame "Stream parameters not seen" startup gap.
+                        if bridgeAudioPktCount < 100 {
+                            let sz = Int(packet.pointee.size)
+                            var hasMajorSync = false
+                            if let d = packet.pointee.data, sz >= 8 {
+                                let scan = min(sz - 3, 48)
+                                var i = 0
+                                while i < scan {
+                                    if d[i] == 0xF8, d[i+1] == 0x72, d[i+2] == 0x6F, d[i+3] == 0xBA {
+                                        hasMajorSync = true; break
+                                    }
+                                    i += 1
+                                }
+                            }
+                            if hasMajorSync, !loggedFirstAudioMajorSync {
+                                loggedFirstAudioMajorSync = true
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] TrueHD major-sync FIRST seen at audio pkt#\(bridgeAudioPktCount) "
+                                    + "(dts=\(packet.pointee.dts) size=\(sz))",
+                                    category: .session
+                                )
+                            }
+                            if bridgeAudioPktCount < 12 || hasMajorSync {
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] audio pkt#\(bridgeAudioPktCount) dts=\(packet.pointee.dts) "
+                                    + "size=\(sz) key=\((packet.pointee.flags & 0x0001) != 0) majorSync=\(hasMajorSync)",
+                                    category: .session
+                                )
+                            }
+                            bridgeAudioPktCount += 1
+                        }
                         let flacPackets: [UnsafeMutablePointer<AVPacket>]
                         do {
                             flacPackets = try bridge.feed(packet: packet)

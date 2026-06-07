@@ -12,6 +12,11 @@ protocol AVIOProvider: AnyObject {
     /// readers that do not track network I/O may report 0.
     var cumulativeBytesFetched: Int64 { get }
 
+    /// DIAGNOSTIC: bytes currently HELD in the reader's own buffers (vs the
+    /// lifetime `cumulativeBytesFetched`). Used by the leak hunt to tell
+    /// whether the reader retains memory. Readers that don't buffer report 0.
+    var currentlyHeldBytes: Int { get }
+
     /// Whether the underlying source supports repositioning (SEEK_SET/CUR/END).
     /// Used by the engine to keep forward-only sources off the seeking native
     /// path. URL-backed readers report true.

@@ -2631,6 +2631,7 @@ public final class AetherEngine: ObservableObject {
                 // irrelevant for trend analysis.
                 let stats = self.nativeVideoSession?.diagnosticStats()
                 let avioMB = (stats?.avioBytesFetched ?? 0) / 1024 / 1024
+                let avioHeldMB = (stats?.avioHeldBytes ?? 0) / 1024 / 1024
                 let cacheMB = (stats?.segmentCacheBytes ?? 0) / 1024 / 1024
                 let cacheCount = stats?.segmentCacheCount ?? 0
                 let packetsWritten = stats?.producerPacketsWritten ?? 0
@@ -2673,7 +2674,7 @@ public final class AetherEngine: ObservableObject {
                     + "rss=\(rssMB)MB "
                     + vmStr
                     + mallocStr
-                    + "avioFetchedMB=\(avioMB) "
+                    + "avioFetchedMB=\(avioMB) avioHeldMB=\(avioHeldMB) "
                     + "cacheCount=\(cacheCount) cacheMB=\(cacheMB) "
                     + "packetsWritten=\(packetsWritten) "
                     + "audioFifo=\(audioFifo) "

@@ -147,6 +147,25 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         counterLock.unlock()
     }
 
+    /// DIAGNOSTIC (leak hunt): bytes this reader is CURRENTLY holding in its
+    /// Swift `Data` buffers — distinct from `cumulativeBytesFetched` (lifetime).
+    /// Sums the persistent-mode sliding `window`, the random-access
+    /// `currentBuffer`/`prefetchBuffer`, and the `streamBuffer`. Each is read
+    /// under its own lock (non-nested → no lock-ordering hazard). If this stays
+    /// small while process anonymous memory balloons, the retention is NOT here.
+    var currentlyHeldBytes: Int {
+        bufferLock.lock()
+        let randomAccess = currentBuffer.count + (prefetchBuffer?.count ?? 0)
+        bufferLock.unlock()
+        streamLock.lock()
+        let stream = streamBuffer.count
+        streamLock.unlock()
+        winCond.lock()
+        let win = window.count
+        winCond.unlock()
+        return randomAccess + stream + win
+    }
+
     /// True when the source is a live stream (no Content-Length).
     private var isStreaming: Bool { fileSize <= 0 }
 

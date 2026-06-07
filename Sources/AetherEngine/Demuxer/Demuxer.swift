@@ -66,6 +66,14 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.cumulativeBytesFetched ?? 0
     }
 
+    /// DIAGNOSTIC (leak hunt): bytes the AVIO reader currently holds in its own
+    /// buffers (vs lifetime fetched). Surfaced through DiagnosticStats so the
+    /// memprobe can show whether the network reader is the anonymous-memory
+    /// retainer. Zero for `file://` / custom sources.
+    var avioHeldBytes: Int {
+        avioProvider?.currentlyHeldBytes ?? 0
+    }
+
     /// Whether the opened source supports seeking. Forward-only custom
     /// sources report false; URL sources and unopened demuxers report true.
     var isSourceSeekable: Bool {

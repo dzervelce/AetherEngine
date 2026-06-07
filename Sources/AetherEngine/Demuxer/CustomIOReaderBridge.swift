@@ -26,6 +26,9 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
     /// meaningfully tracks network bytes, so report 0 here.
     var cumulativeBytesFetched: Int64 { 0 }
 
+    /// Custom readers manage their own buffering; nothing held on our side.
+    var currentlyHeldBytes: Int { 0 }
+
     init(reader: IOReader) {
         self.reader = reader
     }
