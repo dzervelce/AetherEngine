@@ -556,6 +556,22 @@ final class NativeAVPlayerHost {
         avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
+    /// Transport-bar seek variant that reports completion + the ACTUAL landed
+    /// playlist time, so `HLSVideoEngine`'s A2 read-ahead gate can resolve its
+    /// pending-seek epoch precisely (`AVPlayer.seek` is async and the periodic
+    /// clock mirror lags). The plain `seek(to:)` above is kept for startup /
+    /// reload callers that don't drive the gate. The completion fires on the
+    /// MainActor (we hop there to read the isolated player's current time).
+    func seek(to seconds: Double, completion: @escaping @Sendable (_ finished: Bool, _ actualSeconds: Double) -> Void) {
+        let target = CMTime(seconds: seconds, preferredTimescale: 600)
+        avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+            Task { @MainActor [weak self] in
+                let actual = self?.avPlayer.currentTime().seconds ?? seconds
+                completion(finished, actual.isFinite ? actual : seconds)
+            }
+        }
+    }
+
     func setRate(_ value: Float) {
         avPlayer.rate = value
     }

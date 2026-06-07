@@ -64,6 +64,16 @@ final class SegmentCache {
     /// cache window can slide either direction.
     private var currentTargetIndex: Int = -1
 
+    /// AVPlayer's ACTUAL playback position as a segment index, set ONLY from the
+    /// real clock / explicit-seek snap by `HLSVideoEngine.updatePlayhead` — never
+    /// from an HTTP request or a producer restart index. The producer's playhead
+    /// read-ahead gate (`awaitPlayheadWithin`) uses it to cap how far production
+    /// runs ahead of REAL playback (distinct from `currentTargetIndex`, which is
+    /// request-driven and a thrashing player can walk forward). Absolute —
+    /// forward AND backward, so a seek is reflected immediately. -1 until the
+    /// first clock tick.
+    private var _playheadIndex: Int = -1
+
     /// Session-scoped scratch directory. Created on init, removed
     /// on `close()`. Naming includes a UUID so concurrent or
     /// crash-recovered sessions don't collide.
@@ -339,11 +349,43 @@ final class SegmentCache {
 
     /// Broadcast on the cache's condition variable without changing
     /// any state. Used by `HLSSegmentProducer.stop()` so any pump
-    /// currently parked in `awaitFetchHighWater` returns immediately.
+    /// currently parked in `awaitFetchHighWater` or `awaitPlayheadWithin`
+    /// returns immediately.
     func wakeWaiters() {
         condition.lock()
         condition.broadcast()
         condition.unlock()
+    }
+
+    /// Set the real-playback playhead segment index (clock- or explicit-seek-
+    /// driven, via `HLSVideoEngine.updatePlayhead`). Absolute: accepts forward
+    /// AND backward jumps so a seek is reflected at once. Broadcasts so a parked
+    /// producer re-evaluates `awaitPlayheadWithin`. NEVER called from an HTTP
+    /// request or a producer restart index.
+    func setPlayhead(_ index: Int) {
+        guard index >= 0 else { return }
+        condition.lock()
+        _playheadIndex = index
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    /// Pump-side read-ahead gate: wait once until producing `produced` is within
+    /// `window` of EITHER the real playhead OR `floor` (the producer's own
+    /// `baseIndex`). The `floor` term lets a freshly (re)started producer always
+    /// emit its `baseIndex … baseIndex+window` startup burst without deadlocking
+    /// on a clock that still lags a just-issued seek; beyond that burst the real
+    /// playhead must advance. Same one-shot contract as `awaitFetchHighWater`
+    /// (returns on the first wake so the caller re-checks its own cancellation).
+    /// Returns `true` if producing `produced` is now allowed.
+    func awaitPlayheadWithin(produced: Int, floor: Int, window: Int, timeout: TimeInterval = 1.0) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        if max(_playheadIndex, floor) >= produced - window { return true }
+        if closed { return false }
+        let deadline = Date().addingTimeInterval(timeout)
+        _ = condition.wait(until: deadline)
+        return max(_playheadIndex, floor) >= produced - window
     }
 
     // MARK: - Diagnostics

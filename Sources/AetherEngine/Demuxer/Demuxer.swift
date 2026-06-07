@@ -520,16 +520,29 @@ public final class Demuxer: @unchecked Sendable {
         return packet
     }
 
-    /// Seek to a position in seconds.
+    /// Seek to a position in seconds. Returns the `avformat_seek_file` result
+    /// (>= 0 on success, negative AVERROR on failure) so callers that must
+    /// confirm a mandatory reposition can react instead of silently continuing.
     /// Uses avformat_seek_file instead of av_seek_frame, more robust
     /// for MKV containers (av_seek_frame triggers assertion failures
     /// in matroskadec.c with nested elements).
-    func seek(to seconds: Double) {
+    ///
+    /// `snapEarlier`: `AVSEEK_FLAG_BACKWARD` is *ignored* by
+    /// `avformat_seek_file` — direction is expressed via the `[min_ts, max_ts]`
+    /// window. When `snapEarlier` is true we cap `max_ts` at the target so the
+    /// demuxer lands at-or-before it. The head-of-stream cursor reset uses this
+    /// so the very first audio access unit is delivered: for TrueHD/MLP that
+    /// first unit carries the major-sync header the decoder needs, and landing
+    /// at the next cluster boundary *after* it makes the decoder skip frames
+    /// ("Stream parameters not seen") until the next major sync seconds later.
+    @discardableResult
+    func seek(to seconds: Double, snapEarlier: Bool = false) -> Int32 {
         accessLock.lock()
         defer { accessLock.unlock() }
-        guard let ctx = formatContext else { return }
+        guard let ctx = formatContext else { return -1 }
         let timestamp = Int64(seconds * Double(AV_TIME_BASE))
-        let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
+        let maxTs = snapEarlier ? timestamp : Int64.max
+        let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, maxTs, 0)
         if ret < 0 {
             #if DEBUG
             EngineLog.emit("[Demuxer] Seek to \(seconds)s failed: \(ret)", category: .demux)
@@ -538,6 +551,7 @@ public final class Demuxer: @unchecked Sendable {
         // Flush internal parser state after seek, prevents assertion
         // failures in matroskadec.c when reading the next packet.
         avformat_flush(ctx)
+        return ret
     }
 
     /// Close the format context and release resources.

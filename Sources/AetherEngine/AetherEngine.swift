@@ -1201,6 +1201,19 @@ public final class AetherEngine: ObservableObject {
                 self.sourceTime = self.currentTime
             }
         }
+        session.onFatalError = { [weak self, weak session] err in
+            Task { @MainActor in
+                guard let self = self, let session = session else { return }
+                // Session-scoped: re-validate on the main actor immediately
+                // before tearing down, so a fatal from a session we've already
+                // swapped out (reload / new load) can't kill the current one.
+                guard self.nativeVideoSession === session else { return }
+                let message = (err as? HLSVideoEngine.HLSVideoEngineError)?.description
+                    ?? "Playback stopped: \(err.localizedDescription)"
+                self.stopInternal()       // orderly teardown FIRST
+                self.state = .error(message)
+            }
+        }
         // AVPlayer HLS playback over the loopback HTTP server. Detach
         // the synchronous network I/O inside `session.start()` (opens
         // its own Demuxer + prewarm seek = another ~1-3 s on slow CDN)
@@ -1257,6 +1270,11 @@ public final class AetherEngine: ObservableObject {
                 self.nativeClockSeconds = value
                 self.currentTime = value + self.playlistShiftSeconds
                 self.sourceTime = self.currentTime
+                // A2: feed the producer's read-ahead gate the REAL playback
+                // position. `value` is the raw 0-based AVPlayer/playlist clock —
+                // the same space as the segment plan's startSeconds — so it maps
+                // directly (do NOT add playlistShiftSeconds here).
+                self.nativeVideoSession?.updatePlayhead(playlistSeconds: value)
             }
             .store(in: &nativeCancellables)
         host.$duration
@@ -1687,8 +1705,21 @@ public final class AetherEngine: ObservableObject {
             // on a segment that the playlist hasn't grown to expose
             // yet — AVPlayer either fails the seek or stalls until the
             // playlist's periodic refresh catches up.
-            nativeVideoSession?.extendVisibleWindow(toCoverSeconds: clockTarget)
-            nativeHost?.seek(to: clockTarget)
+            //
+            // A2: register the explicit seek with the read-ahead gate
+            // (epoch + pending-seek snap) and thread the epoch through the
+            // seek completion so the gate resolves precisely. Only create
+            // pending state when a host exists to drive the completion.
+            if let session = nativeVideoSession, let host = nativeHost {
+                let epoch = session.beginSeek(toClockSeconds: clockTarget)
+                session.extendVisibleWindow(toCoverSeconds: clockTarget)
+                host.seek(to: clockTarget) { finished, actualSec in
+                    session.resolveSeek(epoch: epoch, finished: finished, actualPlaylistSeconds: actualSec)
+                }
+            } else {
+                nativeVideoSession?.extendVisibleWindow(toCoverSeconds: clockTarget)
+                nativeHost?.seek(to: clockTarget)
+            }
         }
         nativeClockSeconds = clockTarget
         currentTime = target

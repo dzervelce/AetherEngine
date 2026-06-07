@@ -35,6 +35,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         case muxerInit(underlying: Error)
         case alreadyStarted
         case notStarted
+        case headSeekFailed(code: Int32)
+        case memoryPressureAbort
 
         public var description: String {
             switch self {
@@ -46,6 +48,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             case .muxerInit(let e):      return "HLSVideoEngine: muxer init failed (\(e))"
             case .alreadyStarted:        return "HLSVideoEngine: session already started"
             case .notStarted:            return "HLSVideoEngine: session not started"
+            case .headSeekFailed(let c): return "HLSVideoEngine: head-of-stream seek failed (\(c)); cannot guarantee audio major-sync"
+            case .memoryPressureAbort:   return "HLSVideoEngine: stopped under sustained memory pressure to avoid an out-of-memory kill"
             }
         }
 
@@ -300,6 +304,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// parallel.
     private let restartLock = NSLock()
 
+    /// A2 read-ahead gate state: the explicit-seek epoch + pending target used
+    /// to suppress the stale clock during an async `AVPlayer.seek`. Guarded by
+    /// `seekStateLock` so `beginSeek` (MainActor), `updatePlayhead` (periodic
+    /// clock) and `resolveSeek` (seek completion) are safe regardless of thread.
+    private let seekStateLock = NSLock()
+    private var pendingSeekIndex: Int?
+    private var seekEpoch: UInt64 = 0
+    /// Segments of clock-vs-target slack at which a pending seek is considered
+    /// landed (belt for a missed completion; the primary resolver is the
+    /// `AVPlayer.seek` completion handler via `resolveSeek`).
+    private static let seekTolerance = 2
+
     /// Fires once per session, the first time the producer sees an
     /// HDR10+ T.35 signature in a packet. Hooked by `AetherEngine` to
     /// upgrade the published `videoFormat` from `.hdr10` → `.hdr10Plus`.
@@ -307,6 +323,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
     private var hasReportedHDR10Plus = false
     private let hdr10PlusLock = NSLock()
+
+    /// Fires if the CURRENT producer aborts mid-session under sustained memory
+    /// pressure (A1 escalation). AetherEngine wires this to do a session-scoped
+    /// orderly teardown + surface `.error` rather than risk a jetsam kill. The
+    /// call site in `makeProducer` already guards producer-currentness, so a
+    /// stale/leaked producer's abort never reaches here.
+    var onFatalError: (@Sendable (Error) -> Void)?
 
     /// Whether the current audio output route can carry an EAC3+JOC
     /// Atmos bitstream end-to-end. Atmos requires either HDMI
@@ -588,8 +611,30 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // 6. Position the demuxer at the file's first packet so the
         //    producer's pump starts from byte zero. The cue prewarm
         //    above moved the cursor mid-file; libavformat's index is
-        //    populated now, this seek-to-0 is cheap.
-        dem.seek(to: 0)
+        //    populated now, this seek-to-the-start is cheap.
+        //
+        //    `snapEarlier` caps max_ts at the target so the demuxer lands
+        //    at-or-BEFORE the first keyframe rather than at the next cluster
+        //    boundary after it. That guarantees the very first audio access
+        //    unit is delivered — critical for TrueHD/MLP, whose first unit
+        //    carries the major-sync header the bridge decoder needs; landing
+        //    even one cluster late made it skip frames ("Stream parameters
+        //    not seen") for ~10 s until the next major sync. Seek to
+        //    `firstKeyframeSeconds` (not 0) so sources with start_time > 0
+        //    still resolve. This reset is mandatory: if it fails we cannot
+        //    guarantee the major-sync reaches the decoder, so fail the load
+        //    rather than silently ship a session that starts without audio.
+        //    (We do NOT reopen on failure — videoStream/codecpar captured
+        //    above would dangle; throwing is the safe response.)
+        let headSeekRet = dem.seek(to: firstKeyframeSeconds, snapEarlier: true)
+        if headSeekRet < 0 {
+            EngineLog.emit(
+                "[HLSVideoEngine] head-of-stream seek to \(String(format: "%.3f", firstKeyframeSeconds))s "
+                + "failed (\(headSeekRet)); aborting load (audio major-sync not guaranteed)",
+                category: .session
+            )
+            throw HLSVideoEngineError.headSeekFailed(code: headSeekRet)
+        }
 
         // 6. Build the segment cache + producer. The producer's
         //    constructor calls avformat_write_header which opens the
@@ -1132,6 +1177,68 @@ public final class HLSVideoEngine: @unchecked Sendable {
         prov.extendVisibleWindow(toCover: idx)
     }
 
+    // MARK: - A2 read-ahead gate playhead (clock + explicit-seek driven)
+
+    /// Register an explicit (transport-bar) seek with the read-ahead gate.
+    /// Bumps the epoch, snaps the playhead to the target (so the producer can
+    /// burst there immediately via its baseIndex floor), and marks a pending
+    /// seek so `updatePlayhead` ignores the stale pre-seek clock until the seek
+    /// lands. Returns the epoch to thread through the seek completion →
+    /// `resolveSeek`. `seconds` is the 0-based AVPlayer/playlist clock target.
+    @discardableResult
+    func beginSeek(toClockSeconds seconds: Double) -> UInt64 {
+        let idx = Self.segmentIndex(forSeconds: seconds, plan: segmentPlan)
+        seekStateLock.lock()
+        seekEpoch &+= 1
+        let e = seekEpoch
+        pendingSeekIndex = idx
+        seekStateLock.unlock()
+        cache?.setPlayhead(idx)
+        return e
+    }
+
+    /// Real-playback clock feed (raw 0-based AVPlayer/playlist seconds, from the
+    /// periodic time observer). While a seek is pending, ignore stale ticks
+    /// (the clock still reports the pre-seek position); once a tick lands within
+    /// `seekTolerance` of the target the seek is treated as resolved (belt for a
+    /// missed completion). With no pending seek, the tick drives the gate.
+    func updatePlayhead(playlistSeconds: Double) {
+        let idx = Self.segmentIndex(forSeconds: playlistSeconds, plan: segmentPlan)
+        seekStateLock.lock()
+        if let pending = pendingSeekIndex {
+            if abs(idx - pending) <= Self.seekTolerance {
+                pendingSeekIndex = nil
+                seekStateLock.unlock()
+                cache?.setPlayhead(idx)
+            } else {
+                seekStateLock.unlock()   // stale clock during seek → ignore
+            }
+            return
+        }
+        seekStateLock.unlock()
+        cache?.setPlayhead(idx)
+    }
+
+    /// Resolve an explicit seek from `AVPlayer.seek`'s completion. Only the
+    /// latest (current-epoch) seek resolves; a superseded completion is ignored.
+    /// `finished == true` → seek landed: clear suppression so the next clock tick
+    /// is authoritative. `finished == false` → interrupted/failed: resync the
+    /// playhead to where AVPlayer ACTUALLY is (not the unreached target) so the
+    /// gate can't freeze. `actualPlaylistSeconds` is read directly from AVPlayer
+    /// in the completion handler.
+    func resolveSeek(epoch: UInt64, finished: Bool, actualPlaylistSeconds: Double) {
+        seekStateLock.lock()
+        guard epoch == seekEpoch, pendingSeekIndex != nil else {
+            seekStateLock.unlock()
+            return
+        }
+        pendingSeekIndex = nil
+        seekStateLock.unlock()
+        if !finished {
+            cache?.setPlayhead(Self.segmentIndex(forSeconds: actualPlaylistSeconds, plan: segmentPlan))
+        }
+    }
+
     /// Locate the segment that contains a given source-time offset.
     /// Linear scan, fine for our 2k-segment scale on the engine's
     /// rare-event paths (load + seek). Returns 0 if `seconds` is nil
@@ -1297,6 +1404,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         prod.onVideoShiftKnown = { [weak self] shiftPts in
             self?.handleVideoShiftKnown(shiftPts)
+        }
+        prod.onFatalError = { [weak self, weak prod] err in
+            guard let self = self, let prod = prod else { return }
+            // Producer-currentness guard: only the live producer's abort may
+            // tear the session down. A stale/leaked producer (post-restart or
+            // post-teardown) firing late must be ignored.
+            self.restartLock.lock()
+            let isCurrent = (self.producer === prod)
+            self.restartLock.unlock()
+            guard isCurrent else { return }
+            self.onFatalError?(err)
         }
         return prod
     }

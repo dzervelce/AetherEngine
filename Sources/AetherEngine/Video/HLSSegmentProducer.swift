@@ -336,6 +336,47 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// the old buffer 200 MB on its own.
     private static let bufferAheadSegments = 10
 
+    /// A2 read-ahead gate: how many segments the producer may run ahead of the
+    /// REAL playhead (clock), independent of how far AVPlayer has *requested*.
+    /// Bounds the producer↔player race that the request-driven `bufferAhead`
+    /// alone can't (a thrashing/seeking player walks `currentTargetIndex`
+    /// forward). 12 ≈ 72 s; below the observed ~31-segment OOM point, above
+    /// normal prefetch so it never starves.
+    private static let playheadWindowSegments = 12
+
+    /// A1 footprint-pressure backstop (the hard memory bound). Park the pump
+    /// when the process's footprint nears the tvOS jetsam limit; resume when it
+    /// eases (see `runPumpLoop`). Values for a 4 GB Apple TV 4K (~2 GB per-app
+    /// limit). AVPlayer's decode buffers live in a separate process
+    /// (`mediaserverd`), so the footprint bounded here is the engine's own
+    /// (demuxer / AVIO / muxer) — parking idles exactly those anonymous allocators.
+    private static let footprintHighWaterMB = 1500
+    private static let footprintLowWaterMB = 1200
+    private static let footprintCriticalMB = 1800            // ~jetsam edge → escalate
+    private static let footprintParkSliceUs: UInt32 = 250_000 // 250 ms re-poll cadence
+    private static let footprintEaseResumeMs: UInt64 = 3_000  // eased below HIGH → resume
+    private static let footprintAbortMs: UInt64 = 10_000      // never eases → clean abort
+
+    /// Pump-thread-only park state (no lock; touched solely in `runPumpLoop`).
+    private var parked = false
+
+    /// Current process physical footprint in MB (the tvOS jetsam metric), via
+    /// `task_vm_info.phys_footprint`. Cheap; A1 polls it at the slice cadence.
+    /// Returns nil if the mach call fails (caller treats nil as "no pressure").
+    static func physFootprintMB() -> Int? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        return Int(info.phys_footprint / 1024 / 1024)
+    }
+
     /// Worker queue running the read → write_frame pump. One per
     /// producer instance; the queue is serial, no concurrent writes
     /// to the format context. Closed when `stop()` is called.
@@ -417,6 +458,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// restart since matroska seek imprecision can produce a different
     /// shift for the same source.
     var onVideoShiftKnown: (@Sendable (Int64) -> Void)?
+
+    /// Fires at most once if the pump aborts under sustained memory pressure
+    /// (A1 escalation — footprint stayed at/over the high-water mark past the
+    /// escalation budget). The pump exits right after firing. `HLSVideoEngine`
+    /// sets this and, generation+session-scoped, performs an orderly teardown
+    /// and surfaces an `.error` rather than risking a jetsam kill. Mirrors the
+    /// other producer→engine callbacks above.
+    var onFatalError: (@Sendable (Error) -> Void)?
 
     /// Latched once the signature has been seen in this producer's
     /// packet stream so the scan goes silent for the remainder of the
@@ -566,6 +615,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
             if cache.awaitFetchHighWater(reaching: backpressureTarget, timeout: 1.0) { break }
         }
         if checkShouldStop() { return nil }
+        // A2 read-ahead gate: also cap distance ahead of the REAL playhead
+        // (clock), which the request-driven fetch-high-water above can't bound
+        // when AVPlayer thrash/seek-fetches far ahead. `floor: baseIndex` lets a
+        // freshly (re)started producer emit its startup burst without waiting on
+        // a clock that lags a just-issued seek.
+        while !checkShouldStop() {
+            if cache.awaitPlayheadWithin(produced: initialSegmentIndex, floor: baseIndex, window: Self.playheadWindowSegments, timeout: 1.0) { break }
+        }
+        if checkShouldStop() { return nil }
 
         let muxerVideo = MP4SegmentMuxer.VideoConfig(
             codecpar: videoConfig.codecpar,
@@ -636,6 +694,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let backpressureTarget = newIdx - Self.bufferAheadSegments
         while !checkShouldStop() {
             if cache.awaitFetchHighWater(reaching: backpressureTarget, timeout: 1.0) { break }
+        }
+        if checkShouldStop() { return nil }
+        // A2 read-ahead gate (see allocateMuxer): cap distance ahead of the
+        // real playhead, floored at baseIndex for deadlock-free startup bursts.
+        while !checkShouldStop() {
+            if cache.awaitPlayheadWithin(produced: newIdx, floor: baseIndex, window: Self.playheadWindowSegments, timeout: 1.0) { break }
         }
         if checkShouldStop() { return nil }
 
@@ -730,6 +794,70 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     // MARK: - Pump
 
+    /// A1 footprint-pressure backstop. Blocks (cancel-aware) while the process
+    /// footprint is over the high-water mark, with hysteresis so it doesn't
+    /// flap, a bounded "eased below HIGH → resume" path so it never stalls
+    /// forever, and a definite escalation (clean abort via `onFatalError`) if
+    /// pressure never eases or crosses the near-jetsam critical line. Returns
+    /// `true` to keep producing, `false` if the pump must exit.
+    ///
+    /// PARK-ONLY: pausing the pump idles the demuxer / AVIO / muxer — the
+    /// anonymous allocators that drive `phys_footprint` (the OOM bucket) — which
+    /// then drains/compresses away. It does NOT evict the cache (file-backed,
+    /// wrong bucket, and would collide with the provider's pruned-gap restart)
+    /// nor tear down resources (would interrupt playback).
+    private func awaitFootprintHeadroom() -> Bool {
+        if !parked {
+            guard let mb = Self.physFootprintMB(), mb >= Self.footprintHighWaterMB else { return true }
+            parked = true
+            EngineLog.emit(
+                "[HLSSegmentProducer] memory park: physFP=\(mb)MB >= \(Self.footprintHighWaterMB)MB high-water; pausing production",
+                category: .session
+            )
+        }
+        let parkStart = DispatchTime.now()
+        var easedBelowHighAt: DispatchTime?
+        func elapsedMs(since t: DispatchTime) -> UInt64 {
+            (DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1_000_000
+        }
+        while parked {
+            if checkShouldStop() { return false }
+            let mb = Self.physFootprintMB() ?? 0
+
+            if mb < Self.footprintLowWaterMB {
+                EngineLog.emit("[HLSSegmentProducer] memory park released: physFP=\(mb)MB < \(Self.footprintLowWaterMB)MB low-water", category: .session)
+                parked = false
+                return true
+            }
+            if mb < Self.footprintHighWaterMB {
+                // Eased below HIGH but not yet LOW: resume after a short grace so
+                // the pump always makes progress (no permanent stall). Safe —
+                // we're well under the jetsam limit here.
+                if easedBelowHighAt == nil { easedBelowHighAt = DispatchTime.now() }
+                else if elapsedMs(since: easedBelowHighAt!) >= Self.footprintEaseResumeMs {
+                    EngineLog.emit("[HLSSegmentProducer] memory park released: physFP=\(mb)MB eased below \(Self.footprintHighWaterMB)MB", category: .session)
+                    parked = false
+                    return true
+                }
+            } else {
+                easedBelowHighAt = nil
+            }
+            // Definite escalation: never eased within the abort budget, or hit
+            // the near-jetsam critical line → stop cleanly rather than hang or
+            // get OOM-killed.
+            if mb >= Self.footprintCriticalMB || elapsedMs(since: parkStart) >= Self.footprintAbortMs {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] memory-pressure ABORT: physFP=\(mb)MB after \(elapsedMs(since: parkStart))ms parked; stopping session",
+                    category: .session
+                )
+                onFatalError?(HLSVideoEngine.HLSVideoEngineError.memoryPressureAbort)
+                return false
+            }
+            usleep(Self.footprintParkSliceUs)
+        }
+        return true
+    }
+
     private func runPumpLoop() {
         if restartTargetVideoDts > Int64.min {
             restartCount &+= 1
@@ -744,6 +872,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 let stopRequested = shouldStop
                 stateLock.unlock()
                 if stopRequested { break readLoop }
+
+                // A1 backstop: throttle the whole pump (read + mux) while the
+                // process footprint is over the high-water mark so it can't run
+                // resident memory into a jetsam kill. Returns false if the pump
+                // must exit — stop requested mid-park, or sustained pressure
+                // escalated to a clean `memoryPressureAbort` (already reported
+                // via `onFatalError`).
+                if !awaitFootprintHeadroom() { break readLoop }
 
                 guard let packet = try demuxer.readPacket() else {
                     // EOF
