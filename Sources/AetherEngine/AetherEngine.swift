@@ -2376,12 +2376,51 @@ public final class AetherEngine: ObservableObject {
         var cuesEmitted = 0
         var firstCueLogged = false
 
+        // Read-ahead bound. To surface sparse subtitle packets the loop must pull
+        // EVERY video/audio packet too, so without a cap it races to EOF — on a long
+        // high-bitrate remux that means downloading ~all remaining gigabytes through
+        // this side demuxer's own AVIO and accumulating the whole title's cues, which
+        // stacks on the main producer's footprint and OOMs the app (debug23: enabling
+        // embedded subs on an 18.8 GB DV remux → physFP climbing past the producer's
+        // park budget, memory warning, jetsam). Keep the side demuxer within
+        // `readAheadCapSeconds` of source time ahead of the live playhead, resuming as
+        // it advances. The reader re-seeks on `engine.seek`, so pausing here never
+        // strands cues after a scrub. Stream time bases are cached per stream_index.
+        let readAheadCapSeconds = 60.0
+        var tbCache: [Int32: Double] = [:]
+        var playheadSnapshot = startAt
+
         while !Task.isCancelled {
             guard let pkt = try? demuxer.readPacket() else {
                 break
             }
             totalPacketsRead += 1
             let streamIdx = pkt.pointee.stream_index
+
+            // Read-ahead gate (any stream): pause while we're > cap seconds ahead of
+            // the playhead. `sourceTime` is the unified source-PTS clock the start seek
+            // used, so packet PTS (source PTS) compares directly. Refresh the playhead
+            // via a MainActor hop only while actually gated (~5x/s), so steady reading
+            // pays nothing.
+            let pktTb: Double = tbCache[streamIdx] ?? {
+                let tb = demuxer.stream(at: streamIdx)?.pointee.time_base
+                let v = (tb != nil && tb!.den != 0) ? Double(tb!.num) / Double(tb!.den) : 0
+                tbCache[streamIdx] = v
+                return v
+            }()
+            let pts = pkt.pointee.pts
+            if pktTb > 0, pts != Int64.min {
+                let pktSeconds = Double(pts) * pktTb
+                while !Task.isCancelled, pktSeconds - playheadSnapshot > readAheadCapSeconds {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    if let live = await MainActor.run(body: { [weak self] in self?.sourceTime }) {
+                        playheadSnapshot = live
+                    } else {
+                        break // engine gone
+                    }
+                }
+            }
+
             if streamIdx != streamIndex {
                 var p: UnsafeMutablePointer<AVPacket>? = pkt
                 trackedPacketFree(&p)
