@@ -188,6 +188,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// advertise a phantom video stream. Default `false`.
     public var audioOnly: Bool
 
+    /// Enables in-session timeshift (DVR) for a live source. nil keeps live-only
+    /// behavior (seek is a no-op). A value is the rewind window in seconds; the
+    /// engine retains roughly this much past content (disk-backed) and clamps
+    /// seeks to it. Suggested host default when enabling DVR: 1800. Ignored when
+    /// `isLive == false`. Default nil.
+    public var dvrWindowSeconds: Double?
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -197,7 +204,8 @@ public struct LoadOptions: Sendable, Equatable {
         panelIsInHDRMode: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
-        audioOnly: Bool = false
+        audioOnly: Bool = false,
+        dvrWindowSeconds: Double? = nil
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -208,6 +216,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.audioBridgeMode = audioBridgeMode
         self.isLive = isLive
         self.audioOnly = audioOnly
+        self.dvrWindowSeconds = dvrWindowSeconds
     }
 }
 

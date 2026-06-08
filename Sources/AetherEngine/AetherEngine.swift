@@ -152,6 +152,17 @@ public final class AetherEngine: ObservableObject {
     /// state into the next VOD load.
     @Published public private(set) var isLive: Bool = false
 
+    /// Largest session-relative time reached on a live source (seconds since
+    /// first frame). Meaningful only while `isLive`. 0 otherwise.
+    @Published public private(set) var liveEdgeTime: Double = 0
+    /// DVR-seekable span on the session timeline, or nil when DVR is disabled
+    /// or the source is not live.
+    @Published public private(set) var seekableLiveRange: ClosedRange<Double>? = nil
+    /// True when playback is at / near the live edge.
+    @Published public private(set) var isAtLiveEdge: Bool = false
+    /// Seconds the playhead trails the live edge. 0 at the edge.
+    @Published public private(set) var behindLiveSeconds: Double = 0
+
     // MARK: - Output
 
     /// How the AVPlayer surface fills its container layer. Mirrors
@@ -175,6 +186,22 @@ public final class AetherEngine: ObservableObject {
     private var _videoGravity: AVLayerVideoGravity = .resizeAspect
 
     // MARK: - Capabilities
+
+    /// TEST-ONLY routing override. When true, `load` forces every source
+    /// through `SoftwarePlaybackHost` regardless of codec, so the SW live
+    /// + DVR path can be exercised against the H.264 fixture (which would
+    /// otherwise route native). Set ONLY via
+    /// `setForceSoftwarePathForTesting(_:)` from `aetherctl`; nothing in
+    /// the shipping app calls that setter, so normal codec dispatch is
+    /// unaffected.
+    nonisolated(unsafe) static var forceSoftwarePathForTesting = false
+
+    /// TEST-ONLY. Flip the software-path routing override (see
+    /// `forceSoftwarePathForTesting`). Exposed for the `aetherctl live
+    /// --sw` harness; not intended for app use.
+    public nonisolated static func setForceSoftwarePathForTesting(_ on: Bool) {
+        forceSoftwarePathForTesting = on
+    }
 
     /// Snapshot of what the active display can present right now.
     ///
@@ -315,6 +342,15 @@ public final class AetherEngine: ObservableObject {
     /// holds a weak reference back to the engine so its retained task
     /// can't keep `self` alive past teardown.
     private var liveTelemetrySampler: LiveTelemetrySampler?
+
+    /// DVR / live window tracker. Non-nil for ANY live session (both the
+    /// native and software-decode paths construct it at load). Its
+    /// `windowSeconds` is nil when DVR is disabled (live-only: no rewind
+    /// range, scrubbing suppressed), and non-nil when a DVR window was
+    /// requested. Updated by `publishLiveWindow`, which both the native
+    /// time tick and the SW host's edge callback drive; the published
+    /// live surfaces above reflect its state.
+    private var liveWindow: LiveWindow?
 
     /// The URL of the current playback session. Used by
     /// `reloadAtCurrentPosition()` to rebuild the pipeline after
@@ -789,6 +825,7 @@ public final class AetherEngine: ObservableObject {
         loadedURL = url
         loadedOptions = options
         isLive = options.isLive
+        liveWindow = options.isLive ? LiveWindow(windowSeconds: options.dvrWindowSeconds) : nil
         state = .loading
         currentTime = 0
         nativeClockSeconds = 0
@@ -826,7 +863,13 @@ public final class AetherEngine: ObservableObject {
             try await Task.detached(priority: .userInitiated) { [probe, source, options] in
                 switch source {
                 case .url(let u):
-                    try probe.open(url: u, extraHeaders: options.httpHeaders)
+                    // Pass isLive so the probe demuxer's AVIOReader is
+                    // configured for endless-feed mode. The probe demuxer is
+                    // reused as the session demuxer (avformat_open_input +
+                    // avformat_find_stream_info run only once), so the
+                    // AVIOReader it holds must already have isLive=true when
+                    // the producer starts reading from it.
+                    try probe.open(url: u, extraHeaders: options.httpHeaders, isLive: options.isLive)
                 case .custom(let reader, let formatHint):
                     try probe.open(reader: reader, formatHint: formatHint)
                 }
@@ -1059,6 +1102,16 @@ public final class AetherEngine: ObservableObject {
             useSoftwarePath = true
             EngineLog.emit("[AetherEngine] custom source is forward-only, forcing software path", category: .engine)
         }
+        // TEST-ONLY routing override. `aetherctl live --sw` flips this so
+        // the H.264/HEVC fixture (which would normally take the native
+        // path) is forced through SoftwarePlaybackHost, exercising the SW
+        // live + DVR path end-to-end without a VP9/MPEG-2 fixture. Default
+        // false; nothing in the shipping app sets it, so normal codec
+        // routing above is unaffected. See `forceSoftwarePathForTesting`.
+        if Self.forceSoftwarePathForTesting {
+            useSoftwarePath = true
+            EngineLog.emit("[AetherEngine] TEST override: forcing software path", category: .engine)
+        }
         EngineLog.emit("[AetherEngine] dispatch: codec=\(detectedCodecID.rawValue) → \(useSoftwarePath ? "software" : "native")", category: .engine)
 
         do {
@@ -1081,6 +1134,8 @@ public final class AetherEngine: ObservableObject {
                     sourceHTTPHeaders: options.httpHeaders,
                     startPosition: startPosition,
                     audioSourceStreamIndex: audioSourceStreamIndex,
+                    isLive: options.isLive,
+                    dvrWindowSeconds: options.dvrWindowSeconds,
                     preopenedDemuxer: probeOpened ? probe : nil
                 )
                 playbackBackend = .software
@@ -1115,6 +1170,8 @@ public final class AetherEngine: ObservableObject {
                     matchContentEnabled: options.matchContentEnabled,
                     panelIsInHDRMode: panelHDRAfterHandshake,
                     audioBridgeMode: options.audioBridgeMode,
+                    isLive: options.isLive,
+                    dvrWindowSeconds: options.dvrWindowSeconds,
                     preopenedDemuxer: probeOpened ? probe : nil
                 )
                 playbackBackend = .native
@@ -1171,6 +1228,8 @@ public final class AetherEngine: ObservableObject {
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        isLive: Bool = false,
+        dvrWindowSeconds: Double? = nil,
         preopenedDemuxer: Demuxer? = nil
     ) async throws {
         let session = HLSVideoEngine(
@@ -1184,6 +1243,8 @@ public final class AetherEngine: ObservableObject {
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
             initialPositionSeconds: startPosition,
             audioBridgeMode: audioBridgeMode,
+            isLiveSession: isLive,
+            dvrWindowSeconds: dvrWindowSeconds,
             preopenedDemuxer: preopenedDemuxer
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
@@ -1275,6 +1336,16 @@ public final class AetherEngine: ObservableObject {
                 // the same space as the segment plan's startSeconds — so it maps
                 // directly (do NOT add playlistShiftSeconds here).
                 self.nativeVideoSession?.updatePlayhead(playlistSeconds: value)
+                // Live: publish the DVR window surfaces on every tick. The
+                // edge must sit on the SAME session axis as the playhead. The
+                // playhead is folded as host.currentTime + playlistShiftSeconds
+                // above, so the edge (host.seekableEnd in the AVPlayer clock)
+                // folds the same way: seekableEnd + playlistShiftSeconds. Using
+                // the opposite sign would put edge and playhead on different
+                // axes and behindLiveSeconds would be meaningless.
+                if self.isLive {
+                    self.publishLiveWindow(edgeSessionTime: host.seekableEnd + self.playlistShiftSeconds)
+                }
             }
             .store(in: &nativeCancellables)
         host.$duration
@@ -1378,12 +1449,21 @@ public final class AetherEngine: ObservableObject {
         sourceHTTPHeaders: [String: String] = [:],
         startPosition: Double?,
         audioSourceStreamIndex: Int32?,
+        isLive: Bool = false,
+        dvrWindowSeconds: Double? = nil,
         preopenedDemuxer: Demuxer?
     ) async throws {
         activateRendererAudioSession()
         let host = SoftwarePlaybackHost()
         host.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
+        }
+        // Live edge publishing: the SW host calls this on its time tick
+        // with the session-relative edge; the engine publishes the same
+        // four live surfaces it does for the native path. No-op when the
+        // session is not live (liveWindow nil -> publishLiveWindow no-ops).
+        host.onLiveEdge = { [weak self] edge in
+            self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
         // SW path's currentTime tracks source PTS directly, so the
@@ -1428,18 +1508,20 @@ public final class AetherEngine: ObservableObject {
         // The (possibly blocking) open stays detached so the @MainActor
         // runloop keeps ticking, matching the probe / session.start pattern.
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, isLive: isLive)
             }
             try await host.load(
                 demuxer: dem,
                 startPosition: startPosition,
-                audioSourceStreamIndex: audioSourceStreamIndex
+                audioSourceStreamIndex: audioSourceStreamIndex,
+                isLive: isLive,
+                dvrWindowSeconds: dvrWindowSeconds
             )
         }.value
     }
@@ -1677,21 +1759,63 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func seek(to seconds: Double) async {
-        // Live streams have no random-access guarantee; AVPlayer would
-        // either stall indefinitely or land on a segment that the
-        // playlist hasn't materialised. Hosts can hide the scrubber by
-        // observing `$isLive` so this guard is a defence-in-depth.
-        guard !isLive else {
-            EngineLog.emit("[AetherEngine] seek(to:\(seconds)) ignored: source is live", category: .engine)
+        // Live-only sources (no DVR window) have no rewind range; AVPlayer
+        // would either stall indefinitely or land on a segment the playlist
+        // hasn't materialised. DVR sources expose a bounded seekable range
+        // and fall through. Hosts can hide the scrubber by observing
+        // `$seekableLiveRange == nil` so this guard is defence-in-depth.
+        if isLive {
+            guard let w = liveWindow, w.windowSeconds != nil else {
+                EngineLog.emit("[AetherEngine] seek(to:\(seconds)) ignored: live, DVR disabled", category: .engine)
+                return
+            }
+        }
+        // VOD: clamp to [0, duration] in source PTS. Live/DVR: clamp to the
+        // window's session-relative seekable range.
+        let target: Double = isLive ? (liveWindow?.clamp(seconds) ?? seconds) : max(0, min(seconds, duration))
+        state = .seeking
+        if isLive {
+            // Live/DVR native path: translate the session-time target into the
+            // AVPlayer live clock. Measure how far behind the live edge the
+            // (clamped) target sits, then apply that same delta backward from
+            // AVPlayer's current seekable-range end. Because the published edge
+            // is seekableEnd + playlistShiftSeconds (the same fold as the
+            // playhead), this collapses to clockTarget = target - shift, which
+            // is consistent with the engine's source-PTS axis. We compute it via
+            // the behind-delta to stay robust if the edge advances between the
+            // publish tick and this seek.
+            // Software-decode live path: drive the SW host's ring-backed
+            // DVR reseed with the session-time target directly (the host
+            // maps session time to source PTS internally). The native
+            // AVPlayer-clock translation below does not apply; there is no
+            // nativeHost, so do NOT touch nativeClockSeconds.
+            if softwareHost != nil, nativeHost == nil {
+                EngineLog.emit("[AetherEngine] SW live seek target=\(target)", category: .engine)
+                await softwareHost?.seek(to: target)
+                currentTime = target
+                sourceTime = target
+                state = .playing
+                return
+            }
+            let behind = (liveWindow?.edgeTime ?? target) - target   // >= 0; 0 == "to the edge"
+            let clockTarget = max(0, (nativeHost?.seekableEnd ?? 0) - behind)
+            EngineLog.emit("[AetherEngine] live seek target=\(target) behind=\(behind) seekableEnd=\(nativeHost?.seekableEnd ?? 0) clockTarget=\(clockTarget)", category: .engine)
+            // Skip extendVisibleWindow: that is the VOD sliding-window mechanism.
+            // The live playlist already exposes its window of segments.
+            nativeHost?.seek(to: clockTarget)
+            nativeClockSeconds = clockTarget
+            currentTime = target
+            sourceTime = target
+            // publishLiveWindow on the next tick recomputes behindLiveSeconds
+            // against the new playhead.
+            state = .playing
             return
         }
-        let target = max(0, min(seconds, duration))
         // seek(to:) speaks source PTS (the unified engine clock). On the
         // native path AVPlayer's HLS clock sits at source - playlistShiftSeconds,
         // so convert before driving the host. The SW / audio hosts already
         // run on source time (shift 0), making this a no-op there.
         let clockTarget = target - playlistShiftSeconds
-        state = .seeking
         if audioAVPlayerActive, let host = audioAVPlayerHost {
             await host.seek(to: clockTarget)
         } else if let host = audioHost {
@@ -1757,6 +1881,30 @@ public final class AetherEngine: ObservableObject {
     @available(*, deprecated, renamed: "seek(to:)")
     public func seek(toSourceTime seconds: Double) async {
         await seek(to: seconds)
+    }
+
+    /// Update the live DVR window from a path's reported edge and publish the
+    /// four live surfaces (`liveEdgeTime`, `seekableLiveRange`, `isAtLiveEdge`,
+    /// `behindLiveSeconds`). Path-agnostic: the native tick and the SW
+    /// tick both call this with their session-relative edge time. No-op when
+    /// no live window is active.
+    @MainActor
+    private func publishLiveWindow(edgeSessionTime: Double) {
+        guard var w = liveWindow else { return }
+        w.noteEdge(edgeSessionTime)
+        w.notePlayhead(currentTime)
+        liveWindow = w
+        liveEdgeTime = w.edgeTime
+        seekableLiveRange = w.seekableRange
+        isAtLiveEdge = w.isAtEdge
+        behindLiveSeconds = w.behindLiveSeconds
+    }
+
+    /// Seek to the current live edge. No-op when not live. With DVR enabled this
+    /// resolves to `behind = 0` -> `clockTarget = seekableEnd`, i.e. the edge.
+    public func seekToLiveEdge() async {
+        guard isLive, let w = liveWindow else { return }
+        await seek(to: w.edgeTime)
     }
 
     public func stop() {
@@ -1989,6 +2137,8 @@ public final class AetherEngine: ObservableObject {
                     sourceHTTPHeaders: loadedOptions.httpHeaders,
                     startPosition: resumeAt > 1 ? resumeAt : nil,
                     audioSourceStreamIndex: audioStreamIndex,
+                    isLive: loadedOptions.isLive,
+                    dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
                     preopenedDemuxer: customPreopened
                 )
                 EngineLog.emit("[AetherEngine] reload: loadSoftware done (\(elapsedMs(since: loadStart))ms)", category: .engine)
@@ -2585,6 +2735,11 @@ public final class AetherEngine: ObservableObject {
         // `audioTracks`.
         activeAudioTrackIndex = nil
         isLive = false
+        liveWindow = nil
+        liveEdgeTime = 0
+        seekableLiveRange = nil
+        isAtLiveEdge = false
+        behindLiveSeconds = 0
     }
 
     // MARK: - Memory diagnostic
@@ -2800,6 +2955,14 @@ public final class AetherEngine: ObservableObject {
     var cachedBytes: Int64? {
         guard let bytes = nativeVideoSession?.segmentCacheTotalBytes else { return nil }
         return Int64(bytes)
+    }
+
+    /// Authoritative on-disk byte footprint of the loopback HLS segment
+    /// cache (freshly stat-ed resident files), or `nil` when no native
+    /// session is active. Public so the `aetherctl live --report-cache-
+    /// bytes` harness can verify the live window keeps disk bounded.
+    public var segmentCacheDiskBytes: Int64? {
+        nativeVideoSession?.segmentCacheDiskBytes
     }
 
     /// Lifetime count of frames the SW host has enqueued into its

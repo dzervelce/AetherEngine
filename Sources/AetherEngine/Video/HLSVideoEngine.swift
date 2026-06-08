@@ -384,6 +384,94 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// larger playlist footprint is negligible.
     private static let targetSegmentDuration: Double = 4.0
 
+    // MARK: - Measurement spike: sliding-window prototype (superseded)
+    //
+    // PRODUCTIZED (Task B3): the throwaway `_liveSlidingPrototype` flag and
+    // `slidingWindowSize = 12` constant this block originally documented are
+    // GONE. A live session now ALWAYS serves a sliding `.live` playlist
+    // (no PLAYLIST-TYPE, no ENDLIST, advancing MEDIA-SEQUENCE) sized from
+    // `LoadOptions.dvrWindowSeconds` (with a live-only floor) via the shared
+    // `LiveWindowSizing` helper, and the cache evicts strictly below the
+    // playlist's firstVisible. The stall the spike observed (AVPlayer paused
+    // at 81 s) traced to the EVENT-vs-removal contradiction plus an
+    // uncoordinated MEDIA-SEQUENCE slide; the `.live` type plus a
+    // minSafeSegments floor that keeps AVPlayer's live-edge buffer inside
+    // the window removes it. The off-device measurement below is retained
+    // as documentation; on-device tvOS RSS verification is pending with the
+    // maintainer and is NOT this task's success bar (sustained no-stall
+    // playback + advancing MEDIA-SEQUENCE + bounded on-disk bytes is).
+    //
+    // SPIKE RESULT (2026-06-07, aetherctl on macOS, h264-ts-sample.ts,
+    // 300 s each run):
+    //
+    // Baseline (append-only EVENT, _liveSlidingPrototype=false):
+    //   elapsed   phys_footprint_mb   resident_mb
+    //      31s        3625.6              243.1
+    //      61s        7085.4              325.9
+    //      92s        7088.7               48.2
+    //     123s        7087.8               38.8
+    //     154s        7088.0               42.0
+    //     184s        7089.4               41.9
+    //     215s        7089.5               45.6
+    //     246s        7089.6               48.2
+    //     277s        7088.7               41.4
+    //     299s        7087.8               42.6
+    //   Last-half slope (154s-299s, 145s window):
+    //     phys: 7088.0->7087.8 = -0.08 MB/min (FLAT)
+    //     resident: 42.0->42.6 = +0.25 MB/min (noise)
+    //   VERDICT for baseline: FLAT after initial AVPlayer load spike.
+    //
+    // Prototype (sliding MEDIA-SEQUENCE, _liveSlidingPrototype=true):
+    //   elapsed   phys_footprint_mb   resident_mb
+    //      31s        4190.8              268.6
+    //      62s        8312.0              216.0
+    //      92s        8311.3               30.8
+    //     122s        8311.2               24.8
+    //     152s        8311.1               23.9
+    //     183s        8311.1               23.7
+    //     213s        8311.1               22.8
+    //     243s        8311.1               21.9
+    //     273s        8311.1               20.9
+    //     304s        8311.1               21.8
+    //   Last-half slope (152s-304s):
+    //     phys: 8311.1->8311.1 = 0.00 MB/min (FLAT)
+    //     resident: 23.9->21.8 = -0.83 MB/min (DECLINING - eviction working)
+    //   NOTE: AVPlayer stalled (state=paused at 81s). The sliding window
+    //   caused AVPlayer to lose its place when segments fell off the back.
+    //   The measurement is therefore of a stalled, not live-playing session.
+    //
+    // VERDICT: SLIDING BOUNDS FOOTPRINT: NO (on macOS with this fixture)
+    //
+    // Key findings:
+    //   1. Both configurations show FLAT phys_footprint after the initial
+    //      AVPlayer framework load (~90s). The "leak" from the prior EVENT
+    //      experiment (3.0->1.3 MB/sec) was likely a different measurement
+    //      context or a larger/real-world source. The tiny H.264 fixture
+    //      at ~0.5 MB/s does not reproduce linear growth on macOS.
+    //   2. The sliding window DID reduce resident_size (on-disk eviction
+    //      works: old seg files are removed and resident pages drop).
+    //   3. The sliding window BROKE AVPlayer playback (state=paused). This
+    //      is expected: a MEDIA-SEQUENCE sliding window without proper
+    //      live-edge sync causes AVPlayer to lose the playlist window
+    //      mid-play and pause.
+    //   4. phys_footprint on macOS includes compressed VM from all loaded
+    //      frameworks (~7-8 GB for AVFoundation + Swift runtime + aetherctl
+    //      debug binary). On tvOS the equivalent budget is ~500-800 MB.
+    //      This measurement is NOT representative of tvOS jetsam pressure.
+    //
+    // Conclusion for next task:
+    //   The on-disk SegmentCache eviction in the sliding prototype does
+    //   reduce disk pressure and resident pages. The phys_footprint plateau
+    //   on macOS does not prove AVPlayer actually releases segments on tvOS.
+    //   A replaceCurrentItem-based periodic rebuild is still the recommended
+    //   approach for bounding tvOS jetsam-relevant footprint. This spike
+    //   confirmed the measurement harness works and on-disk eviction is
+    //   effective; device-level tvOS measurement is needed for a definitive
+    //   answer.
+    //
+    // End of spike documentation. Sliding is now unconditional for a live
+    // session (see `LiveWindowSizing`).
+
     public init(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
@@ -395,6 +483,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         audioSourceStreamIndexOverride: Int32? = nil,
         initialPositionSeconds: Double? = nil,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
+        isLiveSession: Bool = false,
+        dvrWindowSeconds: Double? = nil,
         preopenedDemuxer: Demuxer? = nil
     ) {
         self.sourceURL = url
@@ -407,8 +497,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
         self.initialPositionSeconds = initialPositionSeconds
         self.audioBridgeMode = audioBridgeMode
+        self.isLiveSession = isLiveSession
+        self.dvrWindowSeconds = dvrWindowSeconds
         self.preopenedDemuxer = preopenedDemuxer
     }
+
+    /// Whether this engine is serving an unbounded (live) source. Set
+    /// once at init from `LoadOptions.isLive`. When true, `start()`
+    /// skips the VOD-only duration guard, mid-duration cue prewarm, and
+    /// precomputed segment plan, and instead builds the provider +
+    /// producer in their forward-only live cut mode (the producer cuts
+    /// a new segment at each video keyframe past the duration target and
+    /// appends it to the provider's growing segment list). VOD paths
+    /// leave this false and are unaffected.
+    private let isLiveSession: Bool
+
+    /// DVR window in seconds for a live session (from `LoadOptions`).
+    /// `nil` means live-only: no DVR seek, but the live window is still
+    /// bounded to `LiveWindowSizing.liveOnlyFloorSeconds`. Threaded into
+    /// the provider so the sliding playlist window and the cache eviction
+    /// share one size. Ignored for VOD.
+    private let dvrWindowSeconds: Double?
 
     /// Encoder choice for the audio bridge (used for source codecs that
     /// can't stream-copy into fMP4: TrueHD, DTS, DTS-HD MA, MP3, Opus,
@@ -453,7 +562,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         } else {
             dem = Demuxer()
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders)
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, isLive: isLiveSession)
             } catch {
                 throw HLSVideoEngineError.openFailed(reason: "\(error)")
             }
@@ -494,63 +603,85 @@ public final class HLSVideoEngine: @unchecked Sendable {
         if videoTimeBase.num > 0, videoTimeBase.den > 0 {
             sourceVideoTbSeconds = Double(videoTimeBase.num) / Double(videoTimeBase.den)
         }
+        // Live sources are unbounded: `dem.duration` is 0 (or negative).
+        // The VOD-only duration guard, mid-duration cue prewarm, and
+        // precomputed keyframe plan all assume a finite source, so the
+        // whole block below is gated. For live, the producer's
+        // forward-only live cut mode (keyframe + elapsed-time cuts)
+        // replaces the precomputed plan, and the provider's segment
+        // list grows as the producer appends finalized segments.
         let durationSeconds = dem.duration
-        guard durationSeconds > 0 else {
-            throw HLSVideoEngineError.zeroDuration
-        }
-        sourceBitrate = dem.bitRate
-
-        // 2. Prewarm the MKV cue table so libavformat's keyframe index
-        //    is populated. avformat_seek_file's first invocation on an
-        //    MKV source lazily parses the Cues element from the file
-        //    tail, which fans out into one or two HTTP byte-range
-        //    reads. Mid-duration target so the prewarm doesn't strand
-        //    the demuxer cursor far from where playback starts.
-        let prewarmStart = DispatchTime.now()
-        dem.seek(to: durationSeconds * 0.5)
-        let prewarmMs = Double(DispatchTime.now().uptimeNanoseconds - prewarmStart.uptimeNanoseconds) / 1_000_000
-        EngineLog.emit("[HLSVideoEngine] cue prewarm: seek to \(String(format: "%.1f", durationSeconds * 0.5))s took \(String(format: "%.1f", prewarmMs))ms")
-
-        // 3. Build the segment plan from real keyframes in the index,
-        //    using the SAME cut algorithm libavformat's hls muxer uses
-        //    internally (first keyframe at-or-after `(segIdx+1) * hls_time`
-        //    absolute from start_pts). When the index doesn't have
-        //    enough entries we fall back to a uniform stride; the
-        //    muxer may then end up making a slightly different number
-        //    of segments than we planned, but Phase A doesn't test
-        //    that path and Phase B's restart machinery handles any
-        //    drift at scrub time.
-        let keyframes = dem.indexedKeyframes(streamIndex: videoIndex)
         let plan: [Segment]
-        if keyframes.count >= 2 {
-            plan = buildKeyframeSegmentPlan(
-                keyframes: keyframes,
-                videoTimeBase: videoTimeBase,
-                sourceDurationSeconds: durationSeconds
-            )
-            let detectedFirstKeyframePts = keyframes.sorted().first ?? 0
-            self.firstKeyframePts = detectedFirstKeyframePts
-            let firstKeyframePts = detectedFirstKeyframePts
-            let firstKeyframeSeconds = Double(firstKeyframePts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
-            self.firstKeyframeSeconds = firstKeyframeSeconds
-            let videoStreamStart = videoStream.pointee.start_time
-            let formatStart = dem.formatStartTime
+        if isLiveSession {
+            // Unbounded source. No duration guard, no prewarm seek, no
+            // precomputed plan. The producer cuts segments live and the
+            // provider's list starts empty and grows.
+            sourceBitrate = dem.bitRate
+            self.firstKeyframePts = 0
+            self.firstKeyframeSeconds = 0
+            plan = []
             EngineLog.emit(
-                "[HLSVideoEngine] segment plan: keyframe-aligned, \(keyframes.count) IRAPs → \(plan.count) segments " +
-                "[firstKeyframePts=\(firstKeyframePts) (\(String(format: "%.3f", firstKeyframeSeconds))s) " +
-                "videoStream.start_time=\(videoStreamStart) format.start_time=\(formatStart)us " +
-                "plan[0].startSeconds=\(String(format: "%.3f", plan.first?.startSeconds ?? -1))]",
+                "[HLSVideoEngine] LIVE session: skipping duration guard / prewarm / plan "
+                + "(dem.duration=\(String(format: "%.1f", durationSeconds))s, producer cuts segments forward)",
                 category: .session
             )
         } else {
-            plan = buildUniformSegmentPlan(
-                videoTimeBase: videoTimeBase,
-                sourceDurationSeconds: durationSeconds
-            )
-            EngineLog.emit(
-                "[HLSVideoEngine] segment plan: uniform stride fallback (\(keyframes.count) IRAPs in index, need >=2)",
-                category: .session
-            )
+            guard durationSeconds > 0 else {
+                throw HLSVideoEngineError.zeroDuration
+            }
+            sourceBitrate = dem.bitRate
+
+            // 2. Prewarm the MKV cue table so libavformat's keyframe index
+            //    is populated. avformat_seek_file's first invocation on an
+            //    MKV source lazily parses the Cues element from the file
+            //    tail, which fans out into one or two HTTP byte-range
+            //    reads. Mid-duration target so the prewarm doesn't strand
+            //    the demuxer cursor far from where playback starts.
+            let prewarmStart = DispatchTime.now()
+            dem.seek(to: durationSeconds * 0.5)
+            let prewarmMs = Double(DispatchTime.now().uptimeNanoseconds - prewarmStart.uptimeNanoseconds) / 1_000_000
+            EngineLog.emit("[HLSVideoEngine] cue prewarm: seek to \(String(format: "%.1f", durationSeconds * 0.5))s took \(String(format: "%.1f", prewarmMs))ms")
+
+            // 3. Build the segment plan from real keyframes in the index,
+            //    using the SAME cut algorithm libavformat's hls muxer uses
+            //    internally (first keyframe at-or-after `(segIdx+1) * hls_time`
+            //    absolute from start_pts). When the index doesn't have
+            //    enough entries we fall back to a uniform stride; the
+            //    muxer may then end up making a slightly different number
+            //    of segments than we planned, but Phase A doesn't test
+            //    that path and Phase B's restart machinery handles any
+            //    drift at scrub time.
+            let keyframes = dem.indexedKeyframes(streamIndex: videoIndex)
+            if keyframes.count >= 2 {
+                plan = buildKeyframeSegmentPlan(
+                    keyframes: keyframes,
+                    videoTimeBase: videoTimeBase,
+                    sourceDurationSeconds: durationSeconds
+                )
+                let detectedFirstKeyframePts = keyframes.sorted().first ?? 0
+                self.firstKeyframePts = detectedFirstKeyframePts
+                let firstKeyframePts = detectedFirstKeyframePts
+                let firstKeyframeSeconds = Double(firstKeyframePts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
+                self.firstKeyframeSeconds = firstKeyframeSeconds
+                let videoStreamStart = videoStream.pointee.start_time
+                let formatStart = dem.formatStartTime
+                EngineLog.emit(
+                    "[HLSVideoEngine] segment plan: keyframe-aligned, \(keyframes.count) IRAPs → \(plan.count) segments " +
+                    "[firstKeyframePts=\(firstKeyframePts) (\(String(format: "%.3f", firstKeyframeSeconds))s) " +
+                    "videoStream.start_time=\(videoStreamStart) format.start_time=\(formatStart)us " +
+                    "plan[0].startSeconds=\(String(format: "%.3f", plan.first?.startSeconds ?? -1))]",
+                    category: .session
+                )
+            } else {
+                plan = buildUniformSegmentPlan(
+                    videoTimeBase: videoTimeBase,
+                    sourceDurationSeconds: durationSeconds
+                )
+                EngineLog.emit(
+                    "[HLSVideoEngine] segment plan: uniform stride fallback (\(keyframes.count) IRAPs in index, need >=2)",
+                    category: .session
+                )
+            }
         }
 
         // 4. Classify the DV variant + dispatch codec / CODECS /
@@ -611,7 +742,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // 6. Position the demuxer at the file's first packet so the
         //    producer's pump starts from byte zero. The cue prewarm
         //    above moved the cursor mid-file; libavformat's index is
-        //    populated now, this seek-to-the-start is cheap.
+        //    populated now, this seek-to-the-start is cheap. Skipped for
+        //    live: there was no prewarm seek to undo, and an unbounded
+        //    source is forward-only (a head seek would either no-op or
+        //    disturb the producer's read cursor on the loopback feed).
         //
         //    `snapEarlier` caps max_ts at the target so the demuxer lands
         //    at-or-BEFORE the first keyframe rather than at the next cluster
@@ -626,14 +760,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         //    rather than silently ship a session that starts without audio.
         //    (We do NOT reopen on failure — videoStream/codecpar captured
         //    above would dangle; throwing is the safe response.)
-        let headSeekRet = dem.seek(to: firstKeyframeSeconds, snapEarlier: true)
-        if headSeekRet < 0 {
-            EngineLog.emit(
-                "[HLSVideoEngine] head-of-stream seek to \(String(format: "%.3f", firstKeyframeSeconds))s "
-                + "failed (\(headSeekRet)); aborting load (audio major-sync not guaranteed)",
-                category: .session
-            )
-            throw HLSVideoEngineError.headSeekFailed(code: headSeekRet)
+        if !isLiveSession {
+            let headSeekRet = dem.seek(to: firstKeyframeSeconds, snapEarlier: true)
+            if headSeekRet < 0 {
+                EngineLog.emit(
+                    "[HLSVideoEngine] head-of-stream seek to \(String(format: "%.3f", firstKeyframeSeconds))s "
+                    + "failed (\(headSeekRet)); aborting load (audio major-sync not guaranteed)",
+                    category: .session
+                )
+                throw HLSVideoEngineError.headSeekFailed(code: headSeekRet)
+            }
         }
 
         // 6. Build the segment cache + producer. The producer's
@@ -883,7 +1019,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Convert resume position (if any) to a segment index so the
         // provider's sliding-window playlist starts with the resume
         // segment already visible.
-        let initialIndex = Self.segmentIndex(forSeconds: initialPositionSeconds, plan: plan)
+        let initialIndex = isLiveSession
+            ? 0
+            : Self.segmentIndex(forSeconds: initialPositionSeconds, plan: plan)
+        // Live: no precomputed plan, no restart machinery (the feed is
+        // forward-only and the live playlist grows as the producer cuts
+        // segments). VOD keeps the restart handler so
+        // scrubs relocate the producer.
         let prov = VideoSegmentProvider(
             cache: segmentCache,
             segments: plan,
@@ -895,11 +1037,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
             hdcpLevel: hdcpLevel,
             sourceBitrate: sourceBitrate,
             initialIndex: initialIndex,
-            restartHandler: { [weak self] idx in
+            isLive: isLiveSession,
+            liveWindowSizing: LiveWindowSizing(
+                targetSegmentDurationSeconds: Self.targetSegmentDuration,
+                dvrWindowSeconds: dvrWindowSeconds
+            ),
+            restartHandler: isLiveSession ? nil : { [weak self] idx in
                 self?.restartProducer(at: idx)
             }
         )
         self.provider = prov
+        // Live producer appends each finalized segment to the provider's
+        // growing list so the live playlist exposes it on the next poll.
+        if isLiveSession {
+            prod.onLiveSegmentFinalized = { [weak prov] index, durationSeconds, startPtsSeconds, discontinuous in
+                prov?.appendLiveSegment(index: index,
+                                        startSeconds: startPtsSeconds,
+                                        durationSeconds: durationSeconds,
+                                        discontinuous: discontinuous)
+            }
+        }
 
         EngineLog.emit(
             "[HLSVideoEngine] prepared: codec=\(manifestCodecs)"
@@ -1126,6 +1283,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Resident bytes in the loopback HLS segment cache.
     var segmentCacheTotalBytes: Int { cache?.totalBytes ?? 0 }
 
+    /// Authoritative on-disk byte footprint of the resident segment files
+    /// (freshly stat-ed). 0 when no native session is active. Used by the
+    /// `aetherctl live --report-cache-bytes` harness to verify the live
+    /// window keeps disk bounded.
+    var segmentCacheDiskBytes: Int64 { cache?.diskBytes() ?? 0 }
+
     /// Producer restart sessions in the current session.
     var producerRestartCount: Int { producer?.restartCount ?? 0 }
 
@@ -1299,6 +1462,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // resource teardown move to a detached task.
         p?.stop()
 
+        // Unblock the pump's read synchronously. A live producer can be parked
+        // inside av_read_frame in the AVIO reconnect loop, which only exits on
+        // the reader's closed flag (not the producer's cancel flag). Without
+        // this, the detached waitForFinish below blocks for up to 3s while the
+        // old live source storms reconnects (e.g. Jellyfin 400s a superseded
+        // transcode) until the reconnect cap is hit, polluting the next
+        // session on the shared engine. markClosed is lock-free and
+        // idempotent; the detached close() still frees the resources.
+        d?.markClosed()
+        preopened?.markClosed()
+
         // Detached cleanup. The closure captures the local resource
         // strong refs (not self), so they live as long as the cleanup
         // needs them. The producer waitForFinish has to come before
@@ -1402,7 +1576,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             restartTargetVideoDts: videoTarget,
             desiredFirstVideoTfdtPts: desiredVideoTfdt,
             desiredFirstAudioTfdtPts: desiredAudioTfdt,
-            segmentBoundaries: segmentBoundaries
+            segmentBoundaries: segmentBoundaries,
+            isLive: isLiveSession
         )
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
@@ -2437,8 +2612,54 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let endPts: Int64
         let startSeconds: Double
         let durationSeconds: Double
+        /// True when this segment opened at a detected live PTS
+        /// discontinuity (program boundary). The playlist builder prefixes
+        /// such a segment with `#EXT-X-DISCONTINUITY`. Always false for VOD
+        /// (the precomputed plan has no discontinuities).
+        var discontinuous: Bool = false
     }
 
+}
+
+// MARK: - Live window sizing
+
+/// Single source of truth for how large the sliding live window is, in
+/// segments. Both the playlist's visible window (`firstVisible = highWater -
+/// windowSegmentCount`) and the on-disk cache eviction (`evictBelow(
+/// firstVisible)`) read this so the two can never drift apart (a drift is
+/// exactly what stalls AVPlayer: the playlist keeps listing a segment the
+/// cache already deleted, or the cache keeps a segment the playlist dropped).
+///
+/// `effectiveWindowSeconds = dvrWindowSeconds ?? liveOnlyFloorSeconds`.
+/// Live-only (no DVR seek) still gets a bounded floor so disk and the
+/// playlist stay finite. `windowSegmentCount = max(minSafeSegments,
+/// ceil(effectiveWindowSeconds / targetSegmentDurationSeconds))`.
+struct LiveWindowSizing {
+    /// Bound applied to a live-only session (no `dvrWindowSeconds`). No DVR
+    /// seek is offered, but the window is still capped so memory and disk
+    /// do not grow without bound. 60 s at 4 s segments is 15 segments.
+    static let liveOnlyFloorSeconds: Double = 60
+
+    /// Floor on the segment count regardless of how small the requested
+    /// window is. AVPlayer keeps several target-durations of media buffered
+    /// near the live edge (it prefetches ~5-7 segments ahead during normal
+    /// playback, see `forwardWaitWindow`). If the window were smaller than
+    /// that buffer, AVPlayer's forward/backward live-edge reads would
+    /// routinely fall below MEDIA-SEQUENCE and it would lose its position
+    /// (the spike's 81 s stall). 8 keeps the window comfortably wider than
+    /// AVPlayer's live-edge buffer at 4 s segments (32 s of runway).
+    static let minSafeSegments = 8
+
+    let targetSegmentDurationSeconds: Double
+    let dvrWindowSeconds: Double?
+
+    /// Number of segments the playlist keeps visible (and the cache keeps
+    /// resident). Clamped up to `minSafeSegments`.
+    var windowSegmentCount: Int {
+        let effective = dvrWindowSeconds ?? Self.liveOnlyFloorSeconds
+        let raw = Int(ceil(effective / max(0.5, targetSegmentDurationSeconds)))
+        return max(Self.minSafeSegments, raw)
+    }
 }
 
 // MARK: - Cache-backed provider
@@ -2459,10 +2680,28 @@ public final class HLSVideoEngine: @unchecked Sendable {
 ///    fire `restartHandler` so the engine can teardown + reseek
 ///    + spin up a fresh producer rooted at the new segment index,
 ///    then re-block on cache.fetch.
-private final class VideoSegmentProvider: HLSSegmentProvider {
+private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     private let cache: SegmentCache
-    private let segments: [HLSVideoEngine.Segment]
+    /// Segment list. Immutable for VOD (the precomputed plan). For live
+    /// it starts empty and the producer appends one entry per finalized
+    /// segment via `appendLiveSegment`, guarded by `stateLock`. All reads
+    /// (`segmentCount`, `segmentDuration(at:)`, `mediaSegmentURL(at:)`,
+    /// `notePlaylistBuild`) take the lock when `isLive` so the growing
+    /// list is observed consistently from the server's playlist-build
+    /// thread.
+    private var segments: [HLSVideoEngine.Segment]
+
+    /// Whether this provider backs a live (unbounded, growing) session.
+    /// Gates the mutable-segments path, the `.event` playlist type (no
+    /// ENDLIST so AVPlayer re-polls), and the locked reads. VOD leaves
+    /// this false and behaves byte-for-byte as before.
+    private let isLive: Bool
+
+    /// Sliding live window sizing. Drives both the playlist's visible
+    /// window (`firstVisible = highWater - windowSegmentCount`) and the
+    /// cache eviction cutoff, so the two never drift. Dormant for VOD.
+    private let liveWindowSizing: LiveWindowSizing
 
     private let codecsString: String
     private let supplementalCodecsString: String?
@@ -2530,13 +2769,13 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     /// feel sluggish, raise if a residual storm remains.
     private static let restartBackwardLeadIn = 8
 
-    // MARK: - Sliding-window EVENT playlist state
+    // MARK: - Sliding-window live/VOD playlist state
 
     /// Segments visible in /media.m3u8 are `[0, visibleHighWater]`.
-    /// EVENT playlists are append-only per RFC 8216 §6.2.1, so this
-    /// counter is monotonic over a session. Grows by `growthPerRefresh`
-    /// on each playlist build, plus explicit jumps from
-    /// `extendVisibleWindow(toCover:)` on seek.
+    /// The visible window is monotonically increasing over a session
+    /// (live sliding window never retracts; VOD seek only extends).
+    /// Grows by `growthPerRefresh` on each playlist build, plus explicit
+    /// jumps from `extendVisibleWindow(toCover:)` on seek.
     ///
     /// Initial value covers the resume position so AVPlayer's first
     /// playlist read already contains the seg AVPlayer is about to
@@ -2548,9 +2787,20 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     /// (target-duration / 2 cadence, ≈ 2 s for our 4 s segments).
     /// Adding ≥ 1 segment per build keeps that check happy.
     private let stateLock = NSLock()
+    /// Condition variable used to signal `waitForFirstLiveSegment` when
+    /// the first live segment is appended. A separate NSCondition (not
+    /// the NSLock above) so the manifest handler can block without
+    /// holding the segment-list lock. Signaled once from
+    /// `appendLiveSegment` when `segments.count` transitions from 0 to 1.
+    private let firstSegmentCondition = NSCondition()
     private var visibleHighWater: Int
     private var refreshCounter: Int = 0
     private var endlistAdded: Bool = false
+    /// First segment index visible in the live sliding-window playlist
+    /// (`#EXT-X-MEDIA-SEQUENCE`). Monotonically increasing; advanced by
+    /// `notePlaylistBuild` to `max(0, highWater - windowSegmentCount)`.
+    /// Stays 0 for VOD and the append-only EVENT audio path.
+    private var _liveFirstVisible: Int = 0
 
     /// How many segments past the resume position the initial playlist
     /// exposes. 30 × 4 s = 120 s of forward runway: enough to absorb
@@ -2577,10 +2827,14 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         hdcpLevel: String?,
         sourceBitrate: Int64,
         initialIndex: Int = 0,
+        isLive: Bool = false,
+        liveWindowSizing: LiveWindowSizing = LiveWindowSizing(targetSegmentDurationSeconds: 4.0, dvrWindowSeconds: nil),
         restartHandler: ((Int) -> Void)? = nil
     ) {
         self.cache = cache
         self.segments = segments
+        self.isLive = isLive
+        self.liveWindowSizing = liveWindowSizing
         self.codecsString = codecsString
         self.supplementalCodecsString = supplementalCodecs
         self.resolution = resolution
@@ -2590,9 +2844,58 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         self.sourceBitrate = sourceBitrate
         self.restartHandler = restartHandler
 
-        let safeInitial = max(0, min(initialIndex, segments.count - 1))
-        let target = safeInitial + Self.initialFillSegments
-        self.visibleHighWater = min(segments.count - 1, max(Self.initialFillSegments, target))
+        if isLive {
+            // Live starts with an empty list; the producer appends as it
+            // cuts. The sliding-window state is dormant for live.
+            self.visibleHighWater = -1
+        } else {
+            let safeInitial = max(0, min(initialIndex, segments.count - 1))
+            let target = safeInitial + Self.initialFillSegments
+            self.visibleHighWater = min(segments.count - 1, max(Self.initialFillSegments, target))
+        }
+    }
+
+    /// Append a producer-finalized live segment to the growing list under
+    /// the state lock. Called once per fragment cut from the producer's
+    /// pump thread (live mode only). `index` is the absolute segment
+    /// index the producer assigned; appends are sequential so the list's
+    /// position equals `index`. Defensive: an out-of-order or duplicate
+    /// index is ignored so the list stays a dense `[0, n)`.
+    func appendLiveSegment(index: Int, startSeconds: Double, durationSeconds: Double,
+                           discontinuous: Bool = false) {
+        stateLock.lock()
+        let wasEmpty = segments.isEmpty
+        guard index == segments.count else {
+            stateLock.unlock()
+            EngineLog.emit(
+                "[HLSVideoEngine] live segment append out of order: got index=\(index), "
+                + "expected \(segments.count); ignoring",
+                category: .session
+            )
+            return
+        }
+        // unused for live; left 0 to avoid a wrong-timebase latent value
+        // (source video TB is not reachable from this provider without a
+        // large new dependency; DVR restart machinery will supply correct
+        // values when wired)
+        let startPts: Int64 = 0
+        let endPts: Int64 = 0
+        segments.append(HLSVideoEngine.Segment(
+            startPts: startPts,
+            endPts: endPts,
+            startSeconds: startSeconds,
+            durationSeconds: durationSeconds,
+            discontinuous: discontinuous
+        ))
+        stateLock.unlock()
+        // Signal `waitForFirstLiveSegment` if this is the first segment
+        // so the server's manifest handler can unblock and serve a playlist
+        // that already contains playable content.
+        if wasEmpty {
+            firstSegmentCondition.lock()
+            firstSegmentCondition.broadcast()
+            firstSegmentCondition.unlock()
+        }
     }
 
     // MARK: - Sliding-window operations
@@ -2602,6 +2905,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     /// new segment fetch so the playlist already lists the target by
     /// the time AVPlayer re-reads it. Idempotent and monotonic.
     func extendVisibleWindow(toCover index: Int) {
+        guard !isLive else { return }   // live uses segments.count directly; window/endlist are VOD-only
         stateLock.lock()
         defer { stateLock.unlock() }
         guard !endlistAdded else { return }
@@ -2614,19 +2918,61 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         }
     }
 
-    /// Atomic snapshot the playlist build reads from. Now that we're
-    /// back on .vod playlistType the sliding-window state is dormant
-    /// (visibleHighWater is still tracked for future EVENT revival,
-    /// but the snapshot reports the full segment count so AVPlayer
-    /// sees the complete playlist with a correct asset.duration).
-    /// Without this fix the snapshot was returning visibleHighWater+1
-    /// (=31 at session start), causing AVPlayer to think the asset
-    /// was 2:13 long and stop playback at that point.
+    /// Atomic snapshot the playlist build reads from. For VOD this
+    /// reports the full segment count so AVPlayer sees a complete asset
+    /// with a correct duration (the historical EVENT experiment that
+    /// reported visibleHighWater+1 made AVPlayer think the asset was
+    /// 2:13 and stop there).
+    ///
+    /// For a live session this advances `_liveFirstVisible` to
+    /// `max(0, highWater - windowSegmentCount)` so the playlist window
+    /// slides forward, then evicts everything strictly below the new
+    /// firstVisible from the cache. The same `windowSegmentCount` drives
+    /// both, so the playlist and the cache stay byte-for-byte aligned.
+    /// firstVisible only advances once enough segments exist to seed
+    /// AVPlayer's live edge (the window stays anchored at 0 until then),
+    /// which is the anti-stall guarantee.
     func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool) {
         stateLock.lock()
         defer { stateLock.unlock() }
         refreshCounter += 1
+        if isLive {
+            let total = segments.count
+            let window = liveWindowSizing.windowSegmentCount
+            // highWater is the last produced index (total - 1). Keep the
+            // last `window` segments visible: firstVisible = highWater -
+            // window + 1 = total - window. Until at least `window`
+            // segments exist, do not advance past 0 so AVPlayer's first
+            // read sees all produced segments and can establish a live
+            // edge without losing a not-yet-buffered position.
+            let newFirst = max(0, total - window)
+            if newFirst > _liveFirstVisible {
+                _liveFirstVisible = newFirst
+                // Evict everything below the new firstVisible. Off-lock to
+                // avoid holding stateLock during file I/O; evictBelow takes
+                // its own lock. Strictly below firstVisible, so no segment
+                // the playlist still lists (or AVPlayer's live-edge buffer
+                // still references) is ever removed.
+                let cutoff = newFirst
+                let cacheRef = cache
+                DispatchQueue.global(qos: .utility).async {
+                    cacheRef.evictBelow(cutoff)
+                }
+            }
+            return (total, refreshCounter, false)
+        }
         return (segments.count, refreshCounter, false)
+    }
+
+    /// First segment index visible in the current playlist window.
+    /// For VOD (and the append-only EVENT audio path) this is always 0.
+    /// For a live session this is `_liveFirstVisible`, which advances as
+    /// old segments fall off the back of the sliding window.
+    var firstVisibleSegmentIndex: Int {
+        guard isLive else { return 0 }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _liveFirstVisible
     }
 
     // MARK: - HLSSegmentProvider
@@ -2645,7 +2991,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     /// `mediaSegment(at:)` (which does drive those side effects) on
     /// nil.
     func mediaSegmentURL(at index: Int) -> URL? {
-        guard index >= 0, index < segments.count else { return nil }
+        guard index >= 0, index < currentSegmentCount else { return nil }
         // Drive cache-window + restart side effects same as the Data
         // path; only the byte materialization changes. Without this
         // the sendfile path would skip the producer restart on
@@ -2691,7 +3037,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     }
 
     func mediaSegment(at index: Int) -> Data? {
-        guard index >= 0, index < segments.count else { return nil }
+        guard index >= 0, index < currentSegmentCount else { return nil }
         let totalStart = DispatchTime.now()
 
         // Defensive: if AVPlayer fetches a segment beyond the current
@@ -2897,11 +3243,38 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         return bytes
     }
 
-    var segmentCount: Int { segments.count }
+    /// Segment-count read that takes `stateLock` for live (the list grows
+    /// on the producer thread) and reads directly for VOD (immutable list,
+    /// no lock needed, byte-for-byte unchanged behaviour).
+    private var currentSegmentCount: Int {
+        guard isLive else { return segments.count }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return segments.count
+    }
+
+    var segmentCount: Int { currentSegmentCount }
 
     func segmentDuration(at index: Int) -> Double {
+        if isLive {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            guard index >= 0, index < segments.count else { return 0 }
+            return segments[index].durationSeconds
+        }
         guard index >= 0, index < segments.count else { return 0 }
         return segments[index].durationSeconds
+    }
+
+    func segmentIsDiscontinuous(at index: Int) -> Bool {
+        if isLive {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            guard index >= 0, index < segments.count else { return false }
+            return segments[index].discontinuous
+        }
+        guard index >= 0, index < segments.count else { return false }
+        return segments[index].discontinuous
     }
 
     /// Reverted to .vod after the sliding-window EVENT experiment:
@@ -2914,7 +3287,43 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
     /// live-edge default overrode EXT-X-START even with the
     /// explicit seek-to-0). The leak is fundamental to the
     /// AVPlayer + HLS-loopback pipeline for 4K HDR HEVC content.
-    var playlistType: HLSPlaylistType { .vod }
+    /// Live sessions serve a `.live` playlist: no `#EXT-X-PLAYLIST-TYPE`
+    /// and no `#EXT-X-ENDLIST`, with an advancing `#EXT-X-MEDIA-SEQUENCE`
+    /// as the sliding window drops consumed segments. EVENT was tried
+    /// first but forbids segment removal (the spec), which contradicts a
+    /// sliding window and was the likely cause of the spike's 81 s stall;
+    /// VOD implies a finished asset and stops playback at the first read.
+    /// `.live` is the only spec-correct shape for a window that grows at
+    /// the edge AND drops the back. VOD stays `.vod` (the reverted-EVENT
+    /// rationale below applies only to finite files); the audio-append
+    /// path keeps `.event` available.
+    var playlistType: HLSPlaylistType { isLive ? .live : .vod }
+    /// Expose the producer's cut target so the playlist builder can anchor
+    /// `#EXT-X-TARGETDURATION` to a stable, generous value from the first
+    /// manifest, avoiding the -12888 startup race for high-bitrate live
+    /// sources. Returns nil for VOD (the default extension nil suffices).
+    var liveTargetSegmentDuration: Double? {
+        isLive ? liveWindowSizing.targetSegmentDurationSeconds : nil
+    }
+    /// Block the calling thread until the first live segment is appended,
+    /// or until `timeout` seconds elapse. Returns true if a segment is
+    /// available, false on timeout. Non-live sessions return immediately.
+    /// Used by the manifest handler to avoid serving an empty live playlist
+    /// that causes AVPlayer to fire CoreMediaErrorDomain -12888 on the
+    /// very first poll (before any `#EXTINF` entries exist).
+    func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool {
+        guard isLive else { return true }
+        let deadline = Date().addingTimeInterval(timeout)
+        firstSegmentCondition.lock()
+        defer { firstSegmentCondition.unlock() }
+        while true {
+            stateLock.lock()
+            let count = segments.count
+            stateLock.unlock()
+            if count > 0 { return true }
+            if !firstSegmentCondition.wait(until: deadline) { return false }
+        }
+    }
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
     var masterResolution: (width: Int, height: Int)? {

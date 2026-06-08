@@ -393,14 +393,43 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// True for the playback path: known file size + sequential read-ahead.
     /// Selects the persistent forward-streaming reader over the chunked
-    /// random-access one. `isStreaming` (no file size) takes precedence.
-    private var usePersistentReader: Bool { !isStreaming && prefetchEnabled }
+    /// random-access one.
+    ///
+    /// For a live source (`isLive`), the persistent reader is always
+    /// selected even without a known fileSize. The persistent reader has
+    /// full reconnect/backoff machinery; the streaming reader has none. A
+    /// live feed that drops its connection would otherwise collapse to a
+    /// silent EOF in `readStreaming`. `isStreaming` no longer takes
+    /// precedence for live sources.
+    private var usePersistentReader: Bool {
+        if isLive { return prefetchEnabled }
+        return !isStreaming && prefetchEnabled
+    }
 
-    init(url: URL, extraHeaders: [String: String] = [:], chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true) {
+    /// When true, the reader treats the source as a genuinely endless live
+    /// feed: `fileSize` is non-authoritative (may be 0 or a stale chunk
+    /// length) and the persistent-read EOF branch that fires on
+    /// `position >= fileSize` is suppressed. When the unproductive-reconnect
+    /// cap is hit on a live source the reader sets `liveExhausted` instead
+    /// of collapsing to a silent EOF, so the demuxer surfaces a terminal
+    /// error the host can map to "live source lost". For a non-live source
+    /// all existing EOF / cap behaviour is unchanged.
+    let isLive: Bool
+
+    /// Set to true by `readPersistent` when the unproductive-reconnect cap
+    /// is hit on a live source. `readPersistent` then returns a distinct
+    /// FFmpeg error code (-5 / EIO) instead of AVERROR_EOF, so the demuxer
+    /// raises a `readFailed` error the engine maps to `.error("live source
+    /// lost")` rather than a silent EOF/stall. Demux-thread-only (written
+    /// under no lock; read by the same thread before the read path exits).
+    private(set) var liveExhausted = false
+
+    init(url: URL, extraHeaders: [String: String] = [:], chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false) {
         self.url = url
         self.extraHeaders = extraHeaders
         self.chunkSize = chunkSize
         self.prefetchEnabled = prefetchEnabled
+        self.isLive = isLive
     }
 
     /// Apply the caller-supplied extra headers to a request. Used by
@@ -439,16 +468,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         context = ctx
 
-        if isStreaming {
-            // Streaming mode: start a continuous GET request in background.
-            // Data accumulates in streamBuffer, read() serves from it.
-            startStreamingDownload()
-            // Wait for initial data before returning
-            _ = streamDataReady.wait(timeout: .now() + .seconds(15))
-        } else if usePersistentReader {
-            // Persistent mode (playback): open one forward-streaming
+        if usePersistentReader {
+            // Persistent mode (playback and live): open one forward-streaming
             // connection at offset 0 and wait for the first bytes before
-            // returning so avformat_open_input has data to probe.
+            // returning so avformat_open_input has data to probe. For a live
+            // source this path is reached even without a known fileSize.
             startPersistentConnection(at: 0)
             winCond.lock()
             let deadline = Date(timeIntervalSinceNow: 15)
@@ -463,6 +487,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // over once avformat_open_input starts pulling.
                 EngineLog.emit("[AVIOReader] Persistent open: no data within 15s, proceeding to read-loop reconnect", category: .demux)
             }
+        } else if isStreaming {
+            // Streaming mode (non-live, no Content-Length): start a continuous
+            // GET in the background. Data accumulates in streamBuffer, read()
+            // serves from it. No reconnect; a dropped connection surfaces as
+            // EOF. For live sources the persistent path is used instead.
+            startStreamingDownload()
+            _ = streamDataReady.wait(timeout: .now() + .seconds(15))
         } else {
             // Seekable chunked mode (still extraction / random access):
             // pre-fill the first chunk with a Range request.
@@ -552,8 +583,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     fileprivate func read(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         guard !isClosed else { return -1 }
-        if isStreaming { return readStreaming(into: buf, size: size) }
+        // For a live source, persistent reader is preferred even without a
+        // known fileSize. Check usePersistentReader before isStreaming so a
+        // live feed with no Content-Length is routed through the reconnect-
+        // capable persistent path rather than the single-shot streaming path.
         if usePersistentReader { return readPersistent(into: buf, size: size) }
+        if isStreaming { return readStreaming(into: buf, size: size) }
         return readSeekable(into: buf, size: size)
     }
 
@@ -761,7 +796,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let retryAfter = connRetryAfter
 
             // Genuine end of file — the ONLY path that reports EOF.
-            if fileSize > 0 && curPosition >= fileSize {
+            // For a live source fileSize is non-authoritative (may be 0 or
+            // a stale chunk-length header); skip this check entirely so a
+            // live feed never gets a synthesized EOF from a position
+            // comparison.
+            if !isLive && fileSize > 0 && curPosition >= fileSize {
                 winCond.unlock()
                 return totalRead > 0 ? Int32(totalRead) : AVERROR_EOF_VALUE
             }
@@ -784,7 +823,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 if !signaled {
                     // A socket stall (no data for connStallTimeout) is transient.
                     if recordReconnectAndShouldGiveUp(permanent: false) {
-                        EngineLog.emit("[AVIOReader] Persistent stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)", category: .demux)
+                        EngineLog.emit("[AVIOReader] Persistent stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")", category: .demux)
+                        if isLive {
+                            liveExhausted = true
+                            return totalRead > 0 ? Int32(totalRead) : AVERROR_EIO_VALUE
+                        }
                         return totalRead > 0 ? Int32(totalRead) : -1
                     }
                     EngineLog.emit("[AVIOReader] Persistent stall at offset \(frontier), reconnecting", category: .demux)
@@ -801,7 +844,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // 404/410 are permanent; timeouts (status 0), expiry, 429/503, 5xx
             // and drops are transient and retried through.
             if recordReconnectAndShouldGiveUp(permanent: Self.isPermanentStatus(status)) {
-                EngineLog.emit("[AVIOReader] Persistent reconnect exhausted at offset \(frontier) status=\(status) (\(unproductiveReconnects) unproductive)", category: .demux)
+                EngineLog.emit("[AVIOReader] Persistent reconnect exhausted at offset \(frontier) status=\(status) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")", category: .demux)
+                if isLive {
+                    liveExhausted = true
+                    return totalRead > 0 ? Int32(totalRead) : AVERROR_EIO_VALUE
+                }
                 return totalRead > 0 ? Int32(totalRead) : -1
             }
             EngineLog.emit("[AVIOReader] Persistent conn ended at offset \(frontier) status=\(status), reconnecting (retryAfter=\(retryAfter)s)", category: .demux)
@@ -1030,16 +1077,24 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// it ended so the reader's wait loop reconnects if more bytes are owed.
     fileprivate func persistentConnectionEnded(error: Error?, generation: Int) {
         winCond.lock()
-        if generation == connGeneration {
+        let isCurrentGen = (generation == connGeneration)
+        if isCurrentGen {
             connEnded = true
         }
+        let windowAhead = isCurrentGen ? (window.count - max(0, Int(position - winStart))) : 0
         winCond.broadcast()
         winCond.unlock()
-        #if DEBUG
         if let error {
-            EngineLog.emit("[AVIOReader] Persistent conn gen=\(generation) error: \(error.localizedDescription)", category: .demux)
+            EngineLog.emit("[AVIOReader] Persistent conn gen=\(generation) ended with error: \(error.localizedDescription)", category: .demux)
         }
-        #endif
+        if isCurrentGen && isLive {
+            // Log drop/close detection for live sources. If the window has
+            // buffered data the read path continues without stalling and
+            // reconnects silently once the buffer drains; otherwise it
+            // reconnects immediately. This fires on both graceful server
+            // close (shutdown/Connection:close) and transport errors.
+            EngineLog.emit("[AVIOReader] Live source: connection ended gen=\(generation) buffered=\(windowAhead / 1024)KB; reconnect will fire when buffer drains", category: .demux)
+        }
     }
 
     /// Parse a `Retry-After` header (delta-seconds form; HTTP-date form is
@@ -1742,6 +1797,12 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
 /// FFmpeg AVERROR_EOF, the C macro can't be imported into Swift.
 /// FFERRTAG(0xF8,'E','O','F') = -541478725
 private let AVERROR_EOF_VALUE: Int32 = -541478725
+
+/// FFmpeg AVERROR(EIO): input/output error. Used as the terminal error
+/// code when a live source's reconnect cap is hit, so the demuxer raises
+/// a `readFailed` error distinct from a normal EOF. The host maps this to
+/// `.error("live source lost")`. Value = AVERROR(EIO) = -5.
+private let AVERROR_EIO_VALUE: Int32 = -5
 
 private func readCallback(
     opaque: UnsafeMutableRawPointer?,

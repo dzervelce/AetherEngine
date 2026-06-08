@@ -163,6 +163,81 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// a new segment and the per-segment muxer needs to be cycled.
     private let segmentBoundaries: [Int64]
 
+    /// Live mode. When true the pump ignores `segmentBoundaries` /
+    /// `segmentIndex(forSourcePts:)` and instead cuts a new segment at
+    /// each video keyframe once `targetSegmentDurationSeconds` of source
+    /// time has elapsed since the current segment opened. Finalized
+    /// segments are reported via `onLiveSegmentFinalized` so the provider
+    /// can grow its playlist. The EOF break stays as a safety net but a
+    /// genuine live feed never reaches it. VOD leaves this false.
+    private let isLive: Bool
+
+    /// Absolute index of the segment the live cutter is currently filling.
+    /// Starts at `baseIndex` (0 for live) when the first video keyframe
+    /// opens segment 0; advances by one on each keyframe-driven cut.
+    private var liveCurrentSegmentIndex: Int
+
+    /// Source-PTS (seconds) at which the current live segment opened (=
+    /// the keyframe that started it). The next keyframe whose pts is at
+    /// least `targetSegmentDurationSeconds` past this triggers a cut.
+    private var liveSegmentStartPtsSeconds: Double = 0
+
+    /// Whether the live cutter has opened its first segment yet (set when
+    /// the first video keyframe arrives post-gate). Until then there is no
+    /// current segment and the first keyframe opens segment 0 without a
+    /// cut.
+    private var liveFirstSegmentOpened = false
+
+    /// Per-index start-PTS (seconds) of each live segment the cutter has
+    /// opened, so a fragment cut / final finalize can report the finished
+    /// segment's `[startSeconds, duration]` to the provider. Entries are
+    /// removed once reported to keep the map bounded over a long session.
+    private var liveSegmentStartByIndex: [Int: Double] = [:]
+
+    /// Fires once per finalized live segment (cut or EOF), off the pump
+    /// thread, with the segment's absolute index, measured duration in
+    /// seconds, start-PTS in seconds, and a `discontinuous` flag (true when
+    /// the segment opened at a detected program-boundary PTS jump). The
+    /// engine wires this to the provider's `appendLiveSegment` so the
+    /// growing playlist exposes the segment, with `#EXT-X-DISCONTINUITY`
+    /// prefixed on the boundary segment. Live-only; nil for VOD.
+    var onLiveSegmentFinalized: (@Sendable (Int, Double, Double, Bool) -> Void)?
+
+    /// Live PTS-discontinuity detection. A real broadcast / IPTV feed can
+    /// cross a program boundary where the source PTS leaps (forward or
+    /// backward) well beyond normal frame spacing and codec params may
+    /// change. We track the previous video packet's RAW source PTS (before
+    /// any shift) and the per-frame spacing, and flag a discontinuity when
+    /// the next video packet's PTS deviates from the expected continuation
+    /// by more than `discontinuityThresholdSeconds`. This is DISTINCT from
+    /// the NOPTS-dts repair (which operates on dts at the +1-tick scale,
+    /// far below this threshold) and from the keyframe gate: it only fires
+    /// on a genuine multi-second leap.
+    ///
+    /// 10 s is the threshold: orders of magnitude above any frame interval
+    /// (≤ ~40 ms) or the look-behind duration inference, and well below the
+    /// synthetic +1000 s test jump, so it never trips on normal advance but
+    /// always catches a program boundary.
+    static let discontinuityThresholdSeconds: Double = 10.0
+
+    /// Previous video packet's RAW source PTS (source video TB), before the
+    /// dynamic shift is applied. `Int64.min` until the first post-gate video
+    /// packet. Used only in live mode to detect the program-boundary leap.
+    private var lastRawVideoPts: Int64 = Int64.min
+
+    /// When the live cutter next opens a segment, mark it discontinuous so
+    /// the playlist builder prefixes it with `#EXT-X-DISCONTINUITY`. Latched
+    /// on detection, consumed (cleared) when the next segment opens.
+    private var pendingDiscontinuityFlag: Bool = false
+
+    /// Per-index discontinuity flag for live segments the cutter has opened.
+    /// Mirrors `liveSegmentStartByIndex`'s lifetime: set when the segment
+    /// opens, read + removed when the segment is reported to the provider.
+    private var liveSegmentDiscontinuousByIndex: [Int: Bool] = [:]
+
+    /// One-shot log latch for the first detected discontinuity.
+    private var loggedFirstDiscontinuity: Bool = false
+
     /// Target segment duration in seconds. Passed to each per-segment
     /// MP4SegmentMuxer as the `frag_duration` defensive backstop;
     /// `+frag_keyframe` auto-cuts at keyframes so this rarely fires
@@ -233,6 +308,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// pending packet is flushed using `*FallbackDurationPts`.
     private var pendingVideoPkt: UnsafeMutablePointer<AVPacket>?
     private var pendingAudioPkt: UnsafeMutablePointer<AVPacket>?
+
+    /// Live-mode segment index assigned to `pendingVideoPkt` /
+    /// `pendingAudioPkt` at the moment that packet was examined (the
+    /// live cutter advances at keyframe boundaries, so the index has to
+    /// be captured then, not recomputed when the look-behind flushes the
+    /// pending packet). Unused for VOD.
+    private var pendingVideoSegIndex: Int = 0
+    private var pendingAudioSegIndex: Int = 0
 
     private var loggedFirstVideoPktInfo = false
     /// One-shot log latches for the monotonic-dts repair. Bumps and
@@ -531,7 +614,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         restartTargetVideoDts: Int64 = Int64.min,
         desiredFirstVideoTfdtPts: Int64,
         desiredFirstAudioTfdtPts: Int64 = 0,
-        segmentBoundaries: [Int64]
+        segmentBoundaries: [Int64],
+        isLive: Bool = false
     ) throws {
         self.demuxer = demuxer
         self.videoStreamIndex = videoStreamIndex
@@ -542,6 +626,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.sourceVideoTimeBase = video.timeBase
         self.targetSegmentDurationSeconds = targetSegmentDurationSeconds
         self.segmentBoundaries = segmentBoundaries
+        self.isLive = isLive
+        self.liveCurrentSegmentIndex = baseIndex
         self.videoFallbackDurationPts = videoFallbackDurationPts
         self.audioFallbackDurationPts = audioFallbackDurationPts
         self.restartTargetVideoDts = restartTargetVideoDts
@@ -592,6 +678,55 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// the first boundary (defensive: shouldn't happen post-gate);
     /// returns the last segment index for any pts past the last
     /// boundary.
+
+    /// Live-mode segment index for a VIDEO packet. Forward-only keyframe
+    /// cutter: the first keyframe opens segment `baseIndex`; a later
+    /// keyframe whose source-pts is at least `targetSegmentDurationSeconds`
+    /// past the current segment's start advances the cutter by one (which
+    /// the look-behind's `ensureMuxer(forSegmentIndex:)` then turns into a
+    /// fragment cut + adopt). `pts` is the post-shift packet pts in source
+    /// video TB. Non-keyframe packets stay in the current segment.
+    /// Returns the absolute index this packet belongs to.
+    private func liveVideoSegmentIndex(pts: Int64, isKeyframe: Bool) -> Int {
+        let ptsSeconds = Double(pts) * sourceVideoTbSeconds
+        if !liveFirstSegmentOpened {
+            // First kept video packet opens segment baseIndex. The gate
+            // guarantees it is a keyframe, so this is always an IRAP start.
+            liveFirstSegmentOpened = true
+            liveCurrentSegmentIndex = baseIndex
+            liveSegmentStartPtsSeconds = ptsSeconds
+            liveSegmentStartByIndex[liveCurrentSegmentIndex] = ptsSeconds
+            liveSegmentDiscontinuousByIndex[liveCurrentSegmentIndex] = false
+            return liveCurrentSegmentIndex
+        }
+        if isKeyframe,
+           ptsSeconds - liveSegmentStartPtsSeconds >= targetSegmentDurationSeconds {
+            // Cut: this keyframe starts a new segment. The finalize of the
+            // segment we are leaving happens inside ensureMuxer/advanceMuxer
+            // when the look-behind routes the previous packet; the duration
+            // is reported there from the recorded start times.
+            liveCurrentSegmentIndex += 1
+            liveSegmentStartPtsSeconds = ptsSeconds
+            liveSegmentStartByIndex[liveCurrentSegmentIndex] = ptsSeconds
+            // A discontinuity detected since the last cut marks THIS new
+            // segment as the boundary segment. AVPlayer keeps its own
+            // timeline continuous across the #EXT-X-DISCONTINUITY tag, which
+            // is what holds seekableEnd (and the engine's native session
+            // edge) monotonic across the jump. Consume the latch.
+            liveSegmentDiscontinuousByIndex[liveCurrentSegmentIndex] = pendingDiscontinuityFlag
+            pendingDiscontinuityFlag = false
+        }
+        return liveCurrentSegmentIndex
+    }
+
+    /// Source video TB in seconds per tick, for live pts→seconds. Mirrors
+    /// the engine's `sourceVideoTbSeconds`; derived from the configured
+    /// time base.
+    private var sourceVideoTbSeconds: Double {
+        guard sourceVideoTimeBase.num > 0, sourceVideoTimeBase.den > 0 else { return 0 }
+        return Double(sourceVideoTimeBase.num) / Double(sourceVideoTimeBase.den)
+    }
+
     private func segmentIndex(forSourcePts pts: Int64) -> Int {
         guard !segmentBoundaries.isEmpty else { return baseIndex }
         // Linear scan is fine here — segmentBoundaries is at most
@@ -725,6 +860,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
             cache.adopt(index: currentMuxerSegmentIndex,
                         stagingPath: result.path,
                         byteCount: result.bytesWritten)
+            // Live: report the just-finalized segment to the provider so
+            // its growing EVENT playlist exposes it. Duration is the gap
+            // between this segment's start and the next segment's start
+            // (both recorded by the keyframe cutter); if the next start
+            // isn't known yet, fall back to the duration target.
+            if isLive {
+                reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
+                                           nextIndex: newIdx)
+            }
         } else {
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s cut failed; not adopted",
@@ -749,6 +893,40 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return muxer
     }
 
+    /// Report a finalized live segment to the engine (which forwards to
+    /// the provider's growing EVENT playlist). `index` is the segment that
+    /// was just adopted into the cache; `nextIndex` is the segment the
+    /// cutter advanced to (nil at EOF). Duration is the gap between this
+    /// segment's recorded start and the next segment's start, falling back
+    /// to the duration target when the next start is unknown. The start
+    /// entry for `index` is removed once reported.
+    private func reportLiveSegmentFinalized(index: Int, nextIndex: Int?) {
+        guard let startSeconds = liveSegmentStartByIndex[index] else {
+            EngineLog.emit(
+                "[HLSSegmentProducer] live finalize: no recorded start for seg-\(index); skipping append",
+                category: .session
+            )
+            return
+        }
+        let duration: Double
+        if let nextIndex = nextIndex, let nextStart = liveSegmentStartByIndex[nextIndex] {
+            let d = nextStart - startSeconds
+            duration = d > 0 ? d : targetSegmentDurationSeconds
+        } else {
+            duration = targetSegmentDurationSeconds
+        }
+        let discontinuous = liveSegmentDiscontinuousByIndex[index] ?? false
+        liveSegmentStartByIndex.removeValue(forKey: index)
+        liveSegmentDiscontinuousByIndex.removeValue(forKey: index)
+        EngineLog.emit(
+            "[HLSSegmentProducer] live seg-\(index) finalized: start=\(String(format: "%.3f", startSeconds))s "
+            + "dur=\(String(format: "%.3f", duration))s"
+            + (discontinuous ? " [DISCONTINUITY]" : ""),
+            category: .session
+        )
+        onLiveSegmentFinalized?(index, duration, startSeconds, discontinuous)
+    }
+
     /// Finalize the session-wide muxer at pump exit and adopt the
     /// final segment.
     private func finalizeSessionMuxerAndAdopt() {
@@ -761,6 +939,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
             cache.adopt(index: idx, stagingPath: result.path,
                         byteCount: result.bytesWritten)
+            // Live safety-net: a real live feed never reaches EOF, but if
+            // the pump exits (stop / error) we still report the final
+            // partial segment so the provider lists it. No next-segment
+            // start exists, so duration falls back to the target.
+            if isLive {
+                reportLiveSegmentFinalized(index: idx, nextIndex: nil)
+            }
         } else {
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(idx).m4s final finalize failed; not adopted",
@@ -1382,6 +1567,39 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                 }
 
+                // Live PTS-discontinuity detection on RAW source video PTS
+                // (before the dynamic shift below mutates it). Only after the
+                // video gate has opened, and only in live mode. Compare the
+                // incoming raw pts against the previous video packet's raw
+                // pts: a leap (forward OR backward) larger than the threshold
+                // is a program boundary. This sits well above the NOPTS-dts
+                // repair scale (+1 tick) and any frame interval, so it does
+                // not interfere with either. The look-behind cut that opens
+                // the next segment consumes `pendingDiscontinuityFlag`.
+                if isVideoPkt, isLive, firstActualVideoDts != Int64.min,
+                   packet.pointee.pts != Int64.min {
+                    let rawPts = packet.pointee.pts
+                    if lastRawVideoPts != Int64.min {
+                        let deltaTicks = rawPts - lastRawVideoPts
+                        let deltaSeconds = Double(deltaTicks) * sourceVideoTbSeconds
+                        if abs(deltaSeconds) >= Self.discontinuityThresholdSeconds {
+                            pendingDiscontinuityFlag = true
+                            if !loggedFirstDiscontinuity {
+                                loggedFirstDiscontinuity = true
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] live PTS discontinuity detected: "
+                                    + "prevRawPts=\(lastRawVideoPts) rawPts=\(rawPts) "
+                                    + "delta=\(String(format: "%.2f", deltaSeconds))s "
+                                    + "(threshold=\(String(format: "%.1f", Self.discontinuityThresholdSeconds))s); "
+                                    + "next segment will carry #EXT-X-DISCONTINUITY",
+                                    category: .session
+                                )
+                            }
+                        }
+                    }
+                    lastRawVideoPts = rawPts
+                }
+
                 // Apply the per-stream dynamic shift. After both
                 // gates have opened, every subsequent packet on each
                 // stream is shifted by its constant per-session
@@ -1422,18 +1640,29 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             category: .session
                         )
                     }
+                    // Compute THIS packet's segment index now. Live: the
+                    // keyframe cutter advances on a keyframe past the
+                    // duration target (using the shifted pts so the
+                    // segment boundaries align with the muxer timeline).
+                    // VOD: unused below; routing uses prev.dts at the look-behind site.
+                    let thisVideoSeg = isLive
+                        ? liveVideoSegmentIndex(
+                            pts: packet.pointee.pts,
+                            isKeyframe: (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
+                          )
+                        : 0
                     if let prev = pendingVideoPkt {
                         // Determine which segment `prev` belongs to.
-                        // Use DTS, not PTS — HEVC open-GOP CRA emits
-                        // leading B-frames whose display PTS sits in
-                        // the previous segment (PTS < CRA.pts) even
-                        // though their decode order is in the current
-                        // segment. DTS is monotonic in decode order
-                        // and segment boundaries (= IRAP keyframes)
-                        // have DTS == PTS, so DTS-based lookup matches
-                        // the segmentPlan exactly without the B-frame
-                        // reorder false-positive.
-                        let prevSeg = segmentIndex(forSourcePts: prev.pointee.dts)
+                        // VOD: DTS lookup against the precomputed plan
+                        // (DTS, not PTS, because HEVC open-GOP CRA emits leading
+                        // B-frames whose display PTS sits in the previous
+                        // segment even though decode order is in the
+                        // current one; segment boundaries are IRAP
+                        // keyframes where DTS == PTS). Live: the index was
+                        // captured when `prev` was examined.
+                        let prevSeg = isLive
+                            ? pendingVideoSegIndex
+                            : segmentIndex(forSourcePts: prev.pointee.dts)
                         if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
                             finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, muxer: muxer)
                             bumpPacketsWritten()
@@ -1448,6 +1677,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         }
                     }
                     pendingVideoPkt = packet
+                    if isLive { pendingVideoSegIndex = thisVideoSeg }
                     pktPtr = nil  // hand ownership to pendingVideoPkt; suppress defer-free
                     continue
                 }
@@ -1537,12 +1767,20 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             // FLAC packet pts is in audio inputTimeBase.
                             // Rescale to source video TB for the segment
                             // lookup so audio and video share one segmentation.
-                            let fpPtsInVideoTb = av_rescale_q(
-                                fp.pointee.pts,
-                                audio.inputTimeBase,
-                                sourceVideoTimeBase
-                            )
-                            let fpSeg = segmentIndex(forSourcePts: fpPtsInVideoTb)
+                            // Live: audio follows the video cutter's current
+                            // segment (the playlist segmentation is driven by
+                            // video keyframes; audio rides along).
+                            let fpSeg: Int
+                            if isLive {
+                                fpSeg = liveCurrentSegmentIndex
+                            } else {
+                                let fpPtsInVideoTb = av_rescale_q(
+                                    fp.pointee.pts,
+                                    audio.inputTimeBase,
+                                    sourceVideoTimeBase
+                                )
+                                fpSeg = segmentIndex(forSourcePts: fpPtsInVideoTb)
+                            }
                             guard let muxer = ensureMuxer(forSegmentIndex: fpSeg) else {
                                 var fpVar: UnsafeMutablePointer<AVPacket>? = fp
                                 trackedPacketFree(&fpVar)
@@ -1557,13 +1795,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         continue
                     }
                     // Stream-copy audio look-behind.
+                    let thisAudioSeg: Int = isLive ? liveCurrentSegmentIndex : 0
                     if let prev = pendingAudioPkt {
-                        let prevPtsInVideoTb = av_rescale_q(
-                            prev.pointee.pts,
-                            audio.inputTimeBase,
-                            sourceVideoTimeBase
-                        )
-                        let prevSeg = segmentIndex(forSourcePts: prevPtsInVideoTb)
+                        let prevSeg: Int
+                        if isLive {
+                            prevSeg = pendingAudioSegIndex
+                        } else {
+                            let prevPtsInVideoTb = av_rescale_q(
+                                prev.pointee.pts,
+                                audio.inputTimeBase,
+                                sourceVideoTimeBase
+                            )
+                            prevSeg = segmentIndex(forSourcePts: prevPtsInVideoTb)
+                        }
                         if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
                             finalizeAndWriteAudio(prev, nextDts: packet.pointee.dts, audio: audio, muxer: muxer)
                         } else {
@@ -1574,6 +1818,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         }
                     }
                     pendingAudioPkt = packet
+                    if isLive { pendingAudioSegIndex = thisAudioSeg }
                     pktPtr = nil
                     continue
                 }
@@ -1592,8 +1837,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // the source.
         if let prev = pendingVideoPkt {
             // DTS-based lookup mirrors the in-loop site above; see
-            // its comment for why this isn't `prev.pointee.pts`.
-            let prevSeg = segmentIndex(forSourcePts: prev.pointee.dts)
+            // its comment for why this isn't `prev.pointee.pts`. Live
+            // uses the index captured when `prev` was examined.
+            let prevSeg = isLive
+                ? pendingVideoSegIndex
+                : segmentIndex(forSourcePts: prev.pointee.dts)
             if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
                 finalizeAndWriteVideo(prev, nextDts: nil, muxer: muxer)
                 bumpPacketsWritten()
@@ -1604,12 +1852,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
             pendingVideoPkt = nil
         }
         if let prev = pendingAudioPkt, let audio = audioConfig {
-            let prevPtsInVideoTb = av_rescale_q(
-                prev.pointee.pts,
-                audio.inputTimeBase,
-                sourceVideoTimeBase
-            )
-            let prevSeg = segmentIndex(forSourcePts: prevPtsInVideoTb)
+            let prevSeg: Int
+            if isLive {
+                prevSeg = pendingAudioSegIndex
+            } else {
+                let prevPtsInVideoTb = av_rescale_q(
+                    prev.pointee.pts,
+                    audio.inputTimeBase,
+                    sourceVideoTimeBase
+                )
+                prevSeg = segmentIndex(forSourcePts: prevPtsInVideoTb)
+            }
             if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
                 finalizeAndWriteAudio(prev, nextDts: nil, audio: audio, muxer: muxer)
             } else {

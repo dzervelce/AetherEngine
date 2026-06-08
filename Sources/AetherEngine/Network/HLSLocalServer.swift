@@ -38,9 +38,28 @@ protocol HLSSegmentProvider: AnyObject {
     /// returns the same value for every index in the audio case.
     func segmentDuration(at index: Int) -> Double
 
+    /// Whether segment `index` opens at a live PTS discontinuity (a
+    /// program boundary where the source clock leapt). When true the
+    /// playlist builder prefixes the segment's `#EXTINF` with
+    /// `#EXT-X-DISCONTINUITY`, which tells AVPlayer to keep its own
+    /// timeline continuous across the jump. Always false for VOD and the
+    /// audio-append path.
+    func segmentIsDiscontinuous(at index: Int) -> Bool
+
     /// Apple HLS playlist type. `.event` for live appended audio,
     /// `.vod` for the fully-known video case.
     var playlistType: HLSPlaylistType { get }
+
+    /// Target segment duration in seconds as configured for the live
+    /// producer (e.g. 4-6 s). Non-nil only for `.live` providers. The
+    /// playlist builder uses this as a stable floor for
+    /// `#EXT-X-TARGETDURATION` so the very first manifest (before any
+    /// segment is finalized) already declares a generous value instead of
+    /// falling back to `max(1, 0) == 1`, which gives AVPlayer only 1.5 s
+    /// to receive segment 0 and triggers CoreMediaErrorDomain -12888 for
+    /// high-bitrate sources. VOD and EVENT providers return nil and keep
+    /// the existing `ceil(maxProducedDuration)` computation unchanged.
+    var liveTargetSegmentDuration: Double? { get }
 
     /// Optional master-playlist metadata. When `masterCodecs` is
     /// non-nil, the server publishes a `master.m3u8` containing one
@@ -87,8 +106,23 @@ protocol HLSSegmentProvider: AnyObject {
     /// counter (for the byte-level "playlist changed" signal), and
     /// whether the playlist should declare itself complete with
     /// `#EXT-X-ENDLIST`. Used by the video provider to advance a
-    /// sliding-window EVENT playlist.
+    /// sliding-window live playlist.
     func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool)
+
+    /// First segment index visible in the current playlist window.
+    /// For append-only and VOD playlists this is always 0.
+    /// For a live session this advances as old segments
+    /// fall off the back. Used by `buildMediaPlaylistText` to emit
+    /// `#EXT-X-MEDIA-SEQUENCE` and to list only [firstVisible, visibleCount).
+    var firstVisibleSegmentIndex: Int { get }
+
+    /// Blocks the calling thread until this provider has at least one
+    /// segment ready, or until `timeout` seconds elapse, whichever
+    /// comes first. Returns `true` if at least one segment is available,
+    /// `false` on timeout. Used by the server's manifest handler to hold
+    /// the first live response until there is meaningful content, preventing
+    /// CoreMediaErrorDomain -12888 on empty live playlists.
+    func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool
 }
 
 extension HLSSegmentProvider {
@@ -96,6 +130,13 @@ extension HLSSegmentProvider {
     /// disk override to return the file URL so the server can use
     /// the `sendfile(2)` fast path.
     func mediaSegmentURL(at index: Int) -> URL? { nil }
+
+    /// Default: append-only / VOD playlists always start at segment 0.
+    var firstVisibleSegmentIndex: Int { 0 }
+
+    /// Default: no discontinuities. Only the live video provider tracks
+    /// program-boundary segments; every other provider returns false.
+    func segmentIsDiscontinuous(at index: Int) -> Bool { false }
 
     var masterCodecs: String? { nil }
     var masterResolution: (width: Int, height: Int)? { nil }
@@ -106,6 +147,22 @@ extension HLSSegmentProvider {
     var masterAverageBandwidth: Int? { nil }
     var masterHDCPLevel: String? { nil }
     var masterClosedCaptions: String? { nil }
+    /// Default: not a live provider; playlist builder uses the
+    /// computed-from-segments path.
+    var liveTargetSegmentDuration: Double? { nil }
+
+    /// Blocks the calling thread until this provider has at least one
+    /// segment ready, or until `timeout` seconds elapse, whichever
+    /// comes first. Returns `true` if at least one segment is available,
+    /// `false` on timeout. Non-live providers return `true` immediately
+    /// (their segment list is fully known at init time). Used by the
+    /// server's manifest handler to hold the first live response until
+    /// there is meaningful content to give AVPlayer: an empty live
+    /// manifest with zero `#EXTINF` entries causes AVPlayer to fire
+    /// CoreMediaErrorDomain -12888 immediately, regardless of
+    /// `#EXT-X-TARGETDURATION`, because the playlist "hasn't changed"
+    /// by the time the first poll interval fires.
+    func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool { true }
 
     /// Default implementation for providers that don't run a
     /// sliding-window playlist. Reports the current segmentCount,
@@ -117,9 +174,24 @@ extension HLSSegmentProvider {
     }
 }
 
-enum HLSPlaylistType {
+enum HLSPlaylistType: Equatable {
+    /// Append-only playlist (`#EXT-X-PLAYLIST-TYPE:EVENT`, no ENDLIST).
+    /// Segments are never removed and MEDIA-SEQUENCE stays 0. Used by the
+    /// audio-append path. NOT used for the productized sliding live video
+    /// path (EVENT forbids segment removal, which is exactly what a
+    /// sliding live window must do).
     case event
+    /// Complete asset (`#EXT-X-PLAYLIST-TYPE:VOD`, ENDLIST present). Used
+    /// by finite-duration video files.
     case vod
+    /// Sliding live playlist: no `#EXT-X-PLAYLIST-TYPE` tag at all and no
+    /// `#EXT-X-ENDLIST`, with a `#EXT-X-MEDIA-SEQUENCE` that advances as
+    /// old segments fall off the back of the window. This is the only
+    /// spec-correct shape for a window that both grows at the live edge
+    /// and drops consumed segments: EVENT forbids removal and VOD implies
+    /// a finished asset, so a live sliding playlist must omit the tag
+    /// (RFC 8216 §4.3.3.5). Used by the live video session.
+    case live
 }
 
 enum HLSVideoRange: String {
@@ -285,6 +357,10 @@ final class HLSLocalServer: @unchecked Sendable {
     private var loggedMasterPlaylist = false
     private var loggedMediaPlaylist = false
     private var loggedRequestHeaders = false
+    /// Count of /media.m3u8 builds. Used to periodically re-log the
+    /// head/tail of a live sliding playlist so the advancing
+    /// #EXT-X-MEDIA-SEQUENCE is observable over a run.
+    private var mediaPlaylistBuildCount = 0
 
     /// Guards every mutable field above plus the listenFd. Reads
     /// from the public-facing computed properties take the lock too.
@@ -399,6 +475,7 @@ final class HLSLocalServer: @unchecked Sendable {
         port = 0
         loggedMasterPlaylist = false
         loggedMediaPlaylist = false
+        mediaPlaylistBuildCount = 0
         let clients = clientFds
         clientFds.removeAll()
         seg0FetchTime = nil
@@ -610,12 +687,35 @@ final class HLSLocalServer: @unchecked Sendable {
             return send404(fd: fd, path: normalizedPath, reason: "no masterCodecs")
 
         case "/media.m3u8":
+            // For a live provider with no segments yet, hold this response
+            // until the first segment is available. An empty live playlist
+            // (no `#EXTINF` entries) causes AVPlayer to fire
+            // CoreMediaErrorDomain -12888 immediately on macOS/tvOS 26,
+            // regardless of `#EXT-X-TARGETDURATION`, because AVFoundation's
+            // HLS client treats a live playlist with zero segments as
+            // permanently stalled (it never polls again). Once we have at
+            // least one segment the playlist is genuinely playable and
+            // subsequent polls see incrementing content (MEDIA-SEQUENCE /
+            // new segments), so -12888 never fires during normal playback.
+            // The 30 s ceiling is a safety net; a real segment always
+            // arrives well within it (the first ~5 s segment at 22 Mbps
+            // takes at most a few seconds to demux + remux over loopback).
+            if let p = provider, p.playlistType == .live {
+                _ = p.waitForFirstLiveSegment(timeout: 30.0)
+            }
             let body = buildMediaPlaylist()
             stateLock.lock()
             let firstTime = !loggedMediaPlaylist
             if firstTime { loggedMediaPlaylist = true }
+            mediaPlaylistBuildCount += 1
+            // For a live (sliding) playlist, re-log the head/tail every 10
+            // rebuilds so the advancing #EXT-X-MEDIA-SEQUENCE is observable
+            // over a run (the firstTime-only log can't show advancement).
+            // VOD logs once and never re-logs (no advancement to show).
+            let isLivePlaylist = (provider?.playlistType == .live)
+            let periodic = isLivePlaylist && (mediaPlaylistBuildCount % 10 == 0)
             stateLock.unlock()
-            if firstTime {
+            if firstTime || periodic {
                 let lines = body.split(separator: "\n", omittingEmptySubsequences: false)
                 let head = lines.prefix(8).joined(separator: "\n")
                 let tail = lines.suffix(6).joined(separator: "\n")
@@ -931,22 +1031,55 @@ final class HLSLocalServer: @unchecked Sendable {
         // build.
         let snapshot = provider.notePlaylistBuild()
         let count = snapshot.visibleCount
+        let firstVisible = provider.firstVisibleSegmentIndex
         let typeIsEvent = (provider.playlistType == .event && !snapshot.endlistAdded)
+        // A sliding live playlist: MEDIA-SEQUENCE advances, segments below
+        // firstVisible are gone, and the playlist is neither EVENT (which
+        // forbids removal) nor VOD (which implies a finished asset). It
+        // carries no PLAYLIST-TYPE tag and no ENDLIST.
+        let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded)
 
-        // Compute target duration as ceil of the longest segment.
+        // Compute target duration as ceil of the longest produced segment.
         // Spec requires this be >= every EXTINF in the playlist.
         var maxDuration: Double = 0
-        for i in 0..<count {
+        for i in firstVisible..<count {
             maxDuration = max(maxDuration, provider.segmentDuration(at: i))
         }
-        let targetDuration = Int(ceil(max(1.0, maxDuration)))
+        var targetDuration = Int(ceil(max(1.0, maxDuration)))
+
+        // For live playlists, apply a stable floor equal to the producer's
+        // configured cut target. Before segment 0 is finalized, maxDuration
+        // is 0 and the plain computation yields 1, giving AVPlayer only
+        // 1.5 s to receive the first segment (1.5 * TARGETDURATION per spec).
+        // High-bitrate sources (20+ Mbps, 5+ s segments, many MB) cannot be
+        // demuxed, remuxed, and published over the loopback path in that
+        // window, so AVPlayer fires CoreMediaErrorDomain -12888
+        // "Playlist File unchanged for longer than 1.5 * target duration".
+        // Using ceil(producerTarget) as the minimum makes TARGETDURATION
+        // stable and generous from the very first (empty) manifest, giving
+        // AVPlayer ~6-9 s to receive segment 0. Per HLS spec TARGETDURATION
+        // must be >= every EXTINF; since the producer cuts at targetSeconds,
+        // ceil(target) satisfies that for normal segments. If a produced
+        // segment ever exceeds it, max() keeps us compliant. VOD and EVENT
+        // paths are unchanged.
+        if typeIsLive, let liveTarget = provider.liveTargetSegmentDuration {
+            let liveFloor = Int(ceil(liveTarget))
+            targetDuration = max(targetDuration, liveFloor)
+        }
 
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
         lines.append("#EXT-X-TARGETDURATION:\(targetDuration)")
-        lines.append("#EXT-X-MEDIA-SEQUENCE:0")
-        if typeIsEvent {
+        lines.append("#EXT-X-MEDIA-SEQUENCE:\(firstVisible)")
+        if typeIsLive {
+            // No #EXT-X-PLAYLIST-TYPE and no #EXT-X-ENDLIST: the sliding
+            // window grows at the live edge and drops segments below
+            // MEDIA-SEQUENCE. A refresh counter keeps two consecutive
+            // polls distinct so AVPlayer never trips its "Playlist File
+            // unchanged" (-12888) check during a quiet window.
+            lines.append("#EXT-X-SODALITE-REFRESH:\(snapshot.refreshCounter)")
+        } else if typeIsEvent {
             lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
             lines.append("#EXT-X-SODALITE-REFRESH:\(snapshot.refreshCounter)")
         } else {
@@ -979,12 +1112,26 @@ final class HLSLocalServer: @unchecked Sendable {
             segURI = { idx in "seg\(idx).mp4" }
         }
         lines.append("#EXT-X-MAP:URI=\"\(initURI)\"")
-        for i in 0..<count {
+        for i in firstVisible..<count {
+            // A segment that opened at a live program-boundary PTS jump is
+            // prefixed with #EXT-X-DISCONTINUITY (RFC 8216 §4.3.2.3): the tag
+            // applies to the segment that FOLLOWS it, so it goes immediately
+            // before that segment's #EXTINF. AVPlayer resets its media-
+            // sequence timeline at the tag, which keeps seekableEnd (and the
+            // engine's native session edge) monotonic across the source jump.
+            if provider.segmentIsDiscontinuous(at: i) {
+                lines.append("#EXT-X-DISCONTINUITY")
+            }
             let dur = provider.segmentDuration(at: i)
             lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
             lines.append(segURI(i))
         }
-        if snapshot.endlistAdded || !typeIsEvent {
+        // ENDLIST marks a complete playlist. Emit it for VOD and for any
+        // append path that has reached its end (endlistAdded), but NEVER
+        // for a sliding live playlist (it must stay open so AVPlayer keeps
+        // re-polling the advancing window) and not while an EVENT playlist
+        // is still growing.
+        if !typeIsLive && (snapshot.endlistAdded || !typeIsEvent) {
             lines.append("#EXT-X-ENDLIST")
         }
         return lines.joined(separator: "\n") + "\n"

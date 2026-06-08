@@ -86,12 +86,18 @@ public final class Demuxer: @unchecked Sendable {
     /// reader issues against `url` (HEAD probe + Range / streaming
     /// GETs). Ignored for `file://` URLs. Pass auth tokens or any
     /// other server-required headers here. Default empty.
-    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback) throws {
+    ///
+    /// `isLive` marks the source as a genuinely endless live feed and
+    /// is forwarded to `AVIOReader` so it suppresses the
+    /// `position >= fileSize` EOF synthesis and surfaces a terminal
+    /// error when the reconnect cap is hit (instead of collapsing to a
+    /// silent EOF). Has no effect on `file://` sources.
+    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false) throws {
         self.openProfile = profile
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         if isHTTP {
-            try openHTTP(url: url, extraHeaders: extraHeaders)
+            try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive)
         } else {
             try openLocal(url: url)
         }
@@ -132,12 +138,13 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     /// Open an HTTP(S) URL via custom AVIO context + URLSession.
-    private func openHTTP(url: URL, extraHeaders: [String: String]) throws {
+    private func openHTTP(url: URL, extraHeaders: [String: String], isLive: Bool = false) throws {
         let reader = AVIOReader(
             url: url,
             extraHeaders: extraHeaders,
             chunkSize: openProfile.avioChunkSize,
-            prefetchEnabled: openProfile.avioPrefetch
+            prefetchEnabled: openProfile.avioPrefetch,
+            isLive: isLive
         )
         try openWithProvider(reader)
     }
@@ -560,6 +567,16 @@ public final class Demuxer: @unchecked Sendable {
         // failures in matroskadec.c when reading the next packet.
         avformat_flush(ctx)
         return ret
+    }
+
+    /// Fast, lock-free unblock: mark the AVIO reader closed so its read
+    /// callback returns -1 immediately and a suspended `av_read_frame`
+    /// (including one parked in the live reconnect loop) returns at once.
+    /// Frees no resources. Call this synchronously when cancelling a pump so
+    /// the pump can unwind without waiting on the (potentially slow) `close()`
+    /// teardown. Idempotent; `close()` calls it again before freeing.
+    func markClosed() {
+        avioProvider?.markClosed()
     }
 
     /// Close the format context and release resources.
