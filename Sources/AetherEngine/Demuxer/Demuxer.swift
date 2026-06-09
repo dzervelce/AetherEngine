@@ -623,8 +623,21 @@ public final class Demuxer: @unchecked Sendable {
     }
 }
 
-enum DemuxerError: Error {
+enum DemuxerError: Error, LocalizedError {
     case openFailed(code: Int32)
     case streamInfoFailed(code: Int32)
     case readFailed(code: Int32)
+
+    /// Human-readable text — hosts surface `error.localizedDescription` directly in
+    /// their error UI; without this it reads "(AetherEngine.DemuxerError error 0.)".
+    var errorDescription: String? {
+        switch self {
+        case .openFailed(let code):
+            return "Could not open the stream — the source did not deliver readable data (network error or dead link; FFmpeg \(code))"
+        case .streamInfoFailed(let code):
+            return "Could not read stream info from the source (FFmpeg \(code))"
+        case .readFailed(let code):
+            return "Reading from the source failed mid-stream (FFmpeg \(code))"
+        }
+    }
 }
