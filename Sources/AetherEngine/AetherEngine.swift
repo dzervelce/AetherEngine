@@ -405,6 +405,41 @@ public final class AetherEngine: ObservableObject {
     /// next periodic time tick. Unused on the SW / audio paths (shift 0).
     private var nativeClockSeconds: Double = 0
 
+    /// Queued live program-boundary shift changes, in output-timeline
+    /// order. The producer rebases its timeline the moment it READS a
+    /// boundary, but AVPlayer renders that seam ~buffer + holdback later;
+    /// each entry holds the new shift and the raw-clock position at which
+    /// it becomes true for the on-screen content. Drained by the
+    /// `$currentTime` sink; cleared on every load/stop.
+    private var pendingLiveShiftRebases: [(activateAt: Double, shift: Double)] = []
+
+    /// 1 Hz live-window publisher, independent of playback ticks. The
+    /// `$currentTime` sink only fires while AVPlayer's periodic time
+    /// observer runs, i.e. NOT while paused, so without this timer
+    /// `liveEdgeTime` / `behindLiveSeconds` / `isAtLiveEdge` /
+    /// `seekableLiveRange` all freeze for the entire pause: the UI shows
+    /// "at live edge" while drifting arbitrarily far behind, and a DVR
+    /// scrub issued while paused seeks against a stale edge. The edge is
+    /// reachable while paused via `host.seekableEnd` (AVPlayer keeps
+    /// reloading the live playlist during a pause).
+    private var liveWindowTimerTask: Task<Void, Never>?
+
+    /// Drive the live surfaces at 1 Hz for the lifetime of a native live
+    /// session. Replaces nothing: the `$currentTime` sink still publishes
+    /// on every playback tick; this covers the paused case.
+    private func startLiveWindowTimer(host: NativeAVPlayerHost) {
+        liveWindowTimerTask?.cancel()
+        guard isLive else { return }
+        liveWindowTimerTask = Task { [weak self, weak host] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self, let host else { return }
+                guard self.isLive else { continue }
+                self.publishLiveWindow(edgeSessionTime: host.seekableEnd + self.playlistShiftSeconds)
+            }
+        }
+    }
+
     /// Source PTS of the currently displayed frame. Equal to `currentTime`
     /// on every path now that the native clock is unified onto source time;
     /// kept as a stable alias for callers that want to express source-
@@ -456,6 +491,13 @@ public final class AetherEngine: ObservableObject {
     /// the same `activeVideoDecoder` label without re-running the
     /// demuxer probe. Reset to `AV_CODEC_ID_NONE` in `stopInternal`.
     private var lastDetectedVideoCodec: AVCodecID = AV_CODEC_ID_NONE
+
+    /// Probe demuxer of the CURRENTLY RUNNING load(), registered before the
+    /// (detached, potentially minutes-blocking) open and cleared when load()
+    /// exits. stopInternal marks it closed so player dismissal / channel
+    /// zapping aborts a probe stuck in the AVIOReader reconnect loop
+    /// instead of letting it reconnect into the next session.
+    private var inFlightProbeDemuxer: Demuxer?
 
     /// Cap the per-session subtitle event diagnostic logs so the in-
     /// app overlay stays readable. Reset on `load()` so each new
@@ -825,7 +867,16 @@ public final class AetherEngine: ObservableObject {
         loadedURL = url
         loadedOptions = options
         isLive = options.isLive
-        liveWindow = options.isLive ? LiveWindow(windowSeconds: options.dvrWindowSeconds) : nil
+        // Native remote-HLS has no engine-managed DVR window; the rewind
+        // range is whatever the remote HLS playlist exposes. Give the live
+        // window an unbounded rewind bound so the engine's live seek isn't a
+        // no-op; the host's `avPlayer.seek` clamps to AVPlayer's real
+        // seekable range, so an over-wide bound only affects the published
+        // range's width, not where a seek actually lands. VOD/loopback live
+        // keeps its disk-backed `dvrWindowSeconds`.
+        liveWindow = options.isLive
+            ? LiveWindow(windowSeconds: options.nativeRemoteHLS ? .greatestFiniteMagnitude : options.dvrWindowSeconds)
+            : nil
         state = .loading
         currentTime = 0
         nativeClockSeconds = 0
@@ -835,6 +886,17 @@ public final class AetherEngine: ObservableObject {
         subtitleTracks = []
         metadata = nil
         subtitleCueDiagnosticCount = 0
+
+        // Native remote-HLS live path: skip the probe + loopback pipeline
+        // entirely and play the URL directly with AVPlayer. The source
+        // server (Jellyfin) already exposes HLS; AVPlayer manages the live
+        // edge, buffering, and reconnect natively. Routed before the probe
+        // because we never demux the m3u8 ourselves (unlike the audioOnly
+        // divert below, which needs probe info first).
+        if options.nativeRemoteHLS {
+            try await loadRemoteHLS(url: url, options: options)
+            return
+        }
 
         // 1. Brief demuxer probe to grab format + frame rate + track
         //    metadata. The HLSVideoEngine spun up below re-opens
@@ -849,6 +911,20 @@ public final class AetherEngine: ObservableObject {
         var probedSubtitleTracks: [TrackInfo] = []
         var probedDefaultAudioIndex: Int32 = -1
         let probe = Demuxer()
+        // Register the in-flight probe so stopInternal can abort it. The
+        // probe's avformat_open_input / find_stream_info can block for the
+        // AVIOReader's full reconnect budget against a dead live source
+        // (e.g. a tuner answering HTTP 500); without this, dismissing the
+        // player or zapping channels left the probe reconnecting in the
+        // background THROUGH the next sessions until the budget ran out
+        // (device repro: a 500-looping channel kept reconnecting across
+        // three subsequent channel sessions). markClosed() is lock-free and
+        // makes the blocked open return promptly.
+        inFlightProbeDemuxer = probe
+        // Identity-guarded: a superseding load() (channel zap mid-probe) has
+        // already registered ITS probe by the time this one unwinds; an
+        // unconditional nil here would strip the successor's abort handle.
+        defer { if inFlightProbeDemuxer === probe { inFlightProbeDemuxer = nil } }
         var probeOpened = false
         do {
             // Detach the HTTP probe + avformat_open_input + avformat_find_stream_info
@@ -913,6 +989,17 @@ public final class AetherEngine: ObservableObject {
         if case .custom = source, !probeOpened {
             state = .error("Failed to load: custom source probe failed")
             throw DemuxerError.openFailed(code: -1)
+        }
+
+        // Live fail-fast: a live source whose probe could not even open is a
+        // dead tuner (the AVIOReader already burned its full reconnect
+        // budget getting here). Proceeding would dispatch on codec NONE and
+        // grind a second, equally doomed open for another ~30 s of spinner
+        // before erroring out. Fail now so the host can show the error (or
+        // try the next channel) immediately.
+        if options.isLive, !probeOpened {
+            state = .error("Live source unavailable")
+            throw DemuxerError.openFailed(code: -5)
         }
 
         // Record seekability for reload gating (forward-only custom sources
@@ -1219,6 +1306,136 @@ public final class AetherEngine: ObservableObject {
     /// auto-picked audio stream when non-nil; used by the mid-playback
     /// audio-track-switch path so the new pipeline picks up the host's
     /// chosen language without a separate API entry point.
+    /// Lean native-HLS live path: build an `AVPlayerItem` from the remote
+    /// URL on the (reused) `NativeAVPlayerHost` and wire its @Published
+    /// mirrors into the engine surface. No Demuxer, no HLSVideoEngine, no
+    /// producer, no loopback server, no display-criteria handshake (AVKit
+    /// drives match-content for the AVPlayerViewController). The live-window
+    /// surfaces are published off `host.seekableEnd`, which reflects the
+    /// remote HLS playlist's seekable range. Mirrors `loadNative`'s host +
+    /// publisher wiring, minus everything loopback-specific.
+    private func loadRemoteHLS(url: URL, options: LoadOptions) async throws {
+        playbackBackend = .native
+
+        let host: NativeAVPlayerHost
+        if let existing = nativeHost {
+            host = existing
+        } else {
+            host = NativeAVPlayerHost()
+        }
+        host.playerLayer.videoGravity = _videoGravity
+        if !pendingExternalMetadata.isEmpty {
+            host.setExternalMetadata(pendingExternalMetadata)
+        }
+        self.nativeHost = host
+        // No producer on this path, so the playhead carries the AVPlayer
+        // clock directly (no source-PTS fold). Keep the shift at 0.
+        self.playlistShiftSeconds = 0
+        self.pendingLiveShiftRebases.removeAll()
+        if currentAVPlayer !== host.avPlayer {
+            self.currentAVPlayer = host.avPlayer
+        }
+
+        nativeCancellables.removeAll()
+        host.$currentTime
+            .sink { [weak self] value in
+                guard let self = self else { return }
+                self.nativeClockSeconds = value
+                self.currentTime = value
+                self.sourceTime = value
+                if self.isLive {
+                    self.publishLiveWindow(edgeSessionTime: host.seekableEnd)
+                }
+            }
+            .store(in: &nativeCancellables)
+        startLiveWindowTimer(host: host)
+        host.$duration
+            .sink { [weak self] value in
+                if value > 0 { self?.duration = value }
+            }
+            .store(in: &nativeCancellables)
+        // Intentionally do NOT flip to .paused on readiness for this path.
+        // The live autostart has already called host.play(), so readyToPlay
+        // is just a waypoint to .playing: the AVPlayer item is ready but is
+        // still filling its initial buffer (the Jellyfin live transcode
+        // spin-up can leave it in waitingToPlay for ~10 s AFTER readiness).
+        // Flipping to .paused here would drop the host's loading spinner and
+        // show a black 'paused' frame for that whole window. The
+        // timeControlStatus sink below instead holds .loading until AVPlayer
+        // actually renders, then flips to .playing.
+        host.$failureMessage
+            .compactMap { $0 }
+            .sink { [weak self] msg in self?.state = .error(msg) }
+            .store(in: &nativeCancellables)
+        host.$didReachEnd
+            .filter { $0 }
+            .sink { [weak self] _ in self?.state = .idle }
+            .store(in: &nativeCancellables)
+        // Drive the host's loading/playing UI off AVPlayer's REAL transport
+        // state. Critical for live: the stream stays in .loading (spinner up)
+        // through the whole transcode spin-up + initial buffer, and only
+        // reaches .playing when AVPlayer genuinely starts rendering. Setting
+        // state = .playing eagerly at load() time (as a prior revision did)
+        // dropped the spinner immediately and showed a ~10 s black screen
+        // while AVPlayer was still in waitingToPlay.
+        host.$timeControlStatus
+            .sink { [weak self] status in
+                guard let self = self else { return }
+                // .error / .idle are terminal; don't resurrect them.
+                if case .error = self.state { return }
+                if self.state == .idle { return }
+                switch status {
+                case .playing:
+                    if self.state != .playing { self.state = .playing }
+                case .waitingToPlayAtSpecifiedRate:
+                    // Bringing the stream up, or a mid-playback rebuffer.
+                    // Hold .loading so the spinner shows during startup; once
+                    // playback has begun the host treats .loading as a no-op
+                    // for the full-screen spinner (hasStartedPlaying gate).
+                    if self.state != .playing { self.state = .loading }
+                case .paused:
+                    // Only an explicit pause after playback began. The
+                    // transient pre-roll paused at load (state == .loading)
+                    // must not be mistaken for a user pause.
+                    if self.state == .playing { self.state = .paused }
+                @unknown default:
+                    break
+                }
+            }
+            .store(in: &nativeCancellables)
+
+        // Start at AVPlayer's natural live edge (skipInitialSeek). AVPlayer
+        // hits the remote server directly here (not the loopback); the
+        // Jellyfin HLS URL carries its own auth (ApiKey / PlaySessionId /
+        // LiveStreamId) as query params, so no extra HTTP headers are needed.
+        host.load(url: url,
+                  startPosition: nil,
+                  perFrameHDR: true,
+                  skipInitialSeek: true,
+                  // System-adaptive buffering for fast live startup. The
+                  // 4 s VOD floor forced a 3-4 s black screen pulling the
+                  // buffer from the remote Jellyfin transcode before play.
+                  forwardBufferDuration: 0)
+
+        // Self-start playback. The VOD native path triggers play() at the
+        // tail of load() (after loadNative returns + the display-criteria
+        // handshake); this lean path early-returns from load() before that
+        // code, so it must start the AVPlayer itself. No criteria handshake
+        // here: AVKit drives match-content from the live AVPlayerItem on the
+        // AVPlayerViewController. AVPlayer's `automaticallyWaitsToMinimize-
+        // Stalling = true` handles "play before ready" — it sits in
+        // `waitingToPlayAtSpecifiedRate`, buffers the first segments, then
+        // plays. Without this the item loads to `readyToPlay` but stays at
+        // `timeControlStatus == .paused` (one frame, never advances).
+        //
+        // State is left at .loading (set by load() before dispatch). It flips
+        // to .playing only when the timeControlStatus sink sees AVPlayer
+        // actually rendering, so the host keeps its loading spinner up through
+        // the transcode spin-up instead of showing a premature black screen.
+        host.play()
+        startMemoryProbe()
+    }
+
     private func loadNative(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
@@ -1275,6 +1492,22 @@ public final class AetherEngine: ObservableObject {
                 self.state = .error(message)
             }
         }
+        session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
+            Task { @MainActor in
+                guard let self = self else { return }
+                // Live program boundary: the producer rebased its timeline,
+                // but AVPlayer is still rendering ~buffer + holdback of OLD
+                // program. Queue the shift and let the $currentTime sink
+                // apply it when the raw clock crosses the seam, so the
+                // published currentTime/sourceTime never jump ahead of what
+                // is actually on screen. Seams are appended in output-
+                // timeline order by construction (the continuation dts is
+                // monotonic even for backward source jumps).
+                self.pendingLiveShiftRebases.append(
+                    (activateAt: seamOutputSeconds, shift: seconds)
+                )
+            }
+        }
         // AVPlayer HLS playback over the loopback HTTP server. Detach
         // the synchronous network I/O inside `session.start()` (opens
         // its own Demuxer + prewarm seek = another ~1-3 s on slow CDN)
@@ -1329,6 +1562,13 @@ public final class AetherEngine: ObservableObject {
                 // SW / audio paths. nativeClockSeconds keeps the raw value
                 // for onPlaylistShiftChanged to re-derive against.
                 self.nativeClockSeconds = value
+                // Activate any queued program-boundary shift whose seam the
+                // playhead has crossed (see onPlaylistShiftRebased above).
+                while let next = self.pendingLiveShiftRebases.first,
+                      value >= next.activateAt {
+                    self.playlistShiftSeconds = next.shift
+                    self.pendingLiveShiftRebases.removeFirst()
+                }
                 self.currentTime = value + self.playlistShiftSeconds
                 self.sourceTime = self.currentTime
                 // feed the producer's read-ahead gate the REAL playback
@@ -1348,6 +1588,7 @@ public final class AetherEngine: ObservableObject {
                 }
             }
             .store(in: &nativeCancellables)
+        startLiveWindowTimer(host: host)
         host.$duration
             .sink { [weak self] value in
                 if value > 0 { self?.duration = value }
@@ -1412,6 +1653,17 @@ public final class AetherEngine: ObservableObject {
         // also true (so setting it true explicitly is a no-op against
         // an unset property anyway; we keep the explicit write so
         // diagnostics surface the live value).
+        // Loopback live deliberately keeps the 4 s forwardBufferDuration
+        // default rather than a deeper buffer. A deep buffer is actively
+        // harmful for live: against the instant-delivering loopback server
+        // AVPlayer pulls the entire visible playlist up front, races to the
+        // live edge, and then hits the one-time transcode warm-up gap (the
+        // ~8 s before the producer cuts the next segment) head-on at the
+        // edge, stalling for the full gap on -12888. A 4 s buffer instead
+        // PACES AVPlayer's consumption to match production, so it plays
+        // through its lead while the producer rides out the warm-up, leaving
+        // only a brief startup hiccup. Verified on device: 8 s made the
+        // startup pause far worse (8-10 s) than the 4 s default (~1 s).
         host.load(url: playbackURL,
                   startPosition: startPosition,
                   perFrameHDR: true)
@@ -1469,6 +1721,7 @@ public final class AetherEngine: ObservableObject {
         // SW path's currentTime tracks source PTS directly, so the
         // AVPlayer-clock shift is 0 and sourceTime mirrors currentTime.
         self.playlistShiftSeconds = 0
+        self.pendingLiveShiftRebases.removeAll()
 
         softwareCancellables.removeAll()
         host.$currentTime
@@ -1542,6 +1795,7 @@ public final class AetherEngine: ObservableObject {
         self.audioHost = host
         // Audio path tracks source PTS directly: no AVPlayer-clock shift.
         self.playlistShiftSeconds = 0
+        self.pendingLiveShiftRebases.removeAll()
 
         audioCancellables.removeAll()
         host.$currentTime
@@ -1615,6 +1869,7 @@ public final class AetherEngine: ObservableObject {
         self.audioAVPlayerHost = host
         self.audioAVPlayerActive = true
         self.playlistShiftSeconds = 0
+        self.pendingLiveShiftRebases.removeAll()
         // Reclaim Now-Playing ownership for this session on each track start,
         // so the Home badge + remote commands stay bound across a pause.
         host.becomeActiveNowPlaying()
@@ -1685,6 +1940,37 @@ public final class AetherEngine: ObservableObject {
         if state == .paused || state == .loading {
             state = .playing
         }
+        clampLiveResumeIfBehindWindow()
+    }
+
+    /// Live resume clamp. While paused the live edge keeps advancing (the
+    /// 1 Hz window timer keeps `liveWindow` fresh), and a pause longer
+    /// than the retention window leaves the playhead on content the
+    /// sliding window has already evicted. AVPlayer would then fetch
+    /// evicted segments (fast-404'd by the provider) instead of cleanly
+    /// resuming, so jump the playhead back inside the window: to just
+    /// above the DVR window's lower bound when a DVR window exists, or to
+    /// the live edge for live-only sessions (their server-side retention
+    /// floor is 60 s; clamping at 45 s leaves headroom before eviction).
+    private func clampLiveResumeIfBehindWindow() {
+        guard isLive, let w = liveWindow else { return }
+        let margin: Double = 5
+        let target: Double?
+        if let win = w.windowSeconds {
+            target = w.behindLiveSeconds > (win - margin)
+                ? (w.seekableRange?.lowerBound ?? w.edgeTime) + margin
+                : nil
+        } else {
+            target = w.behindLiveSeconds > 45 ? w.edgeTime : nil
+        }
+        guard let t = target else { return }
+        EngineLog.emit(
+            "[AetherEngine] live resume clamp: behind=\(String(format: "%.1f", w.behindLiveSeconds))s "
+            + "window=\(w.windowSeconds.map { String(format: "%.0f", $0) } ?? "live-only") "
+            + "-> seek \(String(format: "%.1f", t))",
+            category: .session
+        )
+        Task { await self.seek(to: t) }
     }
 
     public func pause() {
@@ -2699,6 +2985,10 @@ public final class AetherEngine: ObservableObject {
         // currentAVPlayer sink to see a nil publish).
         memoryProbeTask?.cancel()
         memoryProbeTask = nil
+        // Abort a probe blocked in open/find_stream_info (see
+        // `inFlightProbeDemuxer`). Lock-free + idempotent; the owning
+        // load() unwinds with openFailed and clears the reference.
+        inFlightProbeDemuxer?.markClosed()
         liveTelemetrySampler?.stop()
         liveTelemetrySampler = nil
         liveTelemetry = nil
@@ -2757,8 +3047,12 @@ public final class AetherEngine: ObservableObject {
         activeAudioDecoder = nil
         lastDetectedVideoCodec = AV_CODEC_ID_NONE
         playlistShiftSeconds = 0
+        pendingLiveShiftRebases.removeAll()
         nativeClockSeconds = 0
         sourceTime = 0
+
+        liveWindowTimerTask?.cancel()
+        liveWindowTimerTask = nil
 
         cancelSidecarTask()
         embeddedSubtitleTask?.cancel()

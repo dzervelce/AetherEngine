@@ -88,11 +88,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // S16 PCM → FLAC encode).
         case truehd, dts
         case vorbis, pcm, mp2
+        /// AAC in LATM/LOAS framing (separate codec id from ADTS AAC).
+        /// The framing is what European DVB-T2 / satellite broadcasts
+        /// (and IPTV restreams of them) carry, usually around an HE-AAC
+        /// payload. It cannot take the ADTS stream-copy path (no ADTS
+        /// headers to strip, no ASC in extradata, and the payload is
+        /// typically SBR anyway), so it always bridges; the build ships
+        /// the aac_latm decoder.
+        case aacLatm
         case unsupported
 
         static func from(_ codecID: AVCodecID) -> AudioCodecCompat {
             switch codecID {
             case AV_CODEC_ID_AAC:    return .aac
+            case AV_CODEC_ID_AAC_LATM: return .aacLatm
             case AV_CODEC_ID_AC3:    return .ac3
             case AV_CODEC_ID_EAC3:   return .eac3
             case AV_CODEC_ID_FLAC:   return .flac
@@ -125,7 +134,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             case .eac3:   return "ec-3"
             case .flac:   return "fLaC"
             case .alac:   return "alac"
-            case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .unsupported:
+            case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .unsupported:
                 // mp3 is theoretically `mp4a.40.34`, but AVPlayer reads
                 // any mp4a sample entry as AAC, so we bridge it to FLAC
                 // instead, the engine then computes `fLaC` from the
@@ -153,7 +162,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         /// on a lossy mono/stereo source is negligible.
         var requiresBridge: Bool {
             switch self {
-            case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2: return true
+            case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm: return true
             default: return false
             }
         }
@@ -291,6 +300,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// its own published shift in step so the subtitle overlay's cue
     /// lookup uses the right source-time conversion.
     var onPlaylistShiftChanged: (@Sendable (Double) -> Void)?
+    /// Fires when a live program-boundary rebase changes the shift.
+    /// Carries (newShiftSeconds, seamOutputSeconds): AetherEngine queues
+    /// the new shift and applies it to its published clock only when
+    /// playback crosses `seamOutputSeconds` on the raw AVPlayer timeline,
+    /// so currentTime/sourceTime don't jump while the old program is
+    /// still on screen.
+    var onPlaylistShiftRebased: (@Sendable (Double, Double) -> Void)?
     /// Session-long FLAC bridge for codecs that aren't legal in fMP4.
     /// Owned by the engine (not the producer) so that producer
     /// restarts on scrub don't lose the bridge's encoder state. The
@@ -577,6 +593,28 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let isHEVC = codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
         let isH264 = codecpar.pointee.codec_id == AV_CODEC_ID_H264
         let isAV1 = codecpar.pointee.codec_id == AV_CODEC_ID_AV1
+
+        // Source video parameter diagnostics. Decisive for AVPlayer -11821
+        // ("decode failed" with both tracks unreadable right after
+        // readyToPlay) on channels that mux cleanly: the two candidate
+        // causes are interlaced source coding (field_order != progressive;
+        // VT via the fMP4 loopback chokes where the working channels are
+        // all progressive) and malformed/Annex-B extradata feeding a broken
+        // avcC/hvcC into init.mp4. One log line names both.
+        let extraSize = Int(codecpar.pointee.extradata_size)
+        var extraHead = "none"
+        if extraSize > 0, let extra = codecpar.pointee.extradata {
+            let n = min(extraSize, 8)
+            extraHead = (0..<n).map { String(format: "%02x", extra[$0]) }.joined()
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] video codecpar: codec=\(codecpar.pointee.codec_id.rawValue) "
+            + "\(codecpar.pointee.width)x\(codecpar.pointee.height) "
+            + "profile=\(codecpar.pointee.profile) level=\(codecpar.pointee.level) "
+            + "fieldOrder=\(codecpar.pointee.field_order.rawValue) "
+            + "extradata=\(extraSize)B head=\(extraHead)",
+            category: .session
+        )
 
         // Accepted codecs: HEVC, H.264, AV1 (when AVPlayer can decode
         // it on the active platform).
@@ -896,20 +934,53 @@ public final class HLSVideoEngine: @unchecked Sendable {
         if audioStreamIndex >= 0, let audioStream = dem.stream(at: audioStreamIndex) {
             let codecID = audioStream.pointee.codecpar.pointee.codec_id
             let compat = AudioCodecCompat.from(codecID)
-            if compat.requiresBridge {
+            // HE-AAC (SBR, profile 4) / HE-AACv2 (PS, profile 28) cannot take
+            // the ADTS stream-copy path: ADTS signals only the LC core (SBR
+            // is implicit), and the synthesized ASC below would declare plain
+            // LC at the SBR OUTPUT rate (mp4a.40.2 @ 48 kHz for a 24 kHz
+            // core), which AudioToolbox decodes as garbage; on device this
+            // surfaced as AVFoundationErrorDomain -11821 right after
+            // readyToPlay with the item's tracks unreadable (NBC 1,
+            // aac(HE-AAC)). The frame_size check is the belt-and-suspenders
+            // discriminator: SBR outputs 2048 samples per frame where plain
+            // LC outputs 1024 (find_stream_info decodes a frame, so both
+            // profile and frame_size are populated). Route through the FLAC
+            // bridge, which decodes + re-encodes correctly.
+            let acpForHE = audioStream.pointee.codecpar.pointee
+            let isHEAAC = acpForHE.codec_id == AV_CODEC_ID_AAC
+                && (acpForHE.profile == 4        // FF_PROFILE_AAC_HE
+                    || acpForHE.profile == 28    // FF_PROFILE_AAC_HE_V2
+                    || acpForHE.frame_size == 2048)
+            if compat.requiresBridge || isHEAAC {
                 bridgePreferred = true
                 EngineLog.emit(
-                    "[HLSVideoEngine] audio: codec=\(compat) (bridge required) — decoding + FLAC re-encode",
+                    isHEAAC
+                        ? "[HLSVideoEngine] audio: HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
+                        : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + FLAC re-encode",
                     category: .session
                 )
             } else if compat != .unsupported {
+                // ADTS-AAC from MPEG-TS carries no AudioSpecificConfig in
+                // extradata, so the fMP4 mp4a/esds sample entry can't be built
+                // and the mux write_header fails (EINVAL → "Could not find tag
+                // for codec aac"), forcing the lossy FLAC bridge. Synthesise the
+                // ASC into the codecpar (and clear the TS codec_tag) so stream-
+                // copy works; the pump then strips the per-frame ADTS header.
+                let stripAdts = Self.prepareAACForFMP4(audioStream.pointee.codecpar)
+                if stripAdts {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] audio: AAC/ADTS from TS — synthesised ASC + stripping ADTS for fMP4 stream-copy (no FLAC bridge)",
+                        category: .session
+                    )
+                }
                 streamCopyAudio = HLSSegmentProducer.AudioConfig(
                     codecpar: audioStream.pointee.codecpar,
                     timeBase: audioStream.pointee.time_base,
                     sourceStreamIndex: audioStreamIndex,
                     inputTimeBase: audioStream.pointee.time_base,
                     sourceTimeBase: audioStream.pointee.time_base,
-                    bridge: nil
+                    bridge: nil,
+                    stripAacAdts: stripAdts
                 )
                 // Compute the audio per-frame fallback duration in
                 // the source audio time_base. Same need as
@@ -1451,6 +1522,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // way.
         let preopened = preopenedDemuxer
         preopenedDemuxer = nil
+        let prov = provider
         provider = nil
         savedVideoConfig = nil
         savedAudioConfig = nil
@@ -1461,6 +1533,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // unwinding immediately. waitForFinish + the rest of the
         // resource teardown move to a detached task.
         p?.stop()
+
+        // Wake any server thread parked in an LL-HLS blocking playlist
+        // reload. The producer is stopped, so no segment append will
+        // ever broadcast the condition again; without this the parked
+        // thread sleeps out its full 18-30 s timeout holding the
+        // provider alive and then writes into a possibly-recycled fd.
+        prov?.cancelWaiters()
 
         // Unblock the pump's read synchronously. A live producer can be parked
         // inside av_read_frame in the AVIO reconnect loop, which only exits on
@@ -1499,7 +1578,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// the given absolute segment index. Used both for the initial
     /// session bring-up (baseIndex=0) and for the backward / forward
     /// scrub restart path.
-    private func makeProducer(baseIndex: Int) throws -> HLSSegmentProducer {
+    private func makeProducer(
+        baseIndex: Int,
+        liveReopenOutputEndSeconds: Double? = nil
+    ) throws -> HLSSegmentProducer {
         guard let dem = demuxer, let cache = cache, let cfg = savedVideoConfig else {
             throw HLSVideoEngineError.notStarted
         }
@@ -1527,7 +1609,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let videoTarget: Int64
         let desiredVideoTfdt: Int64
         let desiredAudioTfdt: Int64
-        if baseIndex > 0, baseIndex < segmentPlan.count {
+        if let endSeconds = liveReopenOutputEndSeconds {
+            // Live reopen after source loss: no scan target (join the
+            // fresh source at its head), but the first fragment's tfdt
+            // must CONTINUE the output timeline where the failed
+            // producer's last appended segment ended, so AVPlayer's
+            // cumulative-EXTINF clock and the fragment timestamps stay
+            // on one axis across the reopen seam (the seam segment
+            // additionally carries #EXT-X-DISCONTINUITY via
+            // firstSegmentDiscontinuous).
+            videoTarget = Int64.min
+            desiredVideoTfdt = sourceVideoTbSeconds > 0
+                ? Int64(endSeconds / sourceVideoTbSeconds)
+                : 0
+            desiredAudioTfdt = savedAudioConfig.map {
+                av_rescale_q(desiredVideoTfdt, cfg.timeBase, $0.sourceTimeBase)
+            } ?? 0
+        } else if baseIndex > 0, baseIndex < segmentPlan.count {
             videoTarget = segmentPlan[baseIndex].startPts
             desiredVideoTfdt = segmentPlan[baseIndex].startPts - firstKeyframePts
             // Rescale into the source audio TB (not the bridge encoder
@@ -1557,7 +1655,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // entry is the endPts of the final segment so the producer
         // has a known upper bound for its segmentIndex() lookup. The
         // producer indexes this slice with `i = absoluteSegIdx - baseIndex`.
-        let plannedSegs = segmentPlan[baseIndex..<segmentPlan.count]
+        // Clamp the lower bound: a live reopen passes baseIndex >
+        // segmentPlan.count (the plan is empty for live), which would
+        // otherwise build an invalid range.
+        let plannedSegs = segmentPlan[min(baseIndex, segmentPlan.count)..<segmentPlan.count]
         var segmentBoundaries: [Int64] = plannedSegs.map { $0.startPts }
         if let last = plannedSegs.last {
             segmentBoundaries.append(last.endPts)
@@ -1596,7 +1697,162 @@ public final class HLSVideoEngine: @unchecked Sendable {
             guard isCurrent else { return }
             self.onFatalError?(err)
         }
+        prod.onLiveTimelineRebase = { [weak self] shiftPts, seamOutputSeconds in
+            self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: seamOutputSeconds)
+        }
+        prod.onPumpFinished = { [weak self, weak prod] reason in
+            guard let self, let prod else { return }
+            self.handlePumpFinished(prod, reason: reason)
+        }
         return prod
+    }
+
+    // MARK: - Live source-loss recovery
+
+    /// Bounded reopen-with-backoff after a live source is lost. The AVIO
+    /// reader already absorbs transient drops by reconnecting internally
+    /// (up to its unproductive-reconnect cap), so the pump only exits on
+    /// a genuinely exhausted source: the Jellyfin transcode died, the
+    /// tuner dropped, or the network was gone long enough to blow the
+    /// reader's budget. For VOD the engine's restartHandler covers
+    /// recovery; live had NO recovery at all (the stream stayed dead
+    /// until the user re-entered the channel). The reopen tears down the
+    /// dead demuxer, dials a fresh source connection, and brings up a
+    /// producer that continues the output timeline (see
+    /// `liveReopenOutputEndSeconds` in `makeProducer`).
+    private static let liveReopenMaxAttempts = 6
+
+    private func handlePumpFinished(_ prod: HLSSegmentProducer,
+                                    reason: HLSSegmentProducer.PumpExitReason) {
+        guard isLiveSession else { return }
+        switch reason {
+        case .stopRequested, .muxerFailed:
+            return
+        case .eof, .readError, .keyframeStarvation:
+            // A healthy live source never EOFs; treat it like a loss.
+            break
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] live pump exited (reason=\(reason)); starting reopen",
+            category: .session
+        )
+        Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.performLiveReopen(failedProducer: prod)
+        }
+    }
+
+    private func performLiveReopen(failedProducer: HLSSegmentProducer) async {
+        for attempt in 1...Self.liveReopenMaxAttempts {
+            // Abort silently when the session was torn down (stop() nils
+            // the producer) or someone else already replaced it.
+            guard currentProducerIs(failedProducer) else { return }
+
+            // Capped exponential backoff: 0.5, 1, 2, 4, 8, 8 s (~23 s
+            // total). Enough to ride out a Jellyfin transcode respawn
+            // without hammering a dead tuner.
+            let delay = min(0.5 * pow(2.0, Double(attempt - 1)), 8.0)
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+
+            let dem = Demuxer()
+            do {
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, isLive: true)
+            } catch {
+                EngineLog.emit(
+                    "[HLSVideoEngine] live reopen attempt \(attempt)/\(Self.liveReopenMaxAttempts) failed: \(error)",
+                    category: .session
+                )
+                dem.close()
+                continue
+            }
+            // Same channel URL must yield the same stream layout; the
+            // reopened producer reuses savedVideoConfig/savedAudioConfig,
+            // which embed stream indices and time bases from the
+            // original probe. A mismatch means the server handed us a
+            // different transcode shape: retry rather than corrupt.
+            guard dem.videoStreamIndex == videoStreamIndex else {
+                EngineLog.emit(
+                    "[HLSVideoEngine] live reopen attempt \(attempt): video stream index "
+                    + "changed (\(dem.videoStreamIndex) != \(videoStreamIndex)), retrying",
+                    category: .session
+                )
+                dem.close()
+                continue
+            }
+
+            switch finishLiveReopen(failedProducer: failedProducer, dem: dem, attempt: attempt) {
+            case .done, .aborted:
+                return
+            case .retry:
+                continue
+            }
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] live reopen FAILED after \(Self.liveReopenMaxAttempts) attempts; "
+            + "source considered permanently lost",
+            category: .session
+        )
+    }
+
+    /// Synchronous helper for the locked sections of the reopen (NSLock
+    /// is unavailable from async contexts).
+    private func currentProducerIs(_ p: HLSSegmentProducer) -> Bool {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        return producer === p
+    }
+
+    private enum LiveReopenOutcome { case done, aborted, retry }
+
+    /// Swap the freshly opened demuxer in and bring up the continuation
+    /// producer. Synchronous (locked); called from the async retry loop.
+    private func finishLiveReopen(failedProducer: HLSSegmentProducer,
+                                  dem: Demuxer,
+                                  attempt: Int) -> LiveReopenOutcome {
+        restartLock.lock()
+        guard producer === failedProducer, let prov = provider else {
+            restartLock.unlock()
+            dem.close()
+            return .aborted
+        }
+        let oldDem = demuxer
+        demuxer = dem
+        let (nextIndex, outputEnd) = prov.liveContinuationPoint()
+        do {
+            let newProd = try makeProducer(
+                baseIndex: nextIndex,
+                liveReopenOutputEndSeconds: outputEnd
+            )
+            // The fresh connection joins the broadcast at "now":
+            // content and source clock jump relative to the last
+            // delivered segment, so the seam segment carries
+            // #EXT-X-DISCONTINUITY and the shift handoff is deferred
+            // to the seam (same mechanism as a program-boundary
+            // rebase; an immediate onVideoShiftKnown would jump the
+            // host clock while pre-loss content is still on screen).
+            newProd.firstSegmentDiscontinuous = true
+            newProd.onVideoShiftKnown = { [weak self] shiftPts in
+                self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: outputEnd)
+            }
+            producer = newProd
+            restartLock.unlock()
+            oldDem?.close()
+            newProd.start()
+            EngineLog.emit(
+                "[HLSVideoEngine] live reopen succeeded on attempt \(attempt): "
+                + "continuing at seg\(nextIndex) (outputEnd=\(String(format: "%.1f", outputEnd))s)",
+                category: .session
+            )
+            return .done
+        } catch {
+            demuxer = oldDem
+            restartLock.unlock()
+            dem.close()
+            EngineLog.emit(
+                "[HLSVideoEngine] live reopen attempt \(attempt): producer build failed (\(error))",
+                category: .session
+            )
+            return .retry
+        }
     }
 
     /// Converts the producer's `videoShiftPts` (in source video TB)
@@ -1611,6 +1867,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
         onPlaylistShiftChanged?(seconds)
     }
 
+    /// Live program-boundary rebase. Unlike `handleVideoShiftKnown` this
+    /// does NOT push the new shift through `onPlaylistShiftChanged`: the
+    /// shift describes packets at the producer edge, which AVPlayer
+    /// renders ~buffer + holdback later, so the host clock must keep the
+    /// OLD shift until playback crosses the seam. The engine-side
+    /// `playlistShiftSeconds` tracks the producer edge immediately
+    /// (internal bookkeeping); the deferred host-facing activation goes
+    /// through `onPlaylistShiftRebased`.
+    private func handleLiveTimelineRebase(_ shiftPts: Int64, seamOutputSeconds: Double) {
+        let seconds = shiftPts == Int64.min ? 0 : Double(shiftPts) * sourceVideoTbSeconds
+        playlistShiftSeconds = seconds
+        onPlaylistShiftRebased?(seconds, seamOutputSeconds)
+    }
+
     /// Debounced relay. Producers each have their own once-per-instance
     /// scan latch; this guards against re-firing after a scrub restart
     /// (which builds a fresh producer that re-scans from packet zero).
@@ -1622,6 +1892,46 @@ public final class HLSVideoEngine: @unchecked Sendable {
         if !alreadyFired {
             onFirstHDR10PlusDetected?()
         }
+    }
+
+    /// AAC carried as ADTS (the typical MPEG-TS shape) arrives with no
+    /// AudioSpecificConfig in `extradata`, so the fMP4 `mp4a`/`esds` sample
+    /// entry can't be written and the mux fails. Synthesise a 2-byte ASC from
+    /// the codecpar's sample rate / channel count and install it as extradata,
+    /// and clear the codec_tag the mpegts demuxer leaves (the mov muxer rejects
+    /// the TS tag). Returns true when it applied the fix — the caller flags the
+    /// pump to strip the per-frame ADTS header. No-op (false) for non-AAC or
+    /// AAC that already carries an ASC (then the existing copy path works).
+    private static func prepareAACForFMP4(
+        _ codecpar: UnsafeMutablePointer<AVCodecParameters>
+    ) -> Bool {
+        guard codecpar.pointee.codec_id == AV_CODEC_ID_AAC else { return false }
+        guard codecpar.pointee.extradata == nil || codecpar.pointee.extradata_size == 0 else { return false }
+        let freqTable: [Int32] = [96000, 88200, 64000, 48000, 44100, 32000,
+                                  24000, 22050, 16000, 12000, 11025, 8000, 7350]
+        guard let freqIdx = freqTable.firstIndex(of: codecpar.pointee.sample_rate) else { return false }
+        let channels = max(1, Int(codecpar.pointee.ch_layout.nb_channels))
+        let chanConfig = channels <= 7 ? channels : 2
+        // audioObjectType: basic AAC profiles map profile→profile+1 (LC = 2);
+        // default to 2 (AAC-LC, the mp4a.40.2 the engine advertises) otherwise.
+        let profile = Int(codecpar.pointee.profile)
+        let aot = (profile >= 0 && profile <= 3) ? profile + 1 : 2
+        let asc: [UInt8] = [
+            UInt8((aot << 3) | (freqIdx >> 1)),
+            UInt8(((freqIdx & 1) << 7) | (chanConfig << 3)),
+        ]
+        if codecpar.pointee.extradata != nil { av_freep(&codecpar.pointee.extradata) }
+        codecpar.pointee.extradata_size = 0
+        let total = asc.count + Int(AV_INPUT_BUFFER_PADDING_SIZE)
+        guard let buf = av_malloc(total)?.assumingMemoryBound(to: UInt8.self) else { return false }
+        asc.withUnsafeBufferPointer { src in
+            if let base = src.baseAddress { memcpy(buf, base, asc.count) }
+        }
+        memset(buf + asc.count, 0, Int(AV_INPUT_BUFFER_PADDING_SIZE))
+        codecpar.pointee.extradata = buf
+        codecpar.pointee.extradata_size = Int32(asc.count)
+        codecpar.pointee.codec_tag = 0
+        return true
     }
 
     /// Try the stream-copy → FLAC-bridge → video-only cascade for the
@@ -2793,6 +3103,18 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// holding the segment-list lock. Signaled once from
     /// `appendLiveSegment` when `segments.count` transitions from 0 to 1.
     private let firstSegmentCondition = NSCondition()
+    /// Set by `cancelWaiters()` when the engine tears the session down.
+    /// With LL-HLS blocking reload, AVPlayer has a parked playlist request
+    /// open at essentially all times during steady-state live playback
+    /// (waiting on the next segment, which only arrives ~one target
+    /// duration later). Once the producer is stopped no append will ever
+    /// broadcast again, so without this flag the parked server thread
+    /// sleeps out its full timeout (18-30 s) after stop(), pinning the
+    /// provider + SegmentCache via its strong reference and then writing
+    /// a stale playlist into a connection of the NEXT session if the fd
+    /// number was recycled (engine is a process-wide singleton; channel
+    /// zap restarts immediately). Guarded by `firstSegmentCondition`.
+    private var waitersCancelled = false
     private var visibleHighWater: Int
     private var refreshCounter: Int = 0
     private var endlistAdded: Bool = false
@@ -2801,6 +3123,10 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// `notePlaylistBuild` to `max(0, highWater - windowSegmentCount)`.
     /// Stays 0 for VOD and the append-only EVENT audio path.
     private var _liveFirstVisible: Int = 0
+    /// Running count of discontinuity-tagged segments that have slid out
+    /// of the visible live window; the playlist's
+    /// `#EXT-X-DISCONTINUITY-SEQUENCE` value. Guarded by `stateLock`.
+    private var _discontinuitySequence: Int = 0
 
     /// How many segments past the resume position the initial playlist
     /// exposes. 30 × 4 s = 120 s of forward runway: enough to absorb
@@ -2864,7 +3190,6 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     func appendLiveSegment(index: Int, startSeconds: Double, durationSeconds: Double,
                            discontinuous: Bool = false) {
         stateLock.lock()
-        let wasEmpty = segments.isEmpty
         guard index == segments.count else {
             stateLock.unlock()
             EngineLog.emit(
@@ -2888,14 +3213,12 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
             discontinuous: discontinuous
         ))
         stateLock.unlock()
-        // Signal `waitForFirstLiveSegment` if this is the first segment
-        // so the server's manifest handler can unblock and serve a playlist
-        // that already contains playable content.
-        if wasEmpty {
-            firstSegmentCondition.lock()
-            firstSegmentCondition.broadcast()
-            firstSegmentCondition.unlock()
-        }
+        // Wake the manifest handler's startup-buffer wait on every append (not
+        // just the first), so it can unblock once the configured startup
+        // segment count exists. One broadcast per ~4 s segment is negligible.
+        firstSegmentCondition.lock()
+        firstSegmentCondition.broadcast()
+        firstSegmentCondition.unlock()
     }
 
     // MARK: - Sliding-window operations
@@ -2932,7 +3255,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// firstVisible only advances once enough segments exist to seed
     /// AVPlayer's live edge (the window stays anchored at 0 until then),
     /// which is the anti-stall guarantee.
-    func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool) {
+    func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int) {
         stateLock.lock()
         defer { stateLock.unlock() }
         refreshCounter += 1
@@ -2947,6 +3270,13 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
             // edge without losing a not-yet-buffered position.
             let newFirst = max(0, total - window)
             if newFirst > _liveFirstVisible {
+                // RFC 8216 §6.2.2: EXT-X-DISCONTINUITY-SEQUENCE MUST be
+                // incremented for every discontinuity-tagged segment that
+                // falls out of the window. The live `segments` array is
+                // never pruned, so the slid-out range is still readable.
+                for i in _liveFirstVisible..<newFirst where segments[i].discontinuous {
+                    _discontinuitySequence += 1
+                }
                 _liveFirstVisible = newFirst
                 // Evict everything below the new firstVisible. Off-lock to
                 // avoid holding stateLock during file I/O; evictBelow takes
@@ -2959,9 +3289,9 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
                     cacheRef.evictBelow(cutoff)
                 }
             }
-            return (total, refreshCounter, false)
+            return (total, refreshCounter, false, _discontinuitySequence)
         }
-        return (segments.count, refreshCounter, false)
+        return (segments.count, refreshCounter, false, 0)
     }
 
     /// First segment index visible in the current playlist window.
@@ -3038,6 +3368,31 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
 
     func mediaSegment(at index: Int) -> Data? {
         guard index >= 0, index < currentSegmentCount else { return nil }
+
+        // Live fast-404: a request below the sliding window can never be
+        // satisfied. The producer is forward-only (restartHandler is nil
+        // for live) and the cache evicted the file when the window slid,
+        // so falling through would park the connection in the 30 s
+        // cache.fetch below for a segment that will never reappear.
+        // Concrete trigger: pause live TV past the window, resume;
+        // AVPlayer drains its buffer and fetches an evicted segment, and
+        // playback freezes for 30 s instead of AVPlayer resyncing from
+        // the playlist edge. An immediate nil turns into a fast 404 and
+        // lets AVPlayer recover (the engine's resume clamp jumps the
+        // playhead back inside the window in parallel).
+        if isLive {
+            stateLock.lock()
+            let firstVisible = _liveFirstVisible
+            stateLock.unlock()
+            if index < firstVisible {
+                EngineLog.emit(
+                    "[HLSVideoEngine] seg\(index): below live window (firstVisible=\(firstVisible)), fast 404",
+                    category: .session
+                )
+                return nil
+            }
+        }
+
         let totalStart = DispatchTime.now()
 
         // Defensive: if AVPlayer fetches a segment beyond the current
@@ -3305,23 +3660,107 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     var liveTargetSegmentDuration: Double? {
         isLive ? liveWindowSizing.targetSegmentDurationSeconds : nil
     }
-    /// Block the calling thread until the first live segment is appended,
-    /// or until `timeout` seconds elapse. Returns true if a segment is
-    /// available, false on timeout. Non-live sessions return immediately.
-    /// Used by the manifest handler to avoid serving an empty live playlist
-    /// that causes AVPlayer to fire CoreMediaErrorDomain -12888 on the
-    /// very first poll (before any `#EXTINF` entries exist).
+    /// Live startup buffer, in segments. The manifest handler holds the FIRST
+    /// playlist response until this many segments exist, so AVPlayer (which
+    /// starts a live `.live` playlist at its oldest listed segment, reinforced
+    /// by the host's explicit seek-to-0) begins `liveStartupSegments - 1`
+    /// segments BEHIND the production edge and keeps that gap (production and
+    /// playback both run at 1x, so the cushion is constant). This absorbs the
+    /// real-time-transcode jitter that otherwise starves the bleeding edge
+    /// (-16832 "restarting from end of live playlist" + playbackStalled). 2 =
+    /// one segment (~4 s) of cushion: the minimum that gives any headroom, at
+    /// the cost of ~one extra segment of startup latency. Distinct from the
+    /// reverted live-edge hold-back, which trailed the ADVERTISED edge while
+    /// still starting AVPlayer at the bleeding edge (1 segment) and so never
+    /// built a cushion. 1 disables (serve at the first segment, old behaviour).
+    private static let liveStartupSegments = 2
+
+    /// Block the calling thread until at least `liveStartupSegments` live
+    /// segments have been appended, or until `timeout` seconds elapse. Returns
+    /// true if enough segments are available, false on timeout. Non-live
+    /// sessions return immediately. Holding the first manifest response this
+    /// way (a) avoids serving an empty live playlist that fires
+    /// CoreMediaErrorDomain -12888 on the very first poll, and (b) gives
+    /// AVPlayer a startup cushion behind the live edge (see
+    /// `liveStartupSegments`). Subsequent polls return instantly once the
+    /// count is reached, so only the first response is delayed.
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool {
         guard isLive else { return true }
         let deadline = Date().addingTimeInterval(timeout)
         firstSegmentCondition.lock()
         defer { firstSegmentCondition.unlock() }
         while true {
+            if waitersCancelled { return false }
             stateLock.lock()
             let count = segments.count
             stateLock.unlock()
-            if count > 0 { return true }
-            if !firstSegmentCondition.wait(until: deadline) { return false }
+            if count >= Self.liveStartupSegments { return true }
+            if !firstSegmentCondition.wait(until: deadline) {
+                // Degraded start: serving the first playlist with fewer
+                // than liveStartupSegments segments loses the startup
+                // cushion that absorbs transcode jitter, so a -16832
+                // "restarting from end of live playlist" stall right
+                // after startup becomes likely. Make it observable.
+                if count > 0 && count < Self.liveStartupSegments {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] WARNING: live startup degraded, serving first "
+                        + "playlist with \(count)/\(Self.liveStartupSegments) segments after "
+                        + "\(Int(timeout))s timeout (no startup cushion)",
+                        category: .session
+                    )
+                }
+                return count > 0
+            }
+        }
+    }
+
+    /// Wake every thread parked in `waitForFirstLiveSegment` /
+    /// `waitForLiveSegment` and make all future waits return immediately.
+    /// Called from `HLSVideoEngine.stop()`; see `waitersCancelled`.
+    func cancelWaiters() {
+        firstSegmentCondition.lock()
+        waitersCancelled = true
+        firstSegmentCondition.broadcast()
+        firstSegmentCondition.unlock()
+    }
+
+    /// Where a live-reopen producer must continue: the next segment
+    /// index to append, and the OUTPUT-timeline end (seconds) of the
+    /// last appended segment, which becomes the new producer's desired
+    /// first tfdt so the output timeline stays continuous across the
+    /// reopen seam.
+    func liveContinuationPoint() -> (nextIndex: Int, outputEndSeconds: Double) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        let next = segments.count
+        let end = segments.last.map { $0.startSeconds + $0.durationSeconds } ?? 0
+        return (next, end)
+    }
+
+    /// LL-HLS blocking reload: block until segment `index` (0-based absolute
+    /// index = the requested Media Sequence Number) has been appended, or
+    /// until `timeout`. `segments.count > index` means the segment exists.
+    /// Reuses the same per-append broadcast as `waitForFirstLiveSegment`, so
+    /// the wait wakes the instant the producer finalizes the next segment.
+    /// On timeout returns whether the segment happens to exist by then; the
+    /// caller serves the current playlist either way (AVPlayer retries).
+    func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool {
+        guard isLive else { return true }
+        let deadline = Date().addingTimeInterval(timeout)
+        firstSegmentCondition.lock()
+        defer { firstSegmentCondition.unlock() }
+        while true {
+            if waitersCancelled { return false }
+            stateLock.lock()
+            let count = segments.count
+            stateLock.unlock()
+            if count > index { return true }
+            if !firstSegmentCondition.wait(until: deadline) {
+                stateLock.lock()
+                let final = segments.count
+                stateLock.unlock()
+                return final > index
+            }
         }
     }
     var masterCodecs: String? { codecsString }

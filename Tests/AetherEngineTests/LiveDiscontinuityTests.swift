@@ -75,8 +75,16 @@ final class LiveDiscontinuityTests: XCTestCase {
         // discontinuousIndex out of range -> no segment is ever flagged.
         let provider = MockLiveProvider(count: 4, discontinuousIndex: -1)
         let playlist = HLSLocalServer.buildMediaPlaylistText(provider: provider)
-        XCTAssertFalse(playlist.contains("#EXT-X-DISCONTINUITY"),
+        // Exact-line match: live playlists ALWAYS carry the
+        // #EXT-X-DISCONTINUITY-SEQUENCE header (RFC 8216 6.2.2 bookkeeping
+        // for tagged segments that slid out of the window), which a
+        // substring check would falsely match as the per-segment tag.
+        let lines = playlist.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        XCTAssertFalse(lines.contains("#EXT-X-DISCONTINUITY"),
                        "a playlist with no discontinuous segment must not emit the tag")
+        XCTAssertTrue(playlist.contains("#EXT-X-DISCONTINUITY-SEQUENCE:0"),
+                      "live playlists must carry the discontinuity-sequence header")
     }
 
     func testFirstSegmentDiscontinuityIsEmittedAfterMap() {

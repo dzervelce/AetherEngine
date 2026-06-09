@@ -146,16 +146,19 @@ public final class Demuxer: @unchecked Sendable {
             prefetchEnabled: openProfile.avioPrefetch,
             isLive: isLive
         )
-        try openWithProvider(reader)
+        try openWithProvider(reader, isLive: isLive)
     }
 
     /// Shared open path for AVIO-backed sources. Opens the provider,
     /// attaches its AVIOContext to a fresh AVFormatContext, then runs
     /// avformat_open_input + the stream probe. `inputFormat` forces a
-    /// demuxer when non-nil (custom sources with a format hint).
+    /// demuxer when non-nil (custom sources with a format hint). `isLive`
+    /// suppresses the duration-estimate SEEK_END that would latch EOF on an
+    /// unknown-length live source.
     private func openWithProvider(
         _ provider: AVIOProvider,
-        inputFormat: UnsafePointer<AVInputFormat>? = nil
+        inputFormat: UnsafePointer<AVInputFormat>? = nil,
+        isLive: Bool = false
     ) throws {
         // 1. Open the provider (HEAD probe for HTTP, alloc context for custom).
         try provider.open()
@@ -174,7 +177,7 @@ public final class Demuxer: @unchecked Sendable {
         // 3. Open input, URL is nil because pb is already set.
         var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = ctx
         var opts: OpaquePointer? = nil
-        Self.applyDemuxerOptions(&opts)
+        Self.applyDemuxerOptions(&opts, isLive: isLive)
         let ret = avformat_open_input(&ctxPtr, nil, inputFormat, &opts)
         av_dict_free(&opts)
         guard ret == 0 else {
@@ -239,8 +242,21 @@ public final class Demuxer: @unchecked Sendable {
     ///                       reverted to avoid carrying an option that
     ///                       doesn't change behaviour. See
     ///                       [[project_matroska_nopts_dts]].
-    private static func applyDemuxerOptions(_ opts: inout OpaquePointer?) {
+    private static func applyDemuxerOptions(_ opts: inout OpaquePointer?, isLive: Bool = false) {
         av_dict_set(&opts, "fflags", "+genpts", 0)
+        if isLive {
+            // A live HTTP source has unknown length (Content-Length absent,
+            // fileSize == -1). libavformat's stream-info pass still tries to
+            // estimate the duration by seeking toward SEEK_END; our reader
+            // returns -1 for that seek, and the failed end-seek LATCHES
+            // `pb->eof_reached`. That sticky flag then surfaces as
+            // AVERROR_EOF from av_read_frame once the buffer drains the bytes
+            // pulled during probing (~10 s in), ending the producer pump for
+            // good even though the live feed is still streaming. Skipping the
+            // PTS-based duration estimate avoids the SEEK_END entirely, so the
+            // live source is never given a synthesized EOF.
+            av_dict_set(&opts, "skip_estimate_duration_from_pts", "1", 0)
+        }
     }
 
     /// Common stream probing after open.

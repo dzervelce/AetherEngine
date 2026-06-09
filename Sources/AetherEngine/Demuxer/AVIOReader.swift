@@ -851,7 +851,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 }
                 return totalRead > 0 ? Int32(totalRead) : -1
             }
-            EngineLog.emit("[AVIOReader] Persistent conn ended at offset \(frontier) status=\(status), reconnecting (retryAfter=\(retryAfter)s)", category: .demux)
+            EngineLog.emit("[AVIOReader] Persistent conn ended at offset \(frontier) status=\(status), reconnecting (streak=\(unproductiveReconnects) retryAfter=\(retryAfter)s)", category: .demux)
             backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: retryAfter)
             startPersistentConnection(at: frontier)
         }
@@ -904,10 +904,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // 404 / 410: genuinely gone, won't recover — give up quickly.
             return unproductiveReconnects > Self.permanentMaxUnproductive
         }
+        // A source that has NEVER delivered a single byte is dead-on-arrival
+        // (hard HTTP 5xx on a live tuner, wrong URL, dead debrid link), not a
+        // flaky-but-alive link — give those up after a handful of attempts
+        // (upstream live-TV fix; equally right for VOD).
+        if now == 0 {
+            return unproductiveReconnects > Self.reconnectMaxUnproductiveNeverProductive
+        }
         // Transient (timeout / socket stall / signed-URL expiry / 429 / 503 /
-        // 5xx / drop): keep reconnecting with backoff so playback auto-resumes
-        // when the CDN comes back; only give up after a long zero-progress
-        // window so a truly dead link still surfaces an error eventually.
+        // 5xx / drop) on a link that HAS produced data: keep reconnecting with
+        // backoff so playback auto-resumes when the CDN comes back; only give
+        // up after a long zero-progress window so a truly dead link still
+        // surfaces an error eventually.
         let stalledFor = unproductiveSince.map { Date().timeIntervalSince($0) } ?? 0
         return stalledFor > Self.transientGiveUpSeconds
     }
@@ -917,6 +925,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private static func isPermanentStatus(_ status: Int) -> Bool {
         status == 404 || status == 410
     }
+
+    /// Reconnect budget for a connection that has never delivered any data
+    /// (see `recordReconnectAndShouldGiveUp`). 4 attempts ride out a
+    /// transient transcode spin-up hiccup (~10-15 s with backoff) without
+    /// grinding a dead tuner for minutes.
+    private static let reconnectMaxUnproductiveNeverProductive = 4
 
     /// Sleep before a reconnect. A productive reconnect (streak 0) retries
     /// immediately so a single clean drop doesn't stall playback; the delay

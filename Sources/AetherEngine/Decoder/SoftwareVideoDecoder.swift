@@ -50,6 +50,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// thread (decode) and the main thread (close/flush).
     private let lock = NSLock()
 
+    /// Deinterlacer for interlaced MPEG-2 / VC-1 / MPEG-4 sources (DVD
+    /// rips, SD broadcast channels), which would otherwise render with
+    /// combing. Engaged lazily by the first interlaced frame; from then
+    /// on every frame routes through it (temporal filter, see the class
+    /// doc). Guarded by `lock`.
+    private let deinterlacer = DeinterlaceFilter()
+
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
 
@@ -124,60 +131,103 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         guard let f = frame else { lock.unlock(); return }
         lock.unlock()
 
+        var filtered: UnsafeMutablePointer<AVFrame>? = nil
+
         while true {
             lock.lock()
             guard codecContext != nil else { lock.unlock(); break }
             let ret = avcodec_receive_frame(ctx, f)
-            lock.unlock()
-            guard ret >= 0 else { break }
+            guard ret >= 0 else { lock.unlock(); break }
 
-            // Skip pre-seek frames, decoded for reference but not converted.
-            // This avoids the expensive sws_scale + display for frames the
-            // renderer would drop anyway via skipUntilPTS.
-            if let threshold = skipUntilPTS, f.pointee.pts != Int64.min {
-                let framePTS = CMTimeMake(
-                    value: f.pointee.pts * Int64(timeBase.num),
-                    timescale: Int32(timeBase.den)
-                )
-                if CMTimeCompare(framePTS, threshold) < 0 {
+            // Deinterlace routing, still under `lock` (flush()/close()
+            // tear the graph down from another thread). The first
+            // interlaced frame engages the graph; afterwards EVERY
+            // frame routes through it so the temporal references stay
+            // continuous (deint=interlaced passes progressive frames
+            // through untouched). Progressive-only sessions never enter
+            // this branch.
+            let isInterlaced = (f.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
+            if isInterlaced || deinterlacer.isActive {
+                if deinterlacer.ensureGraph(frame: f, timeBase: timeBase),
+                   deinterlacer.push(f) >= 0 {
+                    if filtered == nil { filtered = av_frame_alloc() }
+                    if let out = filtered {
+                        // The filter holds one frame of lookahead, so a
+                        // push can yield zero frames (EAGAIN) or one.
+                        while deinterlacer.pull(into: out) >= 0 {
+                            emit(out)
+                            av_frame_unref(out)
+                        }
+                    }
+                    lock.unlock()
                     continue
                 }
-                skipUntilPTS = nil
+                // No deinterlacer in the linked build / graph failure:
+                // fall through and render the frame as-is (combing,
+                // but playing).
             }
+            lock.unlock()
 
-            guard let pixelBuffer = convertFrameToPixelBuffer(f) else { continue }
-
-            let pts = f.pointee.pts
-            let cmPTS: CMTime
-            if pts != Int64.min {
-                cmPTS = CMTimeMake(
-                    value: pts * Int64(timeBase.num),
-                    timescale: Int32(timeBase.den)
-                )
-            } else {
-                cmPTS = .invalid
-            }
-
-            // HDR10+, software path reads the dynamic metadata off
-            // the post-decode AVFrame side data and serialises to T.35
-            // SEI bytes the same way the VT path does. We can't reuse
-            // the VT path's packet-side stash because the software
-            // decoder owns its own packet flow.
-            let hdr10PlusData = extractHDR10PlusBytes(from: f)
-            if hdr10PlusData != nil, !seenHDR10Plus {
-                seenHDR10Plus = true
-                onFirstHDR10PlusDetected?()
-            }
-
-            onFrame?(pixelBuffer, cmPTS, hdr10PlusData)
+            emit(f)
         }
 
         av_frame_free(&frame)
+        if filtered != nil { av_frame_free(&filtered) }
+    }
+
+    /// Convert + deliver one decoded (or deinterlaced) frame: skip
+    /// threshold, pixel-buffer conversion, HDR10+ side-data extraction,
+    /// onFrame callback. Factored out of the receive loop so the direct
+    /// and deinterlaced paths share it.
+    private func emit(_ f: UnsafeMutablePointer<AVFrame>) {
+        // Skip pre-seek frames, decoded for reference but not converted.
+        // This avoids the expensive sws_scale + display for frames the
+        // renderer would drop anyway via skipUntilPTS.
+        if let threshold = skipUntilPTS, f.pointee.pts != Int64.min {
+            let framePTS = CMTimeMake(
+                value: f.pointee.pts * Int64(timeBase.num),
+                timescale: Int32(timeBase.den)
+            )
+            if CMTimeCompare(framePTS, threshold) < 0 {
+                return
+            }
+            skipUntilPTS = nil
+        }
+
+        guard let pixelBuffer = convertFrameToPixelBuffer(f) else { return }
+
+        let pts = f.pointee.pts
+        let cmPTS: CMTime
+        if pts != Int64.min {
+            cmPTS = CMTimeMake(
+                value: pts * Int64(timeBase.num),
+                timescale: Int32(timeBase.den)
+            )
+        } else {
+            cmPTS = .invalid
+        }
+
+        // HDR10+, software path reads the dynamic metadata off
+        // the post-decode AVFrame side data and serialises to T.35
+        // SEI bytes the same way the VT path does. We can't reuse
+        // the VT path's packet-side stash because the software
+        // decoder owns its own packet flow.
+        let hdr10PlusData = extractHDR10PlusBytes(from: f)
+        if hdr10PlusData != nil, !seenHDR10Plus {
+            seenHDR10Plus = true
+            onFirstHDR10PlusDetected?()
+        }
+
+        onFrame?(pixelBuffer, cmPTS, hdr10PlusData)
     }
 
     func flush() {
         lock.lock()
         defer { lock.unlock() }
+        // The deinterlacer's temporal references are stale across a
+        // seek/discontinuity; drop the graph (lazily rebuilt by the
+        // next interlaced frame).
+        deinterlacer.teardown()
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
     }
@@ -219,6 +269,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     func close() {
         lock.lock()
+        deinterlacer.teardown()
         if codecContext != nil {
             avcodec_free_context(&codecContext)
         }

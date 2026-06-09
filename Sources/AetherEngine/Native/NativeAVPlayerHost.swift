@@ -117,7 +117,7 @@ final class NativeAVPlayerHost {
     /// `DisplayCriteriaController.apply(...)` must have been invoked
     /// upstream so AVKit can configure the HDR pipeline against the
     /// right target mode before the first segment is fetched.
-    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true) {
+    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0) {
         unloadCurrentItem()
 
         Self.nextSessionID += 1
@@ -128,13 +128,27 @@ final class NativeAVPlayerHost {
 
         let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
-        // Match the audio engine's HLSAudioEngine config so any
-        // "video-pattern is wrong" hypothesis can be ruled out as we
-        // iterate. 4 s of forward buffer matches Apple's HLS authoring
-        // recommendation for the current 4 s VOD segment cadence:
-        // enough to ride out a normal segment-generation hiccup
-        // without ballooning resident memory.
-        item.preferredForwardBufferDuration = 4.0
+        // Forward-buffer floor before AVPlayer leaves
+        // `waitingToPlayAtSpecifiedRate` and starts rendering.
+        //
+        // VOD and loopback-live both use this 4 s default: it matches the
+        // loopback HLS segment cadence, enough to ride out a normal
+        // segment-generation hiccup from the local producer without
+        // ballooning resident memory. Loopback-live deliberately does NOT
+        // raise this — a deeper buffer makes AVPlayer pull the whole visible
+        // playlist up front and race to the live edge, then stall on the
+        // transcode warm-up gap; the 4 s buffer paces consumption instead
+        // (see AetherEngine.loadNative call site, verified on device).
+        //
+        // Live remote-HLS (loadRemoteHLS) passes 0 (system adaptive).
+        // Against a remote, bandwidth-limited Jellyfin live transcode the
+        // 4 s floor forced AVPlayer to pull ~4 s (~10 MB at 20 Mbps) before
+        // unblocking — a 3-4 s black screen at startup while the server
+        // transcoded + shipped that buffer. 0 hands buffering back to
+        // AVPlayer's own heuristic, which starts as soon as it has a
+        // playable lead. preferredForwardBufferDuration == 0.0 is the
+        // documented "let the player choose" value.
+        item.preferredForwardBufferDuration = forwardBufferDuration
 
         // Forward per-frame HDR metadata (HDR10+ ST 2094-40 and Dolby
         // Vision RPU) from the source bitstream into AVPlayer's
@@ -502,7 +516,13 @@ final class NativeAVPlayerHost {
         // hint but isn't enough on its own — AVPlayer treats EVENT
         // playlists as "start near the live edge" unless the caller
         // explicitly seeks first.
-        seek(to: startPosition ?? 0)
+        //
+        // Live remote-HLS (nativeRemoteHLS) WANTS AVPlayer's natural live-
+        // edge start, so it sets skipInitialSeek and we leave the position
+        // to AVPlayer. VOD / loopback (default) seeks to startPosition.
+        if !skipInitialSeek {
+            seek(to: startPosition ?? 0)
+        }
     }
 
     /// Release the AVPlayerItem so a follow-up `load(...)` starts

@@ -126,6 +126,31 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// and muxes the returned FLAC packets; nil means the source
         /// packet is muxed directly (stream-copy).
         let bridge: AudioBridge?
+        /// True when the source is AAC carried as ADTS (the typical shape
+        /// out of an MPEG-TS feed: no AudioSpecificConfig in `extradata`,
+        /// a 7/9-byte ADTS header on every frame). To stream-copy that into
+        /// fMP4 the pump must strip the ADTS header from each packet; the
+        /// engine separately synthesises the ASC into the muxer codecpar so
+        /// the `mp4a`/`esds` sample entry is well-formed. Without this the
+        /// mux write_header fails (EINVAL) and the channel falls back to the
+        /// lossy FLAC bridge. Only set for the stream-copy AAC path.
+        let stripAacAdts: Bool
+
+        init(codecpar: UnsafePointer<AVCodecParameters>,
+             timeBase: AVRational,
+             sourceStreamIndex: Int32,
+             inputTimeBase: AVRational,
+             sourceTimeBase: AVRational,
+             bridge: AudioBridge?,
+             stripAacAdts: Bool = false) {
+            self.codecpar = codecpar
+            self.timeBase = timeBase
+            self.sourceStreamIndex = sourceStreamIndex
+            self.inputTimeBase = inputTimeBase
+            self.sourceTimeBase = sourceTimeBase
+            self.bridge = bridge
+            self.stripAacAdts = stripAacAdts
+        }
     }
 
     // MARK: - State
@@ -229,6 +254,50 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// the playlist builder prefixes it with `#EXT-X-DISCONTINUITY`. Latched
     /// on detection, consumed (cleared) when the next segment opens.
     private var pendingDiscontinuityFlag: Bool = false
+
+    /// Latched alongside `pendingDiscontinuityFlag` when a live timeline
+    /// rebase fires. Makes the keyframe cutter cut at the NEXT keyframe
+    /// regardless of the 4 s minimum-duration condition. Without this the
+    /// splice usually lands mid-segment (the cutter only cuts at a
+    /// keyframe >= target duration past the segment start), so the
+    /// #EXT-X-DISCONTINUITY tag would arrive one segment late while the
+    /// boundary segment itself mixes old- and new-program content.
+    private var pendingForceCutFlag: Bool = false
+
+    /// Cross-stream rebase pairing. A program boundary jumps the shared
+    /// MPEG-TS source clock on BOTH streams, but the content gap at the
+    /// splice is rarely symmetric (audio lead-out / silence / dropped
+    /// corrupt packets differ per stream). Rebasing each stream
+    /// independently "one frame past its own last output" collapses each
+    /// stream's gap separately, turning the asymmetry into a PERMANENT
+    /// A/V offset for the rest of the program. The video rebase is the
+    /// master (mirroring the head-of-stream rule where audio inherits the
+    /// video's origin shift): when video rebases, the audio applies the
+    /// SAME timeline delta, rescaled into the audio time base.
+    ///
+    /// `pendingAudioInheritDeltaTicks` is the video rebase delta waiting
+    /// for the audio stream's own boundary packet (video usually crosses
+    /// first; accumulated if a transient dts spike rebases and counter-
+    /// rebases before audio crosses). `lastIndependentAudioRebase`
+    /// records an audio rebase that fired BEFORE the video one (packet
+    /// interleave can deliver the first new-program audio packet early);
+    /// the subsequent video rebase then replaces the audio's measured
+    /// shift with the video-derived one via `pendingAudioShiftOverride`,
+    /// applied at the next audio packet. All pairing state expires after
+    /// `rebasePairingWindowSeconds` so a stale half-boundary can never
+    /// poison a later, unrelated one.
+    private var pendingAudioInheritDelta: (ticksAudioTb: Int64, at: Date)? = nil
+    private var lastIndependentAudioRebase: (preShift: Int64, at: Date)? = nil
+    private var pendingAudioShiftOverride: Int64? = nil
+    private static let rebasePairingWindowSeconds: TimeInterval = 5.0
+
+    /// Last in-band video extradata observed via
+    /// AV_PKT_DATA_NEW_EXTRADATA (live only). Used to deduplicate the
+    /// codec-parameter-change detection: some demuxers re-emit identical
+    /// extradata side data periodically.
+    private var lastSeenVideoExtradata: Data? = nil
+    /// Number of distinct in-band extradata changes seen this session.
+    private var codecParamChangeCount = 0
 
     /// Per-index discontinuity flag for live segments the cutter has opened.
     /// Mirrors `liveSegmentStartByIndex`'s lifetime: set when the segment
@@ -402,6 +471,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// the silent failure mode in the log so the user-visible "lädt
     /// unendlich" symptom maps to a concrete cause.
     private var pregateVideoDropCount: Int = 0
+    /// Wall-clock start of the video keyframe-gate wait (first dropped
+    /// pre-gate packet). Live sessions bound the wait with
+    /// `liveKeyframeGateTimeoutSeconds`; see the gate for rationale.
+    private var pregateWaitStart: Date?
+    private static let liveKeyframeGateTimeoutSeconds: TimeInterval = 15
     private var pregateAudioDropCount: Int = 0
     private var lastPregateVideoLog: Int = 0
     private var lastPregateAudioLog: Int = 0
@@ -593,6 +667,61 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// other producer→engine callbacks above.
     var onFatalError: (@Sendable (Error) -> Void)?
 
+    /// Fires when a live timeline rebase changes `videoShiftPts` at a
+    /// program boundary. Distinct from `onVideoShiftKnown`: the new
+    /// shift describes packets at the PRODUCER edge, which AVPlayer
+    /// renders ~buffer + holdback later, so the engine must defer
+    /// applying it to the published clock until playback crosses the
+    /// seam. `seamOutputSeconds` is the seam's position on the output
+    /// (AVPlayer clock) timeline, directly comparable to the host's raw
+    /// currentTime.
+    var onLiveTimelineRebase: (@Sendable (_ shiftPts: Int64, _ seamOutputSeconds: Double) -> Void)?
+
+    /// Why the pump loop exited. Set exactly once, right before
+    /// `didFinishFlag`; readable after `waitForFinish` returns true and
+    /// delivered via `onPumpFinished`.
+    enum PumpExitReason: Sendable, CustomStringConvertible {
+        /// Clean end of stream (VOD tail, or a live source that closed
+        /// gracefully; for live the engine treats this like a source
+        /// loss, a healthy live source never EOFs).
+        case eof
+        /// `stop()` was called (teardown / scrub restart).
+        case stopRequested
+        /// `demuxer.readPacket()` threw after the AVIO reader exhausted
+        /// its reconnect budget (live) or hit a hard I/O error.
+        case readError(code: Int32)
+        /// A muxer allocation / rotation failed mid-pump.
+        case muxerFailed
+        /// Live keyframe gate: no `AV_PKT_FLAG_KEY` video packet arrived
+        /// within the timeout (mis-flagged source); the stream would
+        /// starve forever, so the pump exits and lets the engine's
+        /// reopen path retry with a fresh source connection.
+        case keyframeStarvation
+
+        var description: String {
+            switch self {
+            case .eof: return "eof"
+            case .stopRequested: return "stopRequested"
+            case .readError(let code): return "readError(\(code))"
+            case .muxerFailed: return "muxerFailed"
+            case .keyframeStarvation: return "keyframeStarvation"
+            }
+        }
+    }
+
+    /// Fires exactly once when the pump loop has fully unwound (after
+    /// the final segment was finalized and `didFinishFlag` broadcast).
+    /// The engine uses this on live sessions to drive the bounded
+    /// reopen-with-backoff recovery when the source was lost.
+    var onPumpFinished: (@Sendable (PumpExitReason) -> Void)?
+
+    /// Marks the FIRST segment this producer opens as discontinuous
+    /// (`#EXT-X-DISCONTINUITY`). Set by the engine's live-reopen path:
+    /// the fresh source connection joins the broadcast at "now", so the
+    /// content (and source clock) jump relative to the last segment the
+    /// failed producer delivered.
+    var firstSegmentDiscontinuous = false
+
     /// Latched once the signature has been seen in this producer's
     /// packet stream so the scan goes silent for the remainder of the
     /// session. The byte scan is cheap (~µs per packet) but there's no
@@ -696,11 +825,20 @@ final class HLSSegmentProducer: @unchecked Sendable {
             liveCurrentSegmentIndex = baseIndex
             liveSegmentStartPtsSeconds = ptsSeconds
             liveSegmentStartByIndex[liveCurrentSegmentIndex] = ptsSeconds
-            liveSegmentDiscontinuousByIndex[liveCurrentSegmentIndex] = false
+            liveSegmentDiscontinuousByIndex[liveCurrentSegmentIndex] = firstSegmentDiscontinuous
+            // A boundary before the first segment has nothing to separate.
+            pendingForceCutFlag = false
             return liveCurrentSegmentIndex
         }
+        // `pendingForceCutFlag` (set by the timeline rebase) cuts at the
+        // NEXT keyframe regardless of the 4 s minimum, so the boundary
+        // segment starts at the new program's first IRAP and carries the
+        // #EXT-X-DISCONTINUITY tag exactly at the splice instead of one
+        // segment late. The short pre-boundary segment this produces is
+        // spec-legal (EXTINF < TARGETDURATION).
         if isKeyframe,
-           ptsSeconds - liveSegmentStartPtsSeconds >= targetSegmentDurationSeconds {
+           pendingForceCutFlag
+            || ptsSeconds - liveSegmentStartPtsSeconds >= targetSegmentDurationSeconds {
             // Cut: this keyframe starts a new segment. The finalize of the
             // segment we are leaving happens inside ensureMuxer/advanceMuxer
             // when the look-behind routes the previous packet; the duration
@@ -708,6 +846,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             liveCurrentSegmentIndex += 1
             liveSegmentStartPtsSeconds = ptsSeconds
             liveSegmentStartByIndex[liveCurrentSegmentIndex] = ptsSeconds
+            pendingForceCutFlag = false
             // A discontinuity detected since the last cut marks THIS new
             // segment as the boundary segment. AVPlayer keeps its own
             // timeline continuous across the #EXT-X-DISCONTINUITY tag, which
@@ -1105,14 +1244,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         let pumpStart = DispatchTime.now()
         var packetsRead = 0
-        let lastError: Int32 = 0
+        var lastError: Int32 = 0
+        var exitReason: PumpExitReason = .eof
 
         do {
             readLoop: while true {
                 stateLock.lock()
                 let stopRequested = shouldStop
                 stateLock.unlock()
-                if stopRequested { break readLoop }
+                if stopRequested {
+                    exitReason = .stopRequested
+                    break readLoop
+                }
 
                 // Footprint backstop: throttle the whole pump (read + mux) while the
                 // process footprint is over the high-water mark so it can't run
@@ -1145,6 +1288,38 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // this knocks the residual leak rate down, matroska's
                 // per-packet side-data allocations were the missing
                 // piece beyond URLSession dispatch_data retention.
+                //
+                // Live exception: AV_PKT_DATA_NEW_EXTRADATA is inspected
+                // FIRST. A broadcast program boundary can change the video
+                // codec parameters (resolution / SPS / PPS), which the
+                // demuxer surfaces as in-band new-extradata side data. The
+                // fMP4 init segment was captured once at session start, so
+                // a real parameter change makes subsequent segments
+                // undecodable against the stale hvcC/avcC. Detect it,
+                // force a discontinuity cut (the tag at least resets
+                // AVPlayer's decoder at the seam), and log loudly: the
+                // full fix (versioned init.mp4 + per-discontinuity
+                // EXT-X-MAP) is gated on a real-world repro channel.
+                if isLive, packet.pointee.stream_index == videoStreamIndex {
+                    var sdSize: Int = 0
+                    if let sd = av_packet_get_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, &sdSize),
+                       sdSize > 0 {
+                        let newExtra = Data(bytes: sd, count: sdSize)
+                        if newExtra != lastSeenVideoExtradata {
+                            lastSeenVideoExtradata = newExtra
+                            codecParamChangeCount += 1
+                            pendingDiscontinuityFlag = true
+                            pendingForceCutFlag = true
+                            EngineLog.emit(
+                                "[HLSSegmentProducer] WARNING: in-band video extradata change #\(codecParamChangeCount) "
+                                + "(\(sdSize) bytes) at a live boundary. The init segment is from session "
+                                + "start; if this is a real SPS/resolution change, expect decode artifacts "
+                                + "until the versioned-init (EXT-X-MAP) path exists. Forcing a discontinuity cut.",
+                                category: .session
+                            )
+                        }
+                    }
+                }
                 av_packet_free_side_data(packet)
 
                 let pktStreamIdx = packet.pointee.stream_index
@@ -1217,6 +1392,184 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         if packet.pointee.pts == Int64.min {
                             packet.pointee.pts = packet.pointee.dts
                         }
+                    }
+                }
+                // Live timeline-discontinuity rebase. A broadcast program
+                // boundary or an MPEG-TS PCR wrap resets the source dts to a
+                // small value, so the incoming packet's dts sits many seconds
+                // BELOW lastValid. The per-frame monotonic gate below is tuned
+                // for +1-tick MKV B-frame reconstruction glitches: for a video
+                // packet it would bump to lastValid+1, find that exceeds the
+                // (also-reset, small) pts, and DROP. Because lastVideoSourceDts
+                // only advances on KEPT packets, every subsequent video packet
+                // would then drop forever — the keyframe cutter stalls, the
+                // live playlist stops growing, and AVPlayer parks on -12888
+                // ("Playlist File unchanged"). For audio the same gate bumps
+                // dts to lastValid+1 while pts stays small, so the muxer emits
+                // pts<dts and audio timing corrupts. Both are exactly the
+                // failure modes seen on Jellyfin live channels at a program
+                // change.
+                //
+                // The correct repair for a multi-second source-clock leap is
+                // not per-packet monotonicity but a timeline REBASE: shift this
+                // stream so its OUTPUT dts continues one frame past the last
+                // output dts. pts and dts move by the same delta, preserving
+                // their skew (no pts<dts), and the next opened segment carries
+                // #EXT-X-DISCONTINUITY so AVPlayer resyncs its clock across the
+                // seam. We set lastValid to dts-1 so the monotonic gate below
+                // sees the rebased packet as already-monotonic and leaves it
+                // alone. Live-only: VOD's B-frame glitch handling is untouched.
+                if isLive, isVideoPkt, lastVideoSourceDts != Int64.min,
+                   videoShiftPts != Int64.min, packet.pointee.dts != Int64.min {
+                    let jumpTicks = packet.pointee.dts - lastVideoSourceDts
+                    let thresholdTicks = sourceVideoTbSeconds > 0
+                        ? Int64(Self.discontinuityThresholdSeconds / sourceVideoTbSeconds)
+                        : Int64.max
+                    if abs(jumpTicks) >= thresholdTicks {
+                        let lastOutputDts = lastVideoSourceDts - videoShiftPts
+                        let continuationDts = lastOutputDts + max(videoFallbackDurationPts, 1)
+                        let newShift = packet.pointee.dts - continuationDts
+                        EngineLog.emit(
+                            "[HLSSegmentProducer] live video timeline rebase: "
+                            + "jumpTicks=\(jumpTicks) srcDts=\(packet.pointee.dts) "
+                            + "lastSrcDts=\(lastVideoSourceDts) oldShift=\(videoShiftPts) "
+                            + "newShift=\(newShift) lastOutDts=\(lastOutputDts)",
+                            category: .session
+                        )
+                        let videoDeltaTicks = newShift - videoShiftPts
+                        videoShiftPts = newShift
+                        // dts-1 so the monotonic gate below is a no-op for this
+                        // packet; line ~1126 then sets lastValid = dts exactly.
+                        lastVideoSourceDts = packet.pointee.dts - 1
+                        // Re-anchor the leading-B-frame drop to the new program;
+                        // otherwise its `pts < firstActualVideoPts` test (raw
+                        // source space) would drop every reset-timeline packet.
+                        if packet.pointee.pts != Int64.min {
+                            firstActualVideoPts = packet.pointee.pts
+                        }
+                        // Reset the PTS-detector baseline so it doesn't also
+                        // double-flag this same leap one packet later.
+                        lastRawVideoPts = Int64.min
+                        pendingDiscontinuityFlag = true
+                        pendingForceCutFlag = true
+                        // Hand the SAME timeline delta to the audio stream
+                        // (rescaled), so both streams undergo one shared
+                        // transform and their true source-time relationship
+                        // survives the boundary. See the pairing-state docs.
+                        if let audio = audioConfig {
+                            let deltaAudioTb = av_rescale_q(
+                                videoDeltaTicks,
+                                sourceVideoTimeBase,
+                                audio.sourceTimeBase
+                            )
+                            if let prior = lastIndependentAudioRebase,
+                               Date().timeIntervalSince(prior.at) < Self.rebasePairingWindowSeconds {
+                                // Audio crossed the boundary first (interleave)
+                                // and measured independently; replace its
+                                // measured shift with the video-derived one at
+                                // the next audio packet.
+                                pendingAudioShiftOverride = prior.preShift + deltaAudioTb
+                                lastIndependentAudioRebase = nil
+                            } else {
+                                // Accumulate instead of overwrite: a transient
+                                // dts spike rebases and immediately counter-
+                                // rebases; the deltas sum to ~0, which is
+                                // exactly what audio should inherit.
+                                let accumulated = (pendingAudioInheritDelta
+                                    .map { Date().timeIntervalSince($0.at) < Self.rebasePairingWindowSeconds ? $0.ticksAudioTb : 0 }
+                                    ?? 0) + deltaAudioTb
+                                pendingAudioInheritDelta = (accumulated, Date())
+                            }
+                        }
+                        // Deferred host-clock handoff: the shift describes
+                        // packets at the PRODUCER edge, which AVPlayer renders
+                        // ~buffer + holdback later. Publishing it immediately
+                        // would jump the host's currentTime/sourceTime while
+                        // the old program is still on screen (a backward
+                        // program reset would jump it by hours). The seam's
+                        // output-timeline position is exactly continuationDts;
+                        // the engine applies the new shift when the playback
+                        // clock crosses it.
+                        let seamOutputSeconds = Double(continuationDts) * sourceVideoTbSeconds
+                        onLiveTimelineRebase?(newShift, seamOutputSeconds)
+                    }
+                }
+                if isLive, isAudioPkt, lastAudioSourceDts != Int64.min,
+                   audioShiftPts != Int64.min, packet.pointee.dts != Int64.min,
+                   let audio = audioConfig {
+                    let jumpTicks = packet.pointee.dts - lastAudioSourceDts
+                    let tb = audio.sourceTimeBase
+                    let thresholdTicks = tb.num > 0
+                        ? Int64(Self.discontinuityThresholdSeconds * Double(tb.den) / Double(tb.num))
+                        : Int64.max
+                    if abs(jumpTicks) >= thresholdTicks {
+                        let lastOutputDts = lastAudioSourceDts - audioShiftPts
+                        // Independent measurement: continue one audio frame
+                        // past the last output dts. Used directly only when
+                        // no video-derived delta is available (audio crossed
+                        // the boundary first); otherwise it bounds the
+                        // monotonic clamp below.
+                        let measuredShift = packet.pointee.dts
+                            - (lastOutputDts + max(audioFallbackDurationPts, 1))
+                        var newShift = measuredShift
+                        var inherited = false
+                        if let p = pendingAudioInheritDelta,
+                           Date().timeIntervalSince(p.at) < Self.rebasePairingWindowSeconds {
+                            // Inherit the video rebase delta so the A/V
+                            // relationship survives the boundary. Clamp so the
+                            // first rebased output dts never lands at or below
+                            // the last emitted one (an audio splice overlap
+                            // would otherwise trip the muxer's monotonic
+                            // check); the clamp ceiling equals the independent
+                            // measurement's continuation point.
+                            let candidate = audioShiftPts + p.ticksAudioTb
+                            let maxShift = packet.pointee.dts - lastOutputDts - 1
+                            newShift = min(candidate, maxShift)
+                            inherited = true
+                            if newShift != candidate {
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] audio rebase inherit clamped: "
+                                    + "candidate=\(candidate) maxShift=\(maxShift) "
+                                    + "(splice overlap collapsed)",
+                                    category: .session
+                                )
+                            }
+                        } else {
+                            // Audio crossed first; remember the pre-boundary
+                            // shift so the upcoming video rebase can replace
+                            // this measurement with the video-derived delta.
+                            lastIndependentAudioRebase = (audioShiftPts, Date())
+                        }
+                        pendingAudioInheritDelta = nil
+                        EngineLog.emit(
+                            "[HLSSegmentProducer] live audio timeline rebase: "
+                            + "jumpTicks=\(jumpTicks) srcDts=\(packet.pointee.dts) "
+                            + "lastSrcDts=\(lastAudioSourceDts) oldShift=\(audioShiftPts) "
+                            + "newShift=\(newShift) "
+                            + "(\(inherited ? "video-derived" : "independent"))",
+                            category: .session
+                        )
+                        audioShiftPts = newShift
+                        lastAudioSourceDts = packet.pointee.dts - 1
+                    } else if let override_ = pendingAudioShiftOverride {
+                        // The video rebase arrived AFTER this stream already
+                        // rebased independently (interleave delivered audio's
+                        // boundary packet first). Correct the shift to the
+                        // video-derived value, clamped to output monotonicity;
+                        // only the few packets between the two boundary
+                        // packets carried the uncorrected shift.
+                        let lastOutputDts = lastAudioSourceDts - audioShiftPts
+                        let maxShift = packet.pointee.dts - lastOutputDts - 1
+                        let applied = min(override_, maxShift)
+                        EngineLog.emit(
+                            "[HLSSegmentProducer] audio rebase corrected to video-derived shift: "
+                            + "old=\(audioShiftPts) new=\(applied)"
+                            + (applied != override_ ? " (clamped from \(override_))" : ""),
+                            category: .session
+                        )
+                        audioShiftPts = applied
+                        lastAudioSourceDts = packet.pointee.dts - 1
+                        pendingAudioShiftOverride = nil
                     }
                 }
                 // Monotonic-dts enforcement at source TB. The matroska
@@ -1357,6 +1710,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             || (packet.pointee.dts != Int64.min && packet.pointee.dts >= restartTargetVideoDts)
                         guard isKey, targetSatisfied else {
                             pregateVideoDropCount += 1
+                            if pregateVideoDropCount == 1 {
+                                pregateWaitStart = Date()
+                            }
                             if pregateVideoDropCount - lastPregateVideoLog >= Self.pregateLogInterval {
                                 lastPregateVideoLog = pregateVideoDropCount
                                 EngineLog.emit(
@@ -1367,6 +1723,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                     + "baseIndex=\(baseIndex)",
                                     category: .session
                                 )
+                            }
+                            // Live-only bounded wait: a source that never
+                            // flags a keyframe (mis-flagged TS) would starve
+                            // the cutter forever with nothing but the
+                            // periodic log above. Exit with a terminal
+                            // reason instead and let the engine's reopen
+                            // path retry with a fresh source connection.
+                            // VOD keeps the unbounded wait (the scan-forward
+                            // restart machinery depends on it).
+                            if isLive, let started = pregateWaitStart,
+                               Date().timeIntervalSince(started) > Self.liveKeyframeGateTimeoutSeconds {
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] live keyframe gate timed out after "
+                                    + "\(Int(Self.liveKeyframeGateTimeoutSeconds))s "
+                                    + "(dropped=\(pregateVideoDropCount)); exiting pump for reopen",
+                                    category: .session
+                                )
+                                exitReason = .keyframeStarvation
+                                break readLoop
                             }
                             continue
                         }
@@ -1584,6 +1959,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         let deltaSeconds = Double(deltaTicks) * sourceVideoTbSeconds
                         if abs(deltaSeconds) >= Self.discontinuityThresholdSeconds {
                             pendingDiscontinuityFlag = true
+                            pendingForceCutFlag = true
                             if !loggedFirstDiscontinuity {
                                 loggedFirstDiscontinuity = true
                                 EngineLog.emit(
@@ -1673,6 +2049,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
                             trackedPacketFree(&pkt)
                             pendingVideoPkt = nil
+                            exitReason = .muxerFailed
                             break readLoop
                         }
                     }
@@ -1794,6 +2171,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         }
                         continue
                     }
+                    // ADTS-AAC from MPEG-TS: strip the per-frame ADTS header
+                    // so the bytes muxed into fMP4 are raw AAC (the sample
+                    // entry's esds/ASC was synthesised at setup). Done in place
+                    // before the look-behind stashes the packet.
+                    if audio.stripAacAdts { Self.stripADTSHeader(packet) }
                     // Stream-copy audio look-behind.
                     let thisAudioSeg: Int = isLive ? liveCurrentSegmentIndex : 0
                     if let prev = pendingAudioPkt {
@@ -1814,6 +2196,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
                             trackedPacketFree(&pkt)
                             pendingAudioPkt = nil
+                            exitReason = .muxerFailed
                             break readLoop
                         }
                     }
@@ -1824,10 +2207,26 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 }
             }
         } catch {
+            if case DemuxerError.readFailed(let code) = error {
+                lastError = code
+                exitReason = .readError(code: code)
+            } else {
+                lastError = -1
+                exitReason = .readError(code: -1)
+            }
             EngineLog.emit(
                 "[HLSSegmentProducer] demuxer.readPacket threw: \(error)",
                 category: .session
             )
+        }
+
+        // A muxer-failure break during a stop()-initiated backpressure
+        // wait is teardown, not an error; report it as such.
+        if case .muxerFailed = exitReason {
+            stateLock.lock()
+            let stopped = shouldStop
+            stateLock.unlock()
+            if stopped { exitReason = .stopRequested }
         }
 
         // Flush look-behind pending packets. No successor packet
@@ -1878,7 +2277,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         finalizeSessionMuxerAndAdopt()
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - pumpStart.uptimeNanoseconds) / 1_000_000
         EngineLog.emit(
-            "[HLSSegmentProducer] pump finished: packetsRead=\(packetsRead) "
+            "[HLSSegmentProducer] pump finished: reason=\(exitReason) "
+            + "packetsRead=\(packetsRead) "
             + "packetsWritten=\(packetsWrittenCount) lastError=\(lastError) "
             + "elapsed=\(String(format: "%.0f", elapsedMs))ms cacheCount=\(cache.count)",
             category: .session
@@ -1888,6 +2288,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         didFinishFlag = true
         finishCondition.broadcast()
         finishCondition.unlock()
+
+        onPumpFinished?(exitReason)
     }
 
     // MARK: - Look-behind finalize helpers
@@ -1934,6 +2336,26 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         var pkt: UnsafeMutablePointer<AVPacket>? = packet
         trackedPacketFree(&pkt)
+    }
+
+    /// Strip a single ADTS header off an AAC packet in place so the bytes
+    /// are raw AAC, suitable for the fMP4 `mp4a` sample entry. ADTS frames
+    /// carry a 7-byte header (or 9 with a CRC, flagged by the
+    /// `protection_absent` bit), then the raw AAC payload. We advance the
+    /// packet's `data` pointer past the header and shrink `size`; the packet's
+    /// `buf` (what `av_packet_unref` frees) is untouched, so this is safe.
+    /// No-ops unless the packet actually starts with the 0xFFF ADTS sync,
+    /// which guards against double-stripping or a source that already emits
+    /// raw AAC. Assumes one raw-data-block per ADTS frame (the universal case
+    /// for streamed AAC); multi-block ADTS is not split here.
+    private static func stripADTSHeader(_ packet: UnsafeMutablePointer<AVPacket>) {
+        guard let data = packet.pointee.data, packet.pointee.size >= 7 else { return }
+        // Sync word: 12 bits of 1s (0xFFF) → data[0]==0xFF, top 4 bits of data[1] set.
+        guard data[0] == 0xFF, (data[1] & 0xF0) == 0xF0 else { return }
+        let headerLen: Int32 = (data[1] & 0x01) != 0 ? 7 : 9
+        guard packet.pointee.size > headerLen else { return }
+        packet.pointee.data = data.advanced(by: Int(headerLen))
+        packet.pointee.size -= headerLen
     }
 
     /// Same shape as `finalizeAndWriteVideo` but for stream-copy

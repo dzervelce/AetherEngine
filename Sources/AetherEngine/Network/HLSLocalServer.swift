@@ -106,8 +106,14 @@ protocol HLSSegmentProvider: AnyObject {
     /// counter (for the byte-level "playlist changed" signal), and
     /// whether the playlist should declare itself complete with
     /// `#EXT-X-ENDLIST`. Used by the video provider to advance a
-    /// sliding-window live playlist.
-    func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool)
+    /// sliding-window live playlist. `discontinuitySequence` is the
+    /// number of `#EXT-X-DISCONTINUITY`-tagged segments that have slid
+    /// OUT of the visible window, emitted as
+    /// `#EXT-X-DISCONTINUITY-SEQUENCE` (RFC 8216 §6.2.2 REQUIRES the
+    /// server to increment it when a discontinuity-tagged segment is
+    /// removed; without it AVPlayer's discontinuity tracking slips one
+    /// window-length after every program boundary).
+    func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int)
 
     /// First segment index visible in the current playlist window.
     /// For append-only and VOD playlists this is always 0.
@@ -123,6 +129,16 @@ protocol HLSSegmentProvider: AnyObject {
     /// the first live response until there is meaningful content, preventing
     /// CoreMediaErrorDomain -12888 on empty live playlists.
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool
+
+    /// LL-HLS blocking playlist reload. Blocks the calling thread until a
+    /// segment with absolute index `index` (the requested Media Sequence
+    /// Number) exists, or until `timeout` seconds elapse. Returns `true`
+    /// once the segment is available, `false` on timeout. Lets the server
+    /// hold AVPlayer's `_HLS_msn` reload open and answer the instant the
+    /// next segment is cut, instead of AVPlayer polling on its own fixed
+    /// cadence and discovering fresh segments a reload-interval late (the
+    /// residual live startup pause). Non-live providers return immediately.
+    func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool
 }
 
 extension HLSSegmentProvider {
@@ -164,13 +180,17 @@ extension HLSSegmentProvider {
     /// by the time the first poll interval fires.
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool { true }
 
+    /// Default: non-live providers have their full segment list at init,
+    /// so any requested index is already available.
+    func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool { true }
+
     /// Default implementation for providers that don't run a
     /// sliding-window playlist. Reports the current segmentCount,
     /// a zero refresh counter (the byte-level change line is a
     /// video-side concern), and trusts the static playlistType to
     /// drive ENDLIST inclusion.
-    func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool) {
-        return (visibleCount: segmentCount, refreshCounter: 0, endlistAdded: false)
+    func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int) {
+        return (visibleCount: segmentCount, refreshCounter: 0, endlistAdded: false, discontinuitySequence: 0)
     }
 }
 
@@ -485,9 +505,18 @@ final class HLSLocalServer: @unchecked Sendable {
         if fdToClose >= 0 {
             close(fdToClose)
         }
-        // Close all active client fds to unblock recv/send.
+        // shutdown() (NOT close) the active client fds to unblock
+        // recv/send. close() here would release the fd NUMBER while the
+        // connection handler still owns it; on the process-wide singleton
+        // engine the next session (channel zap) immediately opens new
+        // sockets/files that recycle those numbers, so the handler's
+        // late send() / deferred close() would then hit a foreign
+        // descriptor (the new session's segment file or AVPlayer
+        // connection). shutdown() wakes the blocked syscalls (recv
+        // returns 0, send fails EPIPE) but keeps the number reserved
+        // until the handler's single deferred close() releases it.
         for fd in clients {
-            close(fd)
+            shutdown(fd, SHUT_RDWR)
         }
     }
 
@@ -648,7 +677,21 @@ final class HLSLocalServer: @unchecked Sendable {
                            category: .hlsServer)
             return false
         }
-        let path = String(parts[1])
+        let rawTarget = String(parts[1])
+        // Split the request target into path + query. AVPlayer appends an
+        // LL-HLS delivery directive (`?_HLS_msn=N`) to media.m3u8 reload
+        // requests once the playlist advertises CAN-BLOCK-RELOAD, so the
+        // route switch must match on the path alone, and the query carries
+        // the blocking-reload Media Sequence Number.
+        let path: String
+        let query: String
+        if let q = rawTarget.firstIndex(of: "?") {
+            path = String(rawTarget[..<q])
+            query = String(rawTarget[rawTarget.index(after: q)...])
+        } else {
+            path = rawTarget
+            query = ""
+        }
         let normalizedPath = (path == "/audio.m3u8") ? "/media.m3u8" : path
 
         EngineLog.emit("[HLSLocalServer] \(firstLine)", category: .hlsServer)
@@ -701,7 +744,26 @@ final class HLSLocalServer: @unchecked Sendable {
             // arrives well within it (the first ~5 s segment at 22 Mbps
             // takes at most a few seconds to demux + remux over loopback).
             if let p = provider, p.playlistType == .live {
-                _ = p.waitForFirstLiveSegment(timeout: 30.0)
+                if let msn = Self.parseHLSMsn(query) {
+                    // LL-HLS blocking reload: AVPlayer is asking for the
+                    // playlist that contains Media Sequence Number `msn`
+                    // (the next segment past what it already has). Hold the
+                    // response until the producer finalizes that segment, so
+                    // AVPlayer receives it the instant it is cut rather than
+                    // a fixed reload-interval later. This is the structural
+                    // fix for the residual startup pause: the segment exists
+                    // on time, but the standard fixed-cadence reload made
+                    // AVPlayer discover it late and drain its buffer. The
+                    // timeout is a safety net (3 x target duration); on
+                    // timeout we serve the current playlist and AVPlayer
+                    // reissues the blocking reload.
+                    _ = p.waitForLiveSegment(index: msn, timeout: 18.0)
+                } else {
+                    // First (non-directive) load: hold until the startup
+                    // cushion exists so AVPlayer never sees an empty live
+                    // playlist (-12888).
+                    _ = p.waitForFirstLiveSegment(timeout: 30.0)
+                }
             }
             let body = buildMediaPlaylist()
             stateLock.lock()
@@ -970,6 +1032,23 @@ final class HLSLocalServer: @unchecked Sendable {
                                             subResourceBaseURL: subResourceBaseURL)
     }
 
+    /// Parse the LL-HLS `_HLS_msn` (Media Sequence Number) delivery
+    /// directive from a request query string (e.g. `_HLS_msn=42` or
+    /// `_HLS_msn=42&_HLS_part=0`). Returns nil when absent or unparseable,
+    /// which the caller treats as a plain (non-blocking) reload. `_HLS_part`
+    /// is intentionally ignored: we advertise segment-level blocking reload
+    /// only, with no partial segments.
+    static func parseHLSMsn(_ query: String) -> Int? {
+        guard !query.isEmpty else { return nil }
+        for pair in query.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1)
+            if kv.count == 2, kv[0] == "_HLS_msn", let n = Int(kv[1]), n >= 0 {
+                return n
+            }
+        }
+        return nil
+    }
+
     /// Public static playlist builders. Pure functions of the provider
     /// state, callable without a live `HLSLocalServer` instance.
     ///
@@ -1047,31 +1126,70 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         var targetDuration = Int(ceil(max(1.0, maxDuration)))
 
-        // For live playlists, apply a stable floor equal to the producer's
-        // configured cut target. Before segment 0 is finalized, maxDuration
-        // is 0 and the plain computation yields 1, giving AVPlayer only
-        // 1.5 s to receive the first segment (1.5 * TARGETDURATION per spec).
-        // High-bitrate sources (20+ Mbps, 5+ s segments, many MB) cannot be
-        // demuxed, remuxed, and published over the loopback path in that
-        // window, so AVPlayer fires CoreMediaErrorDomain -12888
-        // "Playlist File unchanged for longer than 1.5 * target duration".
-        // Using ceil(producerTarget) as the minimum makes TARGETDURATION
-        // stable and generous from the very first (empty) manifest, giving
-        // AVPlayer ~6-9 s to receive segment 0. Per HLS spec TARGETDURATION
-        // must be >= every EXTINF; since the producer cuts at targetSeconds,
-        // ceil(target) satisfies that for normal segments. If a produced
-        // segment ever exceeds it, max() keeps us compliant. VOD and EVENT
-        // paths are unchanged.
+        // For live playlists, apply a stable floor of 1.5x the producer's
+        // configured cut target. Two distinct problems share this floor:
+        //
+        // 1. Empty first manifest. Before segment 0 is finalized, maxDuration
+        //    is 0 and the plain computation yields 1, giving AVPlayer only
+        //    1.5 s to receive the first segment (1.5 * TARGETDURATION per
+        //    spec). High-bitrate sources (20+ Mbps, 5+ s segments, many MB)
+        //    cannot be demuxed, remuxed, and published over the loopback path
+        //    in that window, so AVPlayer fires CoreMediaErrorDomain -12888
+        //    "Playlist File unchanged for longer than 1.5 * target duration".
+        //
+        // 2. Transcode warm-up jitter. Even with the startup cushion, the
+        //    server's real-time transcode takes a moment to reach steady
+        //    throughput. During that warm-up the producer can stall ~8 s
+        //    cutting the next segment (the pump blocks in the persistent
+        //    reader), and AVPlayer, started one segment behind the edge,
+        //    catches the gap and trips -12888 once at startup before
+        //    recovering. The fix is patience, not a bigger cushion: a bigger
+        //    cushion would add startup latency, whereas advertising a more
+        //    generous TARGETDURATION widens the -12888 window at no startup
+        //    cost. The segments are still CUT at the producer's target, so
+        //    EXTINF stays ~targetSeconds and the playlist-reload cadence is
+        //    unaffected; only AVPlayer's unchanged-playlist patience grows.
+        //
+        // ceil(1.5 * target) = 6 for a 4 s cut gives a 9 s patience window,
+        // which clears the observed ~8 s warm-up gap with margin. Per HLS
+        // spec TARGETDURATION must be >= every EXTINF; since the producer
+        // cuts at targetSeconds, 1.5x comfortably satisfies that for normal
+        // segments, and if a produced segment ever exceeds the floor, max()
+        // keeps us compliant. VOD and EVENT paths are unchanged.
         if typeIsLive, let liveTarget = provider.liveTargetSegmentDuration {
-            let liveFloor = Int(ceil(liveTarget))
+            let liveFloor = Int(ceil(liveTarget * 1.5))
             targetDuration = max(targetDuration, liveFloor)
         }
 
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
+        if typeIsLive {
+            // LL-HLS blocking playlist reload. Advertising CAN-BLOCK-RELOAD
+            // makes AVPlayer reload with an `?_HLS_msn=N` directive instead
+            // of polling on its own fixed cadence; the server holds that
+            // reload open until segment N is cut (see the media.m3u8 handler
+            // + waitForLiveSegment), so AVPlayer receives each new segment
+            // the instant it is produced rather than a reload-interval late.
+            // This removes the residual startup pause, where freshly cut
+            // segments existed on time but AVPlayer discovered them late and
+            // drained its buffer. We advertise segment-level blocking only
+            // (no EXT-X-PART / PART-INF, since the producer does not cut
+            // partial segments), so AVPlayer sends `_HLS_msn` without
+            // `_HLS_part`. No explicit HOLD-BACK: AVPlayer uses its default
+            // (3 x TARGETDURATION) distance from the live edge.
+            lines.append("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES")
+        }
         lines.append("#EXT-X-TARGETDURATION:\(targetDuration)")
         lines.append("#EXT-X-MEDIA-SEQUENCE:\(firstVisible)")
+        if typeIsLive {
+            // RFC 8216 §6.2.2: must track discontinuity-tagged segments
+            // that slid out of the window, or AVPlayer's discontinuity
+            // numbering shifts one window-length after every program
+            // boundary. Emitted unconditionally for live (0 is the spec
+            // default and harmless).
+            lines.append("#EXT-X-DISCONTINUITY-SEQUENCE:\(snapshot.discontinuitySequence)")
+        }
         if typeIsLive {
             // No #EXT-X-PLAYLIST-TYPE and no #EXT-X-ENDLIST: the sliding
             // window grows at the live edge and drops segments below

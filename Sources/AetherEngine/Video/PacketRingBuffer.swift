@@ -51,6 +51,15 @@ final class PacketRingBuffer {
     /// non-decreasing from the demux loop).
     private var entries: [Entry] = []
 
+    /// Sequence number of `entries[0]`. Every appended packet gets a
+    /// stable, monotonically increasing sequence number (`firstSeq + i`
+    /// for `entries[i]`); eviction advances `firstSeq` instead of
+    /// renumbering. The live feeder consumes the ring through these
+    /// numbers (`packet(atSeq:)`), so its cursor survives eviction
+    /// races: a cursor below `firstSeq` simply means "fell out of the
+    /// window".
+    private var firstSeq: Int = 0
+
     /// Monotonic counter used to produce unique file names.
     private var counter: Int = 0
 
@@ -81,6 +90,7 @@ final class PacketRingBuffer {
         entries.removeAll(keepingCapacity: false)
         edge = -.infinity
         counter = 0
+        firstSeq = 0
         lock.unlock()
 
         for url in toDelete {
@@ -110,12 +120,16 @@ final class PacketRingBuffer {
         let entry = Entry(pts: pts, isKeyframe: isKeyframe, isVideo: isVideo, fileURL: fileURL, byteCount: bytes.count)
 
         lock.lock()
-        defer {
-            evict()
-            lock.unlock()
-        }
         entries.append(entry)
         if pts > edge { edge = pts }
+        let evictedURLs = evictLocked()
+        lock.unlock()
+
+        // File deletion off-lock: removeItem is filesystem I/O and was
+        // previously holding the lock against the feeder/seek readers.
+        for url in evictedURLs {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     // MARK: - Reader
@@ -142,6 +156,47 @@ final class PacketRingBuffer {
             let data = try Data(contentsOf: entry.fileURL, options: [.alwaysMapped, .uncached])
             return Packet(pts: entry.pts, isKeyframe: entry.isKeyframe, isVideo: entry.isVideo, bytes: data)
         }
+    }
+
+    // MARK: - Sequential consumption (live feeder)
+
+    /// `(first, end)` sequence bounds of the currently retained span:
+    /// `first` is the oldest retained packet's sequence number, `end`
+    /// the next number a future append will get. Empty ring: first == end.
+    var seqBounds: (first: Int, end: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (firstSeq, firstSeq + entries.count)
+    }
+
+    /// The packet with sequence number `seq`, or nil when it has been
+    /// evicted (`seq < seqBounds.first`) or not yet appended
+    /// (`seq >= seqBounds.end`). Bytes are rehydrated from disk
+    /// (kernel-paged mmap); the index lock is NOT held across the read.
+    func packet(atSeq seq: Int) -> Packet? {
+        lock.lock()
+        let idx = seq - firstSeq
+        guard idx >= 0, idx < entries.count else {
+            lock.unlock()
+            return nil
+        }
+        let entry = entries[idx]
+        lock.unlock()
+        guard let data = try? Data(contentsOf: entry.fileURL,
+                                   options: [.alwaysMapped, .uncached]) else { return nil }
+        return Packet(pts: entry.pts, isKeyframe: entry.isKeyframe,
+                      isVideo: entry.isVideo, bytes: data)
+    }
+
+    /// Sequence number of the newest video keyframe with pts <= target,
+    /// or nil when no such keyframe is retained. Used by the DVR seek to
+    /// move the feeder cursor onto a decodable access point.
+    func seq(forKeyframeAtOrBefore target: Double) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.indices
+            .last(where: { entries[$0].isKeyframe && entries[$0].pts <= target })
+            .map { firstSeq + $0 }
     }
 
     // MARK: - Diagnostics
@@ -183,25 +238,33 @@ final class PacketRingBuffer {
     /// This guarantees `oldestPts` is always a keyframe pts that is <=
     /// cutoff (when the buffer is large enough), so a decoder starting
     /// from `oldestPts` always begins at a clean access point.
-    private func evict() {
+    /// Returns the file URLs of evicted entries; the CALLER deletes them
+    /// after releasing the lock.
+    ///
+    /// Forward scan from the front instead of `last(where:)` over the
+    /// whole index: the previous backward scan walked from the newest
+    /// entry down to the pivot near the front on EVERY append, i.e.
+    /// nearly the entire index (a 1800 s window at ~80 pkts/s is ~150 k
+    /// entries, scanned 80x per second on the demux thread). The
+    /// evictable prefix is bounded by one GOP past the cutoff, so the
+    /// forward scan touches a few hundred entries at most.
+    private func evictLocked() -> [URL] {
         let cutoff = edge - windowSeconds
-        // Find the newest keyframe at or before cutoff.
-        guard let pivotIndex = entries.indices.last(where: {
-            entries[$0].isKeyframe && entries[$0].pts <= cutoff
-        }) else {
-            // No evictable keyframe anchor found; retain everything.
-            return
+        // Walk the prefix of entries at or before the cutoff, remembering
+        // the newest keyframe in it. (PTS within the prefix is only
+        // loosely ordered across streams / B-frames, but the prefix scan
+        // evicts strictly contiguous leading entries, which is exactly
+        // the keyframe-aligned guarantee the reseed relies on.)
+        var pivot: Int? = nil
+        var i = 0
+        while i < entries.count, entries[i].pts <= cutoff {
+            if entries[i].isKeyframe { pivot = i }
+            i += 1
         }
-        // Drop everything strictly before the pivot keyframe.
-        let toRemove = entries[..<pivotIndex]
-        let urls = toRemove.map(\.fileURL)
-        entries.removeSubrange(..<pivotIndex)
-
-        // Delete the evicted files outside the hot path (best-effort;
-        // still inside the lock to keep accounting consistent, but the
-        // files are small and the delete is fast).
-        for url in urls {
-            try? FileManager.default.removeItem(at: url)
-        }
+        guard let p = pivot, p > 0 else { return [] }
+        let urls = entries[..<p].map(\.fileURL)
+        entries.removeSubrange(..<p)
+        firstSeq += p
+        return urls
     }
 }

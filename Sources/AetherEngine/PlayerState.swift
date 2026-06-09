@@ -195,6 +195,17 @@ public struct LoadOptions: Sendable, Equatable {
     /// `isLive == false`. Default nil.
     public var dvrWindowSeconds: Double?
 
+    /// Play the URL as a native AVPlayer HLS stream directly: build an
+    /// `AVPlayerItem` from the (remote) URL and hand it to the native
+    /// `AVPlayer`, skipping the demuxer probe, the display-criteria
+    /// handshake, and the entire HLS segment-producer / muxer / loopback
+    /// stack. Use this for a live source the upstream server already
+    /// exposes as HLS (e.g. Jellyfin live `master.m3u8`): AVPlayer manages
+    /// the live edge, buffering, and reconnect natively. Same lean-bypass
+    /// shape as `audioOnly`, but for native HLS video. Pair with
+    /// `isLive: true` for the live UI surfaces. Default `false`.
+    public var nativeRemoteHLS: Bool
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -205,7 +216,8 @@ public struct LoadOptions: Sendable, Equatable {
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
         audioOnly: Bool = false,
-        dvrWindowSeconds: Double? = nil
+        dvrWindowSeconds: Double? = nil,
+        nativeRemoteHLS: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -217,6 +229,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.isLive = isLive
         self.audioOnly = audioOnly
         self.dvrWindowSeconds = dvrWindowSeconds
+        self.nativeRemoteHLS = nativeRemoteHLS
     }
 }
 
