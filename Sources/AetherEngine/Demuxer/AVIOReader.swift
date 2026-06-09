@@ -1361,7 +1361,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         applyExtraHeaders(&request)
 
         do {
-            let (_, response) = try syncRequest(request)
+            // HEAD has no body; the announced Content-Length is the FULL file size and must
+            // never drive allocation (it crashed exactly there — see ChunkFetchDelegate cap).
+            let (_, response) = try syncRequest(request, maxBodyBytes: 1 << 20)
             guard let http = response as? HTTPURLResponse,
                   (200...299).contains(http.statusCode) else {
                 #if DEBUG
@@ -1418,7 +1420,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var lastError: Error?
         for attempt in 0..<Self.maxRetries {
             do {
-                let (data, response) = try syncRequest(request)
+                let (data, response) = try syncRequest(request, maxBodyBytes: size)
                 if let http = response as? HTTPURLResponse {
                     let status = http.statusCode
                     if status != 200 && status != 206 {
@@ -1432,6 +1434,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 return data
             } catch {
                 lastError = error
+                // A server that ignores Range (full-file 200) won't change its mind on a
+                // retry — bail so fetchChunk's source-URL fallback (or a clean read error)
+                // runs instead of burning the backoff.
+                if case AVIOReaderError.oversizeResponse = error { break }
                 if attempt < Self.maxRetries - 1 {
                     Thread.sleep(forTimeInterval: Double(1 << attempt) * 0.5)
                 }
@@ -1465,14 +1471,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return URLSession(configuration: config, delegate: nil, delegateQueue: nil)
     }()
 
-    private func syncRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
+    private func syncRequest(_ request: URLRequest, maxBodyBytes: Int) throws -> (Data, URLResponse) {
         // Delegate-based incremental fetch on a shared long-lived
         // session. See `chunkSession` for the why; the rest of this
         // function is just lifecycle: build a fresh delegate, attach
         // it to a fresh task on the shared session, wait on a
         // semaphore for completion, hand back our heap-allocated
         // body Data.
-        let delegate = ChunkFetchDelegate(extraHeaders: extraHeaders)
+        let delegate = ChunkFetchDelegate(extraHeaders: extraHeaders, maxBodyBytes: maxBodyBytes)
         let task = Self.chunkSession.dataTask(with: request)
         task.delegate = delegate
 
@@ -1588,14 +1594,23 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
 /// `onCompletion` fires + the semaphore signals.
 private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     let extraHeaders: [String: String]
+    /// Hard ceiling on the buffered body. A server that ignores `Range` and answers a ~4 MiB
+    /// chunk request with the whole multi-GB file — or a HEAD response, whose Content-Length
+    /// describes the full file with no body following — must NEVER drive allocation:
+    /// `reserveCapacity(expectedContentLength)` on tens of GB is an instant allocation-failure
+    /// trap (EXC_BREAKPOINT), and buffering would march to jetsam anyway. Reserve is clamped to
+    /// this cap and any bytes beyond it cancel the task with `.oversizeResponse`, so the fetch
+    /// fails cleanly and the caller's retry/fallback path runs.
+    let maxBodyBytes: Int
     var body = Data()
     var response: URLResponse?
     var error: Error?
     var onCompletion: (() -> Void)?
     var onResolved: ((URL) -> Void)?
 
-    init(extraHeaders: [String: String]) {
+    init(extraHeaders: [String: String], maxBodyBytes: Int) {
         self.extraHeaders = extraHeaders
+        self.maxBodyBytes = maxBodyBytes
     }
 
     /// Preserve the `Range` header + caller-supplied extra headers on
@@ -1630,9 +1645,11 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         self.response = response
         // Pre-reserve buffer space when Content-Length is known so
         // body.append doesn't repeatedly realloc as chunks stream in.
+        // CLAMPED to maxBodyBytes — see the property doc; the announced
+        // length is untrusted input (full-file 200s, HEAD responses).
         if let http = response as? HTTPURLResponse {
             let len = Int(http.expectedContentLength)
-            if len > 0 { body.reserveCapacity(len) }
+            if len > 0 { body.reserveCapacity(min(len, maxBodyBytes)) }
             // Surface the post-redirect URL so the reader can cache
             // it for subsequent range fetches. Only on success: a 4xx
             // redirect target shouldn't poison the cache.
@@ -1650,14 +1667,24 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         dataTask: URLSessionDataTask,
         didReceive data: Data
     ) {
+        let count = data.count
+        let baseCount = body.count
+        // Cap enforcement (belt-and-braces for chunked/no-length responses too): a response
+        // streaming past the requested range is a misbehaving server — cancel instead of
+        // buffering toward jetsam. The cancel's NSURLErrorCancelled must not mask this error.
+        guard baseCount + count <= maxBodyBytes else {
+            if error == nil {
+                error = AVIOReaderError.oversizeResponse(limit: maxBodyBytes)
+            }
+            dataTask.cancel()
+            return
+        }
         // Explicit force-copy: append a fresh contiguous range to our
         // heap-backed `body` and memcpy the source bytes in. Foundation's
         // own `body.append(data)` may keep a reference to the source
         // dispatch_data via copy-on-write semantics, defeating the
         // whole point. Manual memcpy through withUnsafeMutableBytes
         // guarantees the source can be dropped once this method returns.
-        let count = data.count
-        let baseCount = body.count
         body.count = baseCount + count
         body.withUnsafeMutableBytes { dst in
             data.withUnsafeBytes { src in
@@ -1673,7 +1700,8 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
-        self.error = error
+        // Keep a deliberate oversize error — the cancellation it triggers must not overwrite it.
+        if self.error == nil { self.error = error }
         onCompletion?()
     }
 }
@@ -1831,6 +1859,9 @@ enum AVIOReaderError: Error, CustomStringConvertible {
     case httpError(code: Int)
     case noResponse
     case requestTimeout
+    /// The response streamed past the requested range size (server ignored `Range`,
+    /// or a HEAD-style full-length body) — cancelled instead of buffering unbounded.
+    case oversizeResponse(limit: Int)
 
     var description: String {
         switch self {
@@ -1838,6 +1869,7 @@ enum AVIOReaderError: Error, CustomStringConvertible {
         case .httpError(let code): return "HTTP error \(code)"
         case .noResponse: return "No response from server"
         case .requestTimeout: return "Request timed out"
+        case .oversizeResponse(let limit): return "Response exceeded requested range (limit \(limit) B)"
         }
     }
 }
