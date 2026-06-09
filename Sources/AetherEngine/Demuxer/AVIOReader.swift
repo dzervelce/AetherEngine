@@ -73,6 +73,35 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private let resolvedURLLock = NSLock()
     private var _resolvedURL: URL?
 
+    /// Process-wide resolved-URL memo keyed by the ORIGINAL source URL. The proxy
+    /// → CDN redirect (a debrid resolve endpoint) can be slow or flaky, and every
+    /// NEW reader over the same source — frame-extractor, subtitle side-demuxer,
+    /// probes after a reload — otherwise re-pays it on its first request. Each
+    /// reader seeds its instance cache from here at init; expiry invalidation
+    /// clears both. Bounded: cleared wholesale past a handful of entries (a
+    /// session touches 1-2 sources).
+    private static let sharedResolvedLock = NSLock()
+    nonisolated(unsafe) private static var sharedResolvedURLs: [URL: URL] = [:]
+
+    private static func sharedResolvedURL(for source: URL) -> URL? {
+        sharedResolvedLock.lock()
+        defer { sharedResolvedLock.unlock() }
+        return sharedResolvedURLs[source]
+    }
+
+    private static func recordSharedResolvedURL(_ resolved: URL, for source: URL) {
+        sharedResolvedLock.lock()
+        defer { sharedResolvedLock.unlock() }
+        if sharedResolvedURLs.count > 8 { sharedResolvedURLs.removeAll(keepingCapacity: true) }
+        sharedResolvedURLs[source] = resolved
+    }
+
+    private static func invalidateSharedResolvedURL(for source: URL) {
+        sharedResolvedLock.lock()
+        defer { sharedResolvedLock.unlock() }
+        sharedResolvedURLs[source] = nil
+    }
+
     /// URL to use for the next request: the cached resolved CDN URL
     /// when available, otherwise the caller-provided source URL.
     private func requestURL() -> URL {
@@ -102,6 +131,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { resolvedURLLock.unlock() }
         if resolved != url && resolved != _resolvedURL {
             _resolvedURL = resolved
+            Self.recordSharedResolvedURL(resolved, for: url)
             #if DEBUG
             EngineLog.emit("[AVIOReader] Cached resolved URL host=\(resolved.host ?? "?")", category: .demux)
             #endif
@@ -116,6 +146,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { resolvedURLLock.unlock() }
         if _resolvedURL != nil {
             _resolvedURL = nil
+            Self.invalidateSharedResolvedURL(for: url)
             #if DEBUG
             EngineLog.emit("[AVIOReader] Dropped resolved URL cache (expiry status)", category: .demux)
             #endif
@@ -430,6 +461,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.chunkSize = chunkSize
         self.prefetchEnabled = prefetchEnabled
         self.isLive = isLive
+        // Skip the proxy → CDN redirect on the FIRST request too when another
+        // reader for this source already resolved it (frame-extractor, subtitle
+        // side-demuxer, post-reload probes). Expiry fallback still works: an
+        // expiry status drops both caches and retries against the source URL.
+        _resolvedURL = Self.sharedResolvedURL(for: url)
     }
 
     /// Apply the caller-supplied extra headers to a request. Used by
@@ -1324,6 +1360,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             #endif
             return size
         }
+        // The probe goes through the cached resolved CDN URL when one exists
+        // (skips the slow/flaky proxy redirect — the frame-extractor's whole
+        // open used to stall on it). If THAT failed, the cached URL may have
+        // expired: drop it and probe once more via the source URL so the
+        // proxy can re-issue a fresh signed redirect.
+        if cachedResolvedURL() != nil {
+            invalidateResolvedURL()
+            if let size = rangeProbeFileSize(), size > 0 {
+                #if DEBUG
+                EngineLog.emit("[AVIOReader] File size: \(size) bytes (Range probe, source-URL retry)", category: .demux)
+                #endif
+                return size
+            }
+        }
         return headProbeFileSize()
     }
 
@@ -1334,7 +1384,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Nil on cancellation, timeout, network error, or unparseable
     /// Content-Range.
     private func rangeProbeFileSize() -> Int64? {
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: requestURL())
         request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
         request.timeoutInterval = 20
         applyExtraHeaders(&request)

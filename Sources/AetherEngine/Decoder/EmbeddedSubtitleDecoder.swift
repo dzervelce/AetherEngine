@@ -252,6 +252,15 @@ final class EmbeddedSubtitleDecoder {
         nextCueID = 0
     }
 
+    /// In-place re-seek reset: drop FFmpeg decoder state on top of the
+    /// dedupe reset (bitmap codecs' composition state machines span
+    /// packets — stale state would corrupt the first post-seek cue).
+    /// Used by the side-demuxer reader when a scrub re-aims it.
+    func flush() {
+        if let ctx = codecContext { avcodec_flush_buffers(ctx) }
+        resetState()
+    }
+
     // MARK: - Codec checks
 
     static func isBitmapCodec(_ id: AVCodecID) -> Bool {

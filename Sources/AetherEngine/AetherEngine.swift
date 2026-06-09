@@ -472,8 +472,16 @@ public final class AetherEngine: ObservableObject {
     /// subtitle activation happens mid-playback, so its subtitle
     /// packets near the visible time have already been read and
     /// discarded). Cancelled + restarted on track change, on
-    /// `clearSubtitle`, on `seek`, and on `stop`.
+    /// `clearSubtitle`, and on `stop`. On `seek` the LIVE reader is
+    /// re-seeked in place via `embeddedSubSeek` — a full restart
+    /// reopened a fresh network demuxer (probe + cue-index prewarm)
+    /// per scrub, which is why cues took seconds to reappear.
     private var embeddedSubtitleTask: Task<Void, Never>?
+
+    /// Cross-thread seek mailbox for the live side-demuxer reader (the
+    /// loop runs detached; `seek` runs on the main actor). Holds only
+    /// the LATEST target — rapid scrubs coalesce.
+    private let embeddedSubSeek = SeekRequestBox()
 
     /// Active embedded subtitle stream index, or -1 for none. Used by
     /// `seek` to know whether to re-arm the side demuxer at the new
@@ -976,6 +984,18 @@ public final class AetherEngine: ObservableObject {
             probedAudioTracks = probe.audioTrackInfos()
             probedSubtitleTracks = probe.subtitleTrackInfos()
             probedDefaultAudioIndex = probe.audioStreamIndex
+            // Host language preference: pick the best-quality matching track AT LOAD
+            // (a post-load selectAudioTrack would cost a full multi-second reload).
+            // An explicit audioSourceStreamIndex override still wins downstream.
+            if !options.preferredAudioLanguages.isEmpty,
+               let preferred = Self.preferredAudioTrack(
+                   in: probedAudioTracks, languages: options.preferredAudioLanguages
+               ) {
+                if preferred != Int(probedDefaultAudioIndex) {
+                    EngineLog.emit("[AetherEngine] preferred-language audio pick: stream \(preferred) (container default \(probedDefaultAudioIndex))", category: .engine)
+                }
+                probedDefaultAudioIndex = Int32(preferred)
+            }
             // probe.close() deferred: ownership transfers to `loadNative`
             // (native dispatch) or `loadSoftware` (software dispatch). Both
             // adopt the probe demuxer for reuse, or open fresh only if the
@@ -2135,23 +2155,29 @@ public final class AetherEngine: ObservableObject {
         currentTime = target
         sourceTime = target
 
-        // Re-arm the side subtitle demuxer at the new playhead so cues
+        // Re-aim the side subtitle demuxer at the new playhead so cues
         // for the post-scrub content surface immediately. Skip when
         // sidecar SRT is active (it pre-decoded the whole file).
         if activeEmbeddedSubtitleStreamIndex >= 0, let url = loadedURL {
-            let streamIdx = activeEmbeddedSubtitleStreamIndex
-            embeddedSubtitleTask?.cancel()
-            embeddedSubtitleTask = nil
             subtitleCues = []
-            // Side-demuxer seeks in source PTS, which is the seek target.
-            // For custom sources, request a fresh clone; skip re-arm if the
-            // reader cannot produce one (forward-only source mid-seek).
-            if isCustomSource {
-                if let clone = customReader?.makeIndependentReader() {
-                    startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: target)
-                }
+            if embeddedSubtitleTask != nil {
+                // Live reader: re-seek IN PLACE. Restarting opened a brand-new
+                // network demuxer (open + cue-index prewarm + seek) on every
+                // scrub — seconds before cues reappeared.
+                embeddedSubSeek.request(target)
             } else {
-                startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: target)
+                // No live reader (died / never started): full restart.
+                // Side-demuxer seeks in source PTS, which is the seek target.
+                // For custom sources, request a fresh clone; skip re-arm if the
+                // reader cannot produce one (forward-only source mid-seek).
+                let streamIdx = activeEmbeddedSubtitleStreamIndex
+                if isCustomSource {
+                    if let clone = customReader?.makeIndependentReader() {
+                        startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: target)
+                    }
+                } else {
+                    startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: target)
+                }
             }
         }
 
@@ -2553,6 +2579,7 @@ public final class AetherEngine: ObservableObject {
     /// start position, and the source video dimensions. The Task's
     /// run loop is cancellable; `cancel()` triggers a clean exit.
     private func startEmbeddedSubtitleTask(url: URL, reader: IOReader?, formatHint: String?, streamIndex: Int32, startAt: Double) {
+        _ = embeddedSubSeek.take() // a fresh reader starts at `startAt`; drop any stale scrub request
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
         let headers = loadedOptions.httpHeaders
@@ -2675,8 +2702,18 @@ public final class AetherEngine: ObservableObject {
         let readAheadCapSeconds = 60.0
         var tbCache: [Int32: Double] = [:]
         var playheadSnapshot = startAt
+        let seekBox = embeddedSubSeek
 
         while !Task.isCancelled {
+            // A scrub re-aims the live reader in place: seek the EXISTING demuxer
+            // (cue index already loaded — no network reopen), flush decoder state,
+            // and continue. Only the latest request matters.
+            if let retarget = seekBox.take() {
+                demuxer.seek(to: max(0, retarget - 2.0))
+                decoder.flush()
+                playheadSnapshot = retarget
+                continue
+            }
             guard let pkt = try? demuxer.readPacket() else {
                 break
             }
@@ -2687,7 +2724,8 @@ public final class AetherEngine: ObservableObject {
             // the playhead. `sourceTime` is the unified source-PTS clock the start seek
             // used, so packet PTS (source PTS) compares directly. Refresh the playhead
             // via a MainActor hop only while actually gated (~5x/s), so steady reading
-            // pays nothing.
+            // pays nothing. A pending scrub re-aim exits the gate (and drops the
+            // not-yet-relevant packet) so the seek is honored promptly.
             let pktTb: Double = tbCache[streamIdx] ?? {
                 let tb = demuxer.stream(at: streamIdx)?.pointee.time_base
                 let v = (tb != nil && tb!.den != 0) ? Double(tb!.num) / Double(tb!.den) : 0
@@ -2697,7 +2735,7 @@ public final class AetherEngine: ObservableObject {
             let pts = pkt.pointee.pts
             if pktTb > 0, pts != Int64.min {
                 let pktSeconds = Double(pts) * pktTb
-                while !Task.isCancelled, pktSeconds - playheadSnapshot > readAheadCapSeconds {
+                while !Task.isCancelled, !seekBox.hasRequest, pktSeconds - playheadSnapshot > readAheadCapSeconds {
                     try? await Task.sleep(nanoseconds: 200_000_000)
                     if let live = await MainActor.run(body: { [weak self] in self?.sourceTime }) {
                         playheadSnapshot = live
@@ -2705,6 +2743,11 @@ public final class AetherEngine: ObservableObject {
                         break // engine gone
                     }
                 }
+            }
+            if seekBox.hasRequest {
+                var p: UnsafeMutablePointer<AVPacket>? = pkt
+                trackedPacketFree(&p)
+                continue // loop top performs the seek
             }
 
             if streamIdx != streamIndex {
@@ -2921,6 +2964,38 @@ public final class AetherEngine: ObservableObject {
     /// requested it OR the probe found no video stream.
     nonisolated static func shouldUseAudioOnlyPath(audioOnlyRequested: Bool, hasVideoStream: Bool) -> Bool {
         audioOnlyRequested || !hasVideoStream
+    }
+
+    /// Best audio track among those matching a preferred language (prefix match
+    /// in either direction, so "en" matches "eng"/"en-US" and vice versa).
+    /// Quality order: lossless (TrueHD/MLP/FLAC) > DTS (covers DTS-HD profiles)
+    /// > EAC3 > AC3 > Opus > AAC; an Atmos flag and channel count break ties
+    /// WITHIN a codec rank, so lossless always beats lossy Atmos. Returns the
+    /// source stream index, or nil when no track matches (container default
+    /// then stands). Pure + `nonisolated` for unit-testability.
+    nonisolated static func preferredAudioTrack(in tracks: [TrackInfo], languages: [String]) -> Int? {
+        let prefs = languages.map { $0.lowercased() }.filter { !$0.isEmpty }
+        guard !prefs.isEmpty else { return nil }
+        func matches(_ t: TrackInfo) -> Bool {
+            guard let lang = t.language?.lowercased(), !lang.isEmpty else { return false }
+            return prefs.contains { lang.hasPrefix($0) || $0.hasPrefix(lang) }
+        }
+        func codecRank(_ codec: String) -> Int {
+            switch codec.lowercased() {
+            case "truehd", "mlp": return 9
+            case "flac": return 8
+            case "dts": return 7
+            case "eac3": return 6
+            case "ac3": return 5
+            case "opus": return 4
+            case "aac": return 3
+            default: return 1
+            }
+        }
+        func score(_ t: TrackInfo) -> Int {
+            codecRank(t.codec) * 10_000 + (t.isAtmos ? 1_000 : 0) + t.channels
+        }
+        return tracks.filter(matches).max { score($0) < score($1) }?.id
     }
 
     /// Whether AVPlayer/AVFoundation can natively decode this audio codec

@@ -206,6 +206,16 @@ public struct LoadOptions: Sendable, Equatable {
     /// `isLive: true` for the live UI surfaces. Default `false`.
     public var nativeRemoteHLS: Bool
 
+    /// Preferred audio languages (BCP-47 prefixes, e.g. `["en"]` matches
+    /// "en" / "eng" / "en-US"), in priority order. When non-empty and the
+    /// source has a matching audio track, the INITIAL track pick becomes
+    /// the best-quality match (lossless > DTS > EAC3 > AC3 > AAC; Atmos
+    /// and channel count break ties) instead of the container default —
+    /// no post-load track-switch reload needed. No match → container
+    /// default stands. An explicit `audioSourceStreamIndex` on `load`
+    /// always wins. Default empty (container default).
+    public var preferredAudioLanguages: [String]
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -217,7 +227,8 @@ public struct LoadOptions: Sendable, Equatable {
         isLive: Bool = false,
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
-        nativeRemoteHLS: Bool = false
+        nativeRemoteHLS: Bool = false,
+        preferredAudioLanguages: [String] = []
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -230,6 +241,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.audioOnly = audioOnly
         self.dvrWindowSeconds = dvrWindowSeconds
         self.nativeRemoteHLS = nativeRemoteHLS
+        self.preferredAudioLanguages = preferredAudioLanguages
     }
 }
 
