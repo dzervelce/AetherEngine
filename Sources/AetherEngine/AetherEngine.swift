@@ -1221,6 +1221,12 @@ public final class AetherEngine: ObservableObject {
         }
         EngineLog.emit("[AetherEngine] dispatch: codec=\(detectedCodecID.rawValue) → \(useSoftwarePath ? "software" : "native")", category: .engine)
 
+        // The probe-level pick (host override > preferred language > container default) must
+        // drive the ACTUAL pipeline selection too: passing only the raw host override (nil on
+        // normal plays) let the pipeline fall back to its own container-default cascade — the
+        // UI then showed the preferred track while the default language kept playing.
+        let pipelineAudioIndex: Int32? = resolvedInitialAudio >= 0 ? resolvedInitialAudio : nil
+
         do {
             if useSoftwarePath {
                 // SW path now REUSES the probe demuxer (single open). Do not
@@ -1240,7 +1246,7 @@ public final class AetherEngine: ObservableObject {
                     url: url,
                     sourceHTTPHeaders: options.httpHeaders,
                     startPosition: startPosition,
-                    audioSourceStreamIndex: audioSourceStreamIndex,
+                    audioSourceStreamIndex: pipelineAudioIndex,
                     isLive: options.isLive,
                     dvrWindowSeconds: options.dvrWindowSeconds,
                     preopenedDemuxer: probeOpened ? probe : nil
@@ -1272,7 +1278,7 @@ public final class AetherEngine: ObservableObject {
                     url: url,
                     sourceHTTPHeaders: options.httpHeaders,
                     startPosition: startPosition,
-                    audioSourceStreamIndex: audioSourceStreamIndex,
+                    audioSourceStreamIndex: pipelineAudioIndex,
                     keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,
                     matchContentEnabled: options.matchContentEnabled,
                     panelIsInHDRMode: panelHDRAfterHandshake,
