@@ -2706,6 +2706,14 @@ public final class AetherEngine: ObservableObject {
         // it advances. The reader re-seeks on `engine.seek`, so pausing here never
         // strands cues after a scrub. Stream time bases are cached per stream_index.
         let readAheadCapSeconds = 60.0
+        // BEHIND guard: a reader whose position falls this far behind the live playhead
+        // (started before a resume position was live, or the playhead moved without an
+        // engine.seek) re-aims forward instead of RACING through the gap — catching up
+        // sequentially pulls the whole gap (gigabytes on a remux) through this side
+        // demuxer's AVIO (debug103: cues from t=230 s while playing t=4353 s → memory
+        // warnings → jetsam).
+        let behindResyncSeconds = 180.0
+        var behindCheckCountdown = 0   // 0 → check on the FIRST packet (catches a wrong start at once)
         var tbCache: [Int32: Double] = [:]
         var playheadSnapshot = startAt
         let seekBox = embeddedSubSeek
@@ -2747,6 +2755,26 @@ public final class AetherEngine: ObservableObject {
                         playheadSnapshot = live
                     } else {
                         break // engine gone
+                    }
+                }
+                // Far-behind resync (cadenced playhead refresh — a behind reader never enters
+                // the ahead-gate above, so its snapshot would otherwise stay stale forever).
+                behindCheckCountdown -= 1
+                if behindCheckCountdown <= 0 {
+                    behindCheckCountdown = 128
+                    if let live = await MainActor.run(body: { [weak self] in self?.sourceTime }) {
+                        playheadSnapshot = live
+                    }
+                    if playheadSnapshot - pktSeconds > behindResyncSeconds {
+                        EngineLog.emit(
+                            "[AetherEngine] subtitle reader \(Int(playheadSnapshot - pktSeconds))s behind playhead — re-aiming",
+                            category: .engine
+                        )
+                        var p: UnsafeMutablePointer<AVPacket>? = pkt
+                        trackedPacketFree(&p)
+                        demuxer.seek(to: max(0, playheadSnapshot - 2.0))
+                        decoder.flush()
+                        continue
                     }
                 }
             }
