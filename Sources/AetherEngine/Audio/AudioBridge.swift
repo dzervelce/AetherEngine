@@ -505,16 +505,34 @@ final class AudioBridge: @unchecked Sendable {
         )
     }
 
-    /// Mark a fragment boundary. Drains the FIFO (drops the partial
-    /// frame's worth of samples that was buffered for the next
-    /// encoder packet, max ~96 ms at 48 kHz), and rebases the
-    /// encoder PTS off the next decoded source frame's pts. Caller
-    /// (VideoSegmentProvider) invokes this before feeding audio
-    /// packets for each fragment so audio and video timestamps stay
-    /// aligned across the muxer's fragment boundaries.
+    /// Mark a PRODUCER RESTART boundary (sole call site:
+    /// HLSVideoEngine.restartProducer / the initial resume relocation,
+    /// after the demuxer re-seek). Drains the FIFO (drops the partial
+    /// frame's worth of samples buffered for the next encoder packet,
+    /// max ~96 ms at 48 kHz), flushes the decoder + resampler state
+    /// from the previous position, and rebases the encoder PTS off the
+    /// next decoded source frame's pts so the new producer's audio
+    /// aligns with the freshly-seeked video.
     func startSegment() {
         if let f = fifo {
             av_audio_fifo_reset(f)
+        }
+        // Decoder predictors carried across the seek made the first
+        // post-restart TrueHD frame log "Lossless check failed"
+        // (debug105/106 — every restart except position-coincident
+        // ones); the SWR delay buffer likewise bleeds a few samples of
+        // previous-position audio into the new segment. The FLAC
+        // ENCODER is deliberately NOT touched: it has no
+        // AV_CODEC_CAP_DELAY (no queued output to drain) and no
+        // AV_CODEC_CAP_ENCODER_FLUSH (avcodec_flush_buffers on it is
+        // undefined; a NULL drain frame would poison it with EOF for
+        // the rest of the session).
+        if let dec = decoderCtx {
+            avcodec_flush_buffers(dec)
+        }
+        if swrCtx != nil {
+            // Re-init with unchanged parameters = drop the delay buffer.
+            swr_init(swrCtx)
         }
         rebaseFromNextSourcePTS = true
     }

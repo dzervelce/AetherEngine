@@ -1075,7 +1075,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         // 6b. Attempt the cascade. The bridge instance, if needed, is
         //     constructed up-front so it survives across restarts.
-        let prod: HLSSegmentProducer
+        var prod: HLSSegmentProducer
         prod = try buildProducerWithAudioCascade(
             preferBridge: bridgePreferred,
             streamCopyAudio: streamCopyAudio,
@@ -1083,16 +1083,34 @@ public final class HLSVideoEngine: @unchecked Sendable {
             sourceAudioStream: audioStreamIndex >= 0 ? dem.stream(at: audioStreamIndex) : nil,
             audioHLSCodecs: &audioHLSCodecs
         )
+
+        // 6c. Mid-title resume: relocate the producer to the resume point
+        //     (minus AVPlayer's backward pre-roll lead-in) BEFORE the pump
+        //     ever runs. The cascade builds at baseIndex 0; starting there
+        //     pays a wasted spin-up at the head plus a reactive restart
+        //     when AVPlayer fetches the resume segment (debug106: 23.7 s
+        //     to first frame on a resume to seg36). The replacement
+        //     producer reuses the cascade's resolved audio path
+        //     (savedAudioConfig / audioBridge); the discarded instance
+        //     never started, so nothing was allocated beyond the object
+        //     (muxers alloc lazily in the pump).
+        let initialIndex = isLiveSession
+            ? 0
+            : Self.segmentIndex(forSeconds: initialPositionSeconds, plan: plan)
+        let initialBase = isLiveSession
+            ? 0
+            : max(0, initialIndex - VideoSegmentProvider.restartBackwardLeadIn)
+        if initialBase > 0 {
+            let videoTb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+            let absoluteSeconds = Double(plan[initialBase].startPts) * Double(videoTb.num) / Double(videoTb.den)
+            dem.seek(to: absoluteSeconds)
+            audioBridge?.startSegment()
+            prod = try makeProducer(baseIndex: initialBase)
+        }
         self.producer = prod
 
         // 7. Wire the provider, the server, and serve the URL.
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs
-        // Convert resume position (if any) to a segment index so the
-        // provider's sliding-window playlist starts with the resume
-        // segment already visible.
-        let initialIndex = isLiveSession
-            ? 0
-            : Self.segmentIndex(forSeconds: initialPositionSeconds, plan: plan)
         // Live: no precomputed plan, no restart machinery (the feed is
         // forward-only and the live playlist grows as the producer cuts
         // segments). VOD keeps the restart handler so
@@ -1118,6 +1136,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         )
         self.provider = prov
+        // Seed the provider's restart bookkeeping with the relocated
+        // initial base so resume-window fetches classify as
+        // producer-will-reach (wait) instead of distant cold-start
+        // (restart).
+        prov.noteInitialProducerBase(initialBase)
         // Live producer appends each finalized segment to the provider's
         // growing list so the live playlist exposes it on the next poll.
         if isLiveSession {
@@ -3116,6 +3139,14 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// `restartProducer(at:)` path.
     private var lastRestartIndex: Int = 0
 
+    /// Seed the restart bookkeeping with the INITIAL producer's base index
+    /// (the resume relocation in HLSVideoEngine.start). Without this the
+    /// provider assumes the producer launched at 0 and the fetch decision
+    /// tree mis-classifies resume-window fetches as distant cold-start.
+    fileprivate func noteInitialProducerBase(_ base: Int) {
+        lastRestartIndex = base
+    }
+
     /// Forward-distance threshold beyond which a fetch triggers a
     /// restart instead of waiting for the producer to catch up.
     /// 8 is the value that survives both failure modes:
@@ -3153,7 +3184,7 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
     /// larger value covers a deeper handover but adds seek latency (the producer
     /// fills the lead-in before reaching the target). Device-tune: lower if seeks
     /// feel sluggish, raise if a residual storm remains.
-    private static let restartBackwardLeadIn = 8
+    fileprivate static let restartBackwardLeadIn = 8
 
     // MARK: - Sliding-window live/VOD playlist state
 
@@ -3432,12 +3463,26 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         // re-fetch of a recently-played segment) don't justify
         // tearing down the producer.
         if previousTarget >= 0, index < previousTarget - 2, let restart = restartHandler {
+            // Current producer already covers the target (its base is at
+            // or below it): let it run. Killing it here threw away
+            // producers that were segments from delivering — debug106:
+            // AVPlayer's own post-init backward re-anchor (36→32 with
+            // base=28) killed a mid-run producer and added ~10 s to first
+            // frame; a real back-skip (40→27, base=28) restarted at 27
+            // only for the follow-up fetch to restart AGAIN at 19 because
+            // 27 sat one slot below the leftover cache range. Restart only
+            // for targets the forward-only producer can NEVER reach
+            // (index below its base) — and start at index − leadIn
+            // directly, so AVPlayer's backward pre-roll fetches land in
+            // cache instead of forcing the reactive below-range restart.
+            guard index < lastRestartIndex else { return }
+            let restartBase = max(0, index - Self.restartBackwardLeadIn)
             EngineLog.emit(
-                "[HLSVideoEngine] declareTarget backward jump \(previousTarget) → \(index), proactively restarting producer",
+                "[HLSVideoEngine] declareTarget backward jump \(previousTarget) → \(index), proactively restarting producer at \(restartBase) (leadIn=\(index - restartBase))",
                 category: .session
             )
-            lastRestartIndex = index
-            restart(index)
+            lastRestartIndex = restartBase
+            restart(restartBase)
             cache.resetHighWaterForRestart()
         }
     }
@@ -3572,8 +3617,40 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
         } else {
             producerPassedAndPruned = highWater > index
         }
-        let needsRestart: Bool
-        if staleBelowProducer || producerPassedAndPruned {
+        // The current producer's NEXT write position: a relocated producer
+        // that hasn't written yet (highWater == -1) starts at
+        // lastRestartIndex; otherwise it writes highWater+1 next. When the
+        // request lies at or ahead of that position within the forward
+        // window, the producer WILL reach it — wait (sized to the gap at
+        // ~3 s/segment for remux bitrates) instead of restarting. This is
+        // the unified rule that the earlier spot guards approximated:
+        // every restart fired against a producer heading for the request
+        // threw away near-delivery work and re-demuxed 8 leadIn segments
+        // (debug105 seg31: 10.2 s freeze; debug106 seg27: below-range
+        // branch killed a 200 ms-old relocation because leftover segments
+        // held the resident range one slot above it; debug106 seg30: the
+        // 2 s hole-probe expired while the producer sat 3 segments away).
+        // Leftover resident ranges, relocations in flight, and mid-run
+        // production lag are all the same case: index >= producerNext.
+        let producerNext = highWater == -1 ? lastRestartIndex : highWater + 1
+        let producerWillReach = index >= producerNext
+            && index - producerNext <= Self.forwardWaitWindow
+        var needsRestart: Bool
+        if producerWillReach {
+            // Gap-scaled wait with a wedged-producer escape: if the
+            // producer genuinely fails to progress to `index`, fall
+            // through to the restart below rather than 404ing.
+            let gap = index - producerNext + 1
+            let timeout = min(30.0, max(6.0, Double(gap) * 4.0))
+            if let waited = cache.fetch(index: index, timeout: timeout) {
+                return logServed(index: index, bytes: waited, totalStart: totalStart, restarted: false)
+            }
+            EngineLog.emit(
+                "[HLSVideoEngine] seg\(index): producer (next=\(producerNext)) failed to reach it within \(Int(timeout))s — falling through to restart",
+                category: .session
+            )
+            needsRestart = true
+        } else if staleBelowProducer || producerPassedAndPruned {
             needsRestart = true
         } else if let r = range {
             if index < r.0 {
@@ -3581,26 +3658,11 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
             } else if index > r.1 + Self.forwardWaitWindow {
                 needsRestart = true
             } else if index >= r.0 && index <= r.1 {
-                // Producer might still be writing this index forward
-                // from its current write head. Wait briefly first —
-                // and SUBSTANTIALLY longer when a relocation toward this
-                // very index is in flight: declareTarget's proactive
-                // restart resets the high-water to -1 and the fresh
-                // producer needs seek + several seconds per segment at
-                // remux bitrates before its first capture lands. A 2 s
-                // wait expires during that gap and the reactive leadIn=8
-                // restart below THROWS AWAY the in-flight relocation,
-                // re-demuxing 8 extra ~40 MB segments (debug105: rewind →
-                // proactive restart@29 in flight, seg31 hole hit the 2 s
-                // timeout → restart@23 → a 10.2 s serve that starved
-                // AVPlayer into dropping its audio renderer). Genuine
-                // holes keep the short wait: once the relocated producer
-                // has written anything, highWater is no longer -1.
-                let restartInFlightTowardIndex = highWater == -1
-                    && index >= lastRestartIndex
-                    && index <= lastRestartIndex + Self.forwardWaitWindow
-                let timeout = restartInFlightTowardIndex ? 15.0 : 2.0
-                if let waited = cache.fetch(index: index, timeout: timeout) {
+                // Genuine in-range hole: the producer is already PAST
+                // `index` (producerWillReach above owns the behind case),
+                // so this is an evicted/pruned slot. Brief wait for an
+                // in-flight write, then restart.
+                if let waited = cache.fetch(index: index, timeout: 2.0) {
                     return logServed(index: index, bytes: waited, totalStart: totalStart, restarted: false)
                 }
                 needsRestart = true

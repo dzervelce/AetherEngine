@@ -1174,6 +1174,13 @@ public final class AetherEngine: ObservableObject {
             // stays 1.0, and routing falls through to the media playlist
             // — no rejection, no retry, rate matching still engaged.
             ranPlainHDRPreflight = true
+            let capsBefore = Self.displayCapabilities
+            EngineLog.emit(
+                "[AetherEngine] plain-HDR pre-switch: base=\(base) display caps "
+                + "DV=\(capsBefore.supportsDolbyVision) HDR=\(capsBefore.supportsHDR) HLG=\(capsBefore.supportsHLG) "
+                + "matchContent(combined)=\(options.matchContentEnabled)",
+                category: .engine
+            )
             let willSwitch = displayCriteria.apply(
                 format: base,
                 frameRate: snappedRate,
@@ -1184,13 +1191,19 @@ public final class AetherEngine: ObservableObject {
                 await displayCriteria.waitForSwitch()
                 if !displayCriteria.currentPanelIsHDR() {
                     // The handshake ran but the panel ended in an SDR mode:
-                    // Match Dynamic Range is off (rate-only users — tvOS
-                    // honoured only the refresh-rate dimension) or the panel
-                    // refused. Remember for the rest of the session so
+                    // on an HDR-capable panel that means tvOS honoured only
+                    // the refresh-rate dimension — Match Dynamic Range is
+                    // OFF in Settings → Video and Audio → Match Content
+                    // (the combined API flag can't distinguish it from
+                    // rate-only). Remember for the rest of the session so
                     // subsequent plays don't pay the mode-switch blackout.
                     Self.panelRefusedRangeSwitch = true
+                    let capsAfter = Self.displayCapabilities
                     EngineLog.emit(
-                        "[AetherEngine] plain-HDR pre-switch did not yield an HDR panel mode; skipping pre-switches for the rest of this session",
+                        "[AetherEngine] plain-HDR pre-switch did not yield an HDR panel mode "
+                        + "(caps after: DV=\(capsAfter.supportsDolbyVision) HDR=\(capsAfter.supportsHDR)) — "
+                        + "on an HDR-capable panel this means Match Dynamic Range is OFF in tvOS Settings; "
+                        + "skipping pre-switches for the rest of this session",
                         category: .engine
                     )
                 }
