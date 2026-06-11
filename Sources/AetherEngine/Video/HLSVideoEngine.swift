@@ -1228,29 +1228,46 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // and the standard `sourceIsHDR && panelReadyForHDR` check
         // below routes them correctly.
         let sourceIsHDR = videoRange != .sdr || effectiveDvMode
-        // `panelIsInHDRMode` is authoritative here. AetherEngine.load reads
-        // `UIScreen.currentEDRHeadroom` AFTER `DisplayCriteriaController.
-        // waitForSwitch` settles and passes the empirical result down, so a
-        // panel that's about to switch to HDR via match-range already reads
-        // as HDR by the time we route here.
+        // `panelIsInHDRMode` is the empirical panel snapshot. Engine
+        // pre-flight hosts read it AFTER `DisplayCriteriaController.
+        // waitForSwitch` settles; AVKit-sole-writer hosts (suppressed
+        // criteria) pass their pre-load `currentEDRHeadroom` read.
         //
-        // Previously this OR-fell-through via `(displaySupportsHDR &&
-        // matchContentEnabled)`, but tvOS's match-content API exposes only
-        // one combined `isDisplayCriteriaMatchingEnabled` flag — there's no
-        // way to tell whether Match Dynamic Range specifically is on or
-        // only Match Frame Rate. Trusting the combined flag as a panel-
-        // will-switch proxy broke playback for users with rate-match ON +
-        // range-match OFF: we routed master with `VIDEO-RANGE=PQ`, the
-        // panel stayed SDR, AVPlayer rejected with -11848 / -11868 (DrHurt
-        // #4 2026-05-27).
-        let panelReadyForHDR = panelIsInHDRMode
-        let dv5OnNonDVPanel = dvVariant == .profile5 && !effectiveDvMode
-        let useMasterPlaylist: Bool
-        if dv5OnNonDVPanel {
-            useMasterPlaylist = false
-        } else {
-            useMasterPlaylist = sourceIsHDR && panelReadyForHDR
-        }
+        // Beyond an already-HDR panel, ONE more case serves the master: a
+        // PLAIN-HDR variant (no `dvh1` anywhere — plain `hvc1` + PQ/HLG)
+        // on an HDR-capable panel with Match Content enabled. There AVKit
+        // derives `preferredDisplayCriteria` from the master's VIDEO-RANGE
+        // / FRAME-RATE and drives the SDR→HDR panel switch itself via the
+        // host's `appliesPreferredDisplayCriteriaAutomatically`. Without
+        // this, suppressed-criteria hosts never switch at all: the media
+        // playlist carries no STREAM-INF, AVAsset derives nil criteria,
+        // and HDR10 plays SDR-tonemapped with the panel never asked.
+        //
+        // tvOS exposes only the combined `isDisplayCriteriaMatchingEnabled`
+        // flag, so a rate-match-ON / range-match-OFF user still reads
+        // matchContent=true, the panel refuses the range switch, and
+        // AVPlayer's strict variant filter rejects the HDR-only master
+        // (-11848 / -11868, DrHurt #4 2026-05-27). That rejection used to
+        // be a hard failure (why this OR was once removed); it is safe now
+        // because AetherEngine.loadNative catches exactly that signature
+        // and re-points the same session at the media playlist
+        // (tone-mapped — identical to the old behavior; see
+        // `mediaPlaylistFallbackURL`).
+        //
+        // DV-codec masters (bare `dvh1` CODECS or SUPPLEMENTAL-CODECS DV
+        // brands) stay gated on an already-HDR panel: the variant filter
+        // rejects them outright on panels not presently able to engage DV,
+        // and an AVKit-driven SDR→DV master transition has no verified
+        // working case.
+        let useMasterPlaylist = Self.resolveUseMasterPlaylist(
+            sourceIsHDR: sourceIsHDR,
+            panelIsInHDRMode: panelIsInHDRMode,
+            displaySupportsHDR: displaySupportsHDR,
+            matchContentEnabled: matchContentEnabled,
+            primaryCodecs: primaryCodecs,
+            supplementalCodecs: supplementalCodecs,
+            dv5OnNonDVPanel: dvVariant == .profile5 && !effectiveDvMode
+        )
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL
             : srv.mediaPlaylistURL
@@ -1270,6 +1287,43 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// undefined before. Host wires this into AVPlayerItem flags that
     /// only make sense when AVPlayer can engage an HDR pipeline.
     public private(set) var servingMasterPlaylist: Bool = false
+
+    /// Master-vs-media playlist routing decision. Pure function so the
+    /// matrix is unit-testable (PlaylistRoutingTests); see the call site
+    /// in `start()` for the full rationale and failure-history notes.
+    static func resolveUseMasterPlaylist(
+        sourceIsHDR: Bool,
+        panelIsInHDRMode: Bool,
+        displaySupportsHDR: Bool,
+        matchContentEnabled: Bool,
+        primaryCodecs: String,
+        supplementalCodecs: String?,
+        dv5OnNonDVPanel: Bool
+    ) -> Bool {
+        guard sourceIsHDR, !dv5OnNonDVPanel else { return false }
+        if panelIsInHDRMode { return true }
+        // AVKit-driven SDR→HDR switch is only safe for plain-HDR variants
+        // (no DV codec tags anywhere in the master).
+        let masterIsPlainHDR = supplementalCodecs == nil && !primaryCodecs.hasPrefix("dvh1")
+        return masterIsPlainHDR && displaySupportsHDR && matchContentEnabled
+    }
+
+    /// One-shot master→media fallback target for the host-level
+    /// -11848/-11868 variant-rejection retry (see AetherEngine.loadNative).
+    /// Non-nil only while the session serves the master playlist; the
+    /// retry flips `servingMasterPlaylist` via `noteServingMediaPlaylist()`
+    /// so a second failure surfaces as a normal error.
+    var mediaPlaylistFallbackURL: URL? {
+        guard servingMasterPlaylist else { return nil }
+        return server?.mediaPlaylistURL
+    }
+
+    /// Record that AVPlayer was re-pointed at the media playlist after a
+    /// master-variant rejection, so diagnostics and the fallback's
+    /// one-shot guard reflect the live routing.
+    func noteServingMediaPlaylist() {
+        servingMasterPlaylist = false
+    }
 
     // MARK: - Diagnostics
 

@@ -28,6 +28,11 @@ final class NativeAVPlayerHost {
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
     @Published private(set) var failureMessage: String?
+    /// Typed companion to `failureMessage`: the AVPlayerItem failure as an
+    /// NSError so consumers can branch on domain/code (the master-playlist
+    /// variant-rejection retry in AetherEngine.loadNative needs -11848 /
+    /// -11868). Set together with `failureMessage`.
+    @Published private(set) var failureError: NSError?
     /// True after the AVPlayer item reaches the end of its stream.
     /// Engine flips state to .idle so host end-of-content flows
     /// (auto-dismiss, next-episode countdown if no marker) fire.
@@ -184,6 +189,7 @@ final class NativeAVPlayerHost {
         playerItem = item
         accessLogCount = 0
         failureMessage = nil
+        failureError = nil
         isReady = false
 
         // Status observer to track readyToPlay / failed transitions.
@@ -319,6 +325,9 @@ final class NativeAVPlayerHost {
                     self.duration = item.duration.seconds.isFinite ? item.duration.seconds : 0
                     self.isReady = true
                 case .failed:
+                    self.failureError = (item.error as NSError?)
+                        ?? NSError(domain: AVFoundationErrorDomain, code: -1,
+                                   userInfo: [NSLocalizedDescriptionKey: "AVPlayerItem failed (no description)"])
                     self.failureMessage = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
                 default:
                     break

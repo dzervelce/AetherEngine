@@ -1310,6 +1310,14 @@ public final class AetherEngine: ObservableObject {
                 // immediate DV mode), this is what makes cold-start
                 // playback land.
                 await displayCriteria.waitForSwitch()
+                // The step-2.5 videoFormat write used the host's PRE-LOAD
+                // panel snapshot, which goes stale whenever AVKit itself
+                // drove the switch (plain-HDR master routing): the panel
+                // is in HDR by now but videoFormat still reads .sdr.
+                // Re-read the panel after the handshake settles so the
+                // published format reflects what's actually on glass.
+                let panelHDRNow = displayCriteria.currentPanelIsHDR()
+                videoFormat = (effectiveFormat != .sdr && panelHDRNow) ? effectiveFormat : .sdr
                 // Auto-play after load. AVPlayer's
                 // `automaticallyWaitsToMinimizeStalling = true` (default)
                 // handles "play before ready" correctly: it transitions
@@ -1460,6 +1468,22 @@ public final class AetherEngine: ObservableObject {
         // the transcode spin-up instead of showing a premature black screen.
         host.play()
         startMemoryProbe()
+    }
+
+    /// AVPlayer's master-level variant-filter rejection signature: an
+    /// HDR-only master was refused because the panel can't (or won't)
+    /// engage the advertised range. -11848 "Cannot Open" at asset open,
+    /// -11868 AVErrorNoCompatibleAlternatesForExternalDisplay at output;
+    /// CoreMedia -15517 / -17223 ride along as underlying errors, so the
+    /// AVFoundation code may sit one level down.
+    private static func isMasterVariantRejection(_ err: NSError) -> Bool {
+        let avCodes: Set<Int> = [-11848, -11868]
+        if err.domain == AVFoundationErrorDomain, avCodes.contains(err.code) { return true }
+        if let underlying = err.userInfo[NSUnderlyingErrorKey] as? NSError,
+           underlying.domain == AVFoundationErrorDomain, avCodes.contains(underlying.code) {
+            return true
+        }
+        return false
     }
 
     private func loadNative(
@@ -1628,9 +1652,40 @@ public final class AetherEngine: ObservableObject {
                 }
             }
             .store(in: &nativeCancellables)
-        host.$failureMessage
+        host.$failureError
             .compactMap { $0 }
-            .sink { [weak self] msg in self?.state = .error(msg) }
+            .sink { [weak self, weak session, weak host] err in
+                guard let self = self else { return }
+                // Master-playlist variant rejection → one-shot media-playlist
+                // retry. The plain-HDR master routing (HLSVideoEngine.
+                // resolveUseMasterPlaylist) can serve VIDEO-RANGE=PQ to a
+                // panel that turns out not to switch (rate-match-only users:
+                // tvOS can't split the combined match-content flag), which
+                // AVPlayer rejects with -11848 / -11868. Re-point the SAME
+                // session at its media playlist — segments, producer, and
+                // cache are shared between the two playlists — so playback
+                // proceeds tone-mapped, identical to the pre-routing
+                // behavior. `mediaPlaylistFallbackURL` is nil once the
+                // session serves media, so a second failure (or any
+                // non-variant error) surfaces as a normal error state.
+                if let session = session, let host = host,
+                   self.nativeVideoSession === session,
+                   Self.isMasterVariantRejection(err),
+                   let fallbackURL = session.mediaPlaylistFallbackURL {
+                    session.noteServingMediaPlaylist()
+                    EngineLog.emit(
+                        "[AetherEngine] master playlist rejected (\(err.domain) \(err.code)); "
+                        + "retrying via media playlist (panel won't switch — tone-mapped)",
+                        category: .engine
+                    )
+                    host.load(url: fallbackURL,
+                              startPosition: startPosition,
+                              perFrameHDR: true)
+                    if self.state == .playing { host.play() }
+                    return
+                }
+                self.state = .error(err.localizedDescription)
+            }
             .store(in: &nativeCancellables)
         host.$didReachEnd
             .filter { $0 }
