@@ -914,6 +914,11 @@ public final class AetherEngine: ObservableObject {
         var effectiveFormat: VideoFormat = .sdr
         var detectedRate: Double? = nil
         var detectedDVProfile: Bool = false
+        // What the HLS route will PRESENT to AVPlayer: a plain-HDR base
+        // (.hdr10/.hlg — incl. stripped DV), .sdr, or nil for DV signaling.
+        // Drives the plain-HDR panel pre-switch in step 2 for
+        // suppressed-criteria (AVKit-sole-writer) hosts.
+        var plainHDRPresentedBase: VideoFormat? = nil
         var detectedCodecID: AVCodecID = AV_CODEC_ID_NONE
         var probedAudioTracks: [TrackInfo] = []
         var probedSubtitleTracks: [TrackInfo] = []
@@ -980,6 +985,12 @@ public final class AetherEngine: ObservableObject {
                 sourceVideoWidth = stream.pointee.codecpar.pointee.width
                 sourceVideoHeight = stream.pointee.codecpar.pointee.height
                 lastDetectedVideoCodec = detectedCodecID
+                plainHDRPresentedBase = HLSVideoEngine.presentedPlainHDRBase(
+                    codecpar: stream.pointee.codecpar,
+                    codecID: detectedCodecID,
+                    effectiveDvMode: Self.displayCapabilities.supportsDolbyVision
+                        || options.keepDvh1TagWithoutDV
+                )
             }
             probedAudioTracks = probe.audioTrackInfos()
             probedSubtitleTracks = probe.subtitleTrackInfos()
@@ -1111,12 +1122,50 @@ public final class AetherEngine: ObservableObject {
 
         // 2. Display-criteria handshake. Drive from the effective format so
         //    a non-DV panel doesn't get asked to switch into dvh1 mode.
+        var ranPlainHDRPreflight = false
         if !options.suppressDisplayCriteria {
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
             let willSwitch = displayCriteria.apply(
                 format: effectiveFormat,
                 frameRate: snappedRate,
                 codecTag: codecTag,
+                omitColorExtensions: options.omitCriteriaColorExtensions
+            )
+            if willSwitch {
+                await displayCriteria.waitForSwitch()
+            }
+        } else if let base = plainHDRPresentedBase, base != .sdr,
+                  !options.panelIsInHDRMode,
+                  options.matchContentEnabled,
+                  Self.displayCapabilities.supportsHDR {
+            // PLAIN-HDR PRE-SWITCH for AVKit-sole-writer hosts (debug104,
+            // 2026-06-11). Handing AVPlayer a VIDEO-RANGE=PQ master while
+            // the panel still sits in SDR loses a race INSIDE AVKit: it
+            // derives criteria from the manifest and starts the panel
+            // switch, but its variant filter evaluates against the CURRENT
+            // (still-SDR, mid-transition) display and rejects the item
+            // with -11868/-17223 ~700 ms in — observed as "HDR flips on,
+            // then off", the media-retry reload, and a ~6 s waitForSwitch
+            // spin on the reverted panel. Switching the panel BEFORE the
+            // asset exists is the engine's original proven ordering;
+            // scoped here to sources PRESENTING plain HDR (hvc1/avc1 +
+            // PQ/HLG: HDR10/HLG, and stripped DV — P7 always, P8.1/P8.4
+            // on non-DV panels). DV-presenting sources keep the pure
+            // AVKit-sole-writer arrangement untouched (engine+AVKit dual
+            // writers broke DV output with the same -11868/-17223).
+            //
+            // The criteria asks for the PRESENTED base, never DV —
+            // `effectiveFormat` reads .dolbyVision for stripped-DV
+            // sources, but what AVPlayer will see is the plain HDR base
+            // layer. Rate-match-only users (combined tvOS flag): the
+            // panel honours only the refresh-rate dimension, headroom
+            // stays 1.0, and routing falls through to the media playlist
+            // — no rejection, no retry, rate matching still engaged.
+            ranPlainHDRPreflight = true
+            let willSwitch = displayCriteria.apply(
+                format: base,
+                frameRate: snappedRate,
+                codecTag: nil,
                 omitColorExtensions: options.omitCriteriaColorExtensions
             )
             if willSwitch {
@@ -1146,13 +1195,17 @@ public final class AetherEngine: ObservableObject {
         //      published `videoFormat` and HLSVideoEngine's master-vs-
         //      media routing so the two stay in step.
         //
-        //      Suppressed-criteria hosts (AVKit-sole-writer path) fall
-        //      back to the caller's pre-load snapshot — their criteria
-        //      fires later from AVKit and we can't probe the outcome
-        //      from here.
+        //      Suppressed-criteria hosts (AVKit-sole-writer path) use the
+        //      caller's pre-load snapshot — UNLESS the plain-HDR
+        //      pre-switch above ran, in which case the post-handshake
+        //      headroom read is authoritative (that's the whole point of
+        //      the pre-switch: have the panel's true mode in hand before
+        //      the master-vs-media routing).
         let panelHDRAfterHandshake: Bool
         if options.suppressDisplayCriteria {
-            panelHDRAfterHandshake = options.panelIsInHDRMode
+            panelHDRAfterHandshake = ranPlainHDRPreflight
+                ? displayCriteria.currentPanelIsHDR()
+                : options.panelIsInHDRMode
         } else {
             panelHDRAfterHandshake = displayCriteria.currentPanelIsHDR()
         }
@@ -1318,6 +1371,16 @@ public final class AetherEngine: ObservableObject {
                 // published format reflects what's actually on glass.
                 let panelHDRNow = displayCriteria.currentPanelIsHDR()
                 videoFormat = (effectiveFormat != .sdr && panelHDRNow) ? effectiveFormat : .sdr
+                if options.suppressDisplayCriteria {
+                    // AVKit owns the criteria lifecycle from here: it
+                    // re-derives criteria from the master on every load and
+                    // restores the panel at dismissal. The plain-HDR
+                    // pre-switch's write must NOT be nil-reset by
+                    // stopInternal on mid-session reloads (audio switch /
+                    // next episode call load() → stopInternal(reset: true))
+                    // — that would blink the panel out of HDR every time.
+                    displayCriteria.handOffToAVKit()
+                }
                 // Auto-play after load. AVPlayer's
                 // `automaticallyWaitsToMinimizeStalling = true` (default)
                 // handles "play before ready" correctly: it transitions

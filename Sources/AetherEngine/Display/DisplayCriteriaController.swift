@@ -288,6 +288,19 @@ final class DisplayCriteriaController {
         #endif
     }
 
+    /// Relinquish reset ownership after a pre-switch whose criteria AVKit
+    /// then adopts (AVKit-sole-writer hosts): clears `didApply` so
+    /// `reset()` stays a no-op. AVKit re-derives the same criteria from
+    /// each master playlist it loads and restores the panel at dismissal;
+    /// without the hand-off, stopInternal's reset() on a mid-session
+    /// reload (audio switch / next episode) nil-writes the criteria and
+    /// blinks the panel out of HDR.
+    func handOffToAVKit() {
+        #if os(tvOS)
+        didApply = false
+        #endif
+    }
+
     /// Clear the preferred display criteria so the panel returns to
     /// its default mode after playback. Idempotent. No-op when the
     /// controller never wrote criteria during the current session

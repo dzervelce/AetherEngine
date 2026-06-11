@@ -1228,44 +1228,32 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // and the standard `sourceIsHDR && panelReadyForHDR` check
         // below routes them correctly.
         let sourceIsHDR = videoRange != .sdr || effectiveDvMode
-        // `panelIsInHDRMode` is the empirical panel snapshot. Engine
+        // `panelIsInHDRMode` is the empirical panel snapshot and (besides
+        // the DV5 carve-out) the ONLY gate for master routing. Engine
         // pre-flight hosts read it AFTER `DisplayCriteriaController.
-        // waitForSwitch` settles; AVKit-sole-writer hosts (suppressed
-        // criteria) pass their pre-load `currentEDRHeadroom` read.
+        // waitForSwitch` settles; AVKit-sole-writer hosts get the same
+        // guarantee from the plain-HDR PRE-SWITCH in AetherEngine.load,
+        // which switches the panel and re-reads EDR headroom BEFORE the
+        // routing decision reaches here.
         //
-        // Beyond an already-HDR panel, ONE more case serves the master: a
-        // PLAIN-HDR variant (no `dvh1` anywhere — plain `hvc1` + PQ/HLG)
-        // on an HDR-capable panel with Match Content enabled. There AVKit
-        // derives `preferredDisplayCriteria` from the master's VIDEO-RANGE
-        // / FRAME-RATE and drives the SDR→HDR panel switch itself via the
-        // host's `appliesPreferredDisplayCriteriaAutomatically`. Without
-        // this, suppressed-criteria hosts never switch at all: the media
-        // playlist carries no STREAM-INF, AVAsset derives nil criteria,
-        // and HDR10 plays SDR-tonemapped with the panel never asked.
-        //
-        // tvOS exposes only the combined `isDisplayCriteriaMatchingEnabled`
-        // flag, so a rate-match-ON / range-match-OFF user still reads
-        // matchContent=true, the panel refuses the range switch, and
-        // AVPlayer's strict variant filter rejects the HDR-only master
-        // (-11848 / -11868, DrHurt #4 2026-05-27). That rejection used to
-        // be a hard failure (why this OR was once removed); it is safe now
-        // because AetherEngine.loadNative catches exactly that signature
-        // and re-points the same session at the media playlist
-        // (tone-mapped — identical to the old behavior; see
-        // `mediaPlaylistFallbackURL`).
-        //
-        // DV-codec masters (bare `dvh1` CODECS or SUPPLEMENTAL-CODECS DV
-        // brands) stay gated on an already-HDR panel: the variant filter
-        // rejects them outright on panels not presently able to engage DV,
-        // and an AVKit-driven SDR→DV master transition has no verified
-        // working case.
+        // Do NOT route master for a panel that is not ALREADY in HDR. The
+        // obvious alternative — serve `VIDEO-RANGE=PQ` and let AVKit's
+        // `appliesPreferredDisplayCriteriaAutomatically` drive the SDR→HDR
+        // transition — was tried and REFUTED on-device (debug104,
+        // 2026-06-11, P7→plain-HDR master on a DV panel with match-content
+        // ON): AVKit derives criteria from the master and STARTS the panel
+        // switch, but its variant filter evaluates against the CURRENT
+        // (still-SDR, mid-transition) display and rejects the item with
+        // -11868/-17223 ~700 ms in — the panel visibly flips into HDR and
+        // back out, playback falls back tone-mapped through the media
+        // retry, and waitForSwitch spins ~6 s on the reverted panel. The
+        // same race is documented for the engine pre-flight era in
+        // DisplayCriteriaController.waitForSwitch (its -11848 note).
+        // Switching the panel BEFORE AVPlayer ever sees the master is the
+        // only ordering that works.
         let useMasterPlaylist = Self.resolveUseMasterPlaylist(
             sourceIsHDR: sourceIsHDR,
             panelIsInHDRMode: panelIsInHDRMode,
-            displaySupportsHDR: displaySupportsHDR,
-            matchContentEnabled: matchContentEnabled,
-            primaryCodecs: primaryCodecs,
-            supplementalCodecs: supplementalCodecs,
             dv5OnNonDVPanel: dvVariant == .profile5 && !effectiveDvMode
         )
         let resolvedURL: URL? = useMasterPlaylist
@@ -1289,23 +1277,57 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public private(set) var servingMasterPlaylist: Bool = false
 
     /// Master-vs-media playlist routing decision. Pure function so the
-    /// matrix is unit-testable (PlaylistRoutingTests); see the call site
-    /// in `start()` for the full rationale and failure-history notes.
+    /// matrix is unit-testable (PlaylistRoutingTests). PANEL-EMPIRICAL
+    /// ONLY: callers that want the SDR→HDR switch must put the panel into
+    /// HDR BEFORE this decision (engine pre-flight, or AetherEngine.load's
+    /// plain-HDR pre-switch for suppressed-criteria hosts). Serving an HDR
+    /// master to a not-yet-HDR panel loses AVKit's variant-filter race —
+    /// the filter rejects with -11868 while the panel is still
+    /// mid-transition toward HDR (debug104), even though AVKit itself
+    /// initiated that transition from the same master.
     static func resolveUseMasterPlaylist(
         sourceIsHDR: Bool,
         panelIsInHDRMode: Bool,
-        displaySupportsHDR: Bool,
-        matchContentEnabled: Bool,
-        primaryCodecs: String,
-        supplementalCodecs: String?,
         dv5OnNonDVPanel: Bool
     ) -> Bool {
         guard sourceIsHDR, !dv5OnNonDVPanel else { return false }
-        if panelIsInHDRMode { return true }
-        // AVKit-driven SDR→HDR switch is only safe for plain-HDR variants
-        // (no DV codec tags anywhere in the master).
-        let masterIsPlainHDR = supplementalCodecs == nil && !primaryCodecs.hasPrefix("dvh1")
-        return masterIsPlainHDR && displaySupportsHDR && matchContentEnabled
+        return panelIsInHDRMode
+    }
+
+    /// The plain-HDR base format the codec route will PRESENT to AVPlayer
+    /// for this source — `.hdr10`/`.hlg` when the master will carry plain
+    /// `hvc1`/`avc1` + PQ/HLG (HDR10/HLG sources, and stripped DV: P7
+    /// always, P8.1/P8.4 on non-DV panels), `.sdr` when there is nothing
+    /// to switch for, and nil when the route emits DOLBY VISION signaling
+    /// (bare `dvh1` CODECS or a DV SUPPLEMENTAL-CODECS brand — P5, and
+    /// P8.1/P8.4 with `effectiveDvMode`). Mirrors `resolveCodecRoute`'s
+    /// variant dispatch; drives AetherEngine.load's plain-HDR panel
+    /// pre-switch for AVKit-sole-writer hosts. NB plain HLG sources report
+    /// `.hdr10` on purpose: the route labels them `VIDEO-RANGE=PQ`
+    /// (pre-existing nit) and the pre-switch criteria must match the
+    /// master AVKit will act on. AV1 DV variants report `.sdr` (software
+    /// path — AVPlayer never sees them).
+    static func presentedPlainHDRBase(
+        codecpar: UnsafePointer<AVCodecParameters>,
+        codecID: AVCodecID,
+        effectiveDvMode: Bool
+    ) -> VideoFormat? {
+        let variant = classifyDVVariant(doviConfigRecord(from: codecpar), codecID: codecID)
+        switch variant {
+        case .none:
+            return Self.isHDRTransfer(codecpar) ? .hdr10 : .sdr
+        case .profile7:
+            return .hdr10
+        case .profile81:
+            return effectiveDvMode ? nil : .hdr10
+        case .profile84:
+            return effectiveDvMode ? nil : .hlg
+        case .profile5:
+            return nil
+        case .profile82, .unknown,
+             .av1Profile10, .av1Profile101, .av1Profile104, .av1Profile102:
+            return .sdr
+        }
     }
 
     /// One-shot master→media fallback target for the host-level
@@ -2368,7 +2390,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     // MARK: - DV / HDR detection
 
-    private func doviConfigRecord(
+    private static func doviConfigRecord(
         from codecpar: UnsafePointer<AVCodecParameters>
     ) -> AVDOVIDecoderConfigurationRecord? {
         let count = Int(codecpar.pointee.nb_coded_side_data)
@@ -2387,7 +2409,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return nil
     }
 
-    private func isHDRTransfer(_ codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
+    private static func isHDRTransfer(_ codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
         let trc = codecpar.pointee.color_trc
         return trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
     }
@@ -2519,7 +2541,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO
     }
 
-    private func classifyDVVariant(
+    private static func classifyDVVariant(
         _ record: AVDOVIDecoderConfigurationRecord?,
         codecID: AVCodecID
     ) -> DVVariant {
@@ -2622,7 +2644,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let safeLevel = levelIDC > 0 ? levelIDC : 40         // 4.0
             return CodecRoute(
                 codecTagOverride: "avc1",
-                videoRange: isHDRTransfer(codecpar) ? .pq : .sdr,
+                videoRange: Self.isHDRTransfer(codecpar) ? .pq : .sdr,
                 primaryCodecs: String(format: "avc1.%02X%02X%02X", safeProfile, 0, safeLevel),
                 supplementalCodecs: nil,
                 stripDolbyVisionMetadata: false,
@@ -2638,8 +2660,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // Dolby Vision RPU, classify resolves to one of the
             // av1Profile10x variants and we emit the matching `dav1`
             // codec tag + Apple HLS Authoring Spec CODECS string.
-            let dvRecord = effectiveDvMode ? doviConfigRecord(from: codecpar) : nil
-            let dvVariant = classifyDVVariant(dvRecord, codecID: AV_CODEC_ID_AV1)
+            let dvRecord = effectiveDvMode ? Self.doviConfigRecord(from: codecpar) : nil
+            let dvVariant = Self.classifyDVVariant(dvRecord, codecID: AV_CODEC_ID_AV1)
 
             // AV1 codec-string fields (per Apple HLS Authoring Spec +
             // AV1 codec-string IETF draft):
@@ -2768,8 +2790,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // `dvh1` sample entry + media playlist routing plays DV5
         // correctly on every panel mode. The routing branch below
         // forces media playlist for the DV5-on-non-DV-panel case.
-        let dvRecord = doviConfigRecord(from: codecpar)
-        let dvVariant = classifyDVVariant(dvRecord, codecID: AV_CODEC_ID_HEVC)
+        let dvRecord = Self.doviConfigRecord(from: codecpar)
+        let dvVariant = Self.classifyDVVariant(dvRecord, codecID: AV_CODEC_ID_HEVC)
 
         // Dump the raw DV side data fields so a remote tester can
         // photograph the diagnostic overlay and confirm what the
@@ -2956,7 +2978,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         case .none:
             return CodecRoute(
                 codecTagOverride: "hvc1",
-                videoRange: isHDRTransfer(codecpar) ? .pq : .sdr,
+                videoRange: Self.isHDRTransfer(codecpar) ? .pq : .sdr,
                 primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
                 supplementalCodecs: nil,
                 stripDolbyVisionMetadata: false,
