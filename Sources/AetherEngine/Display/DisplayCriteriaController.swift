@@ -229,9 +229,9 @@ final class DisplayCriteriaController {
                 sawSwitchStart = true
                 break
             }
-            if screen.currentEDRHeadroom > 1.001 {
-                // Panel already in HDR mode; no switch needed.
-                EngineLog.emit("[DisplayCriteria] no switch needed (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)) at entry)", category: .engine)
+            if Self.panelModeIsHDR(screen) {
+                // Panel already in an HDR mode; no switch needed.
+                EngineLog.emit("[DisplayCriteria] no switch needed (\(Self.headroom(screen)) at entry)", category: .engine)
                 return
             }
             try? await Task.sleep(for: .milliseconds(10))
@@ -243,7 +243,7 @@ final class DisplayCriteriaController {
             // unsupported codec) or the setter was a no-op (criteria
             // already matched). Don't block playback further; AVPlayer
             // will either tonemap or fail with a real error.
-            EngineLog.emit("[DisplayCriteria] WARN handshake never started (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)) after 1000ms); proceeding", category: .engine)
+            EngineLog.emit("[DisplayCriteria] WARN handshake never started (\(Self.headroom(screen)) after 1000ms); proceeding", category: .engine)
             return
         }
 
@@ -252,15 +252,15 @@ final class DisplayCriteriaController {
             try? await Task.sleep(for: .milliseconds(100))
             if !displayManager.isDisplayModeSwitchInProgress {
                 let totalMs = (tick + 1) * 100 + 1000  // include stage 1 budget
-                if screen.currentEDRHeadroom > 1.001 {
-                    EngineLog.emit("[DisplayCriteria] switch settled after ~\(totalMs)ms (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
+                if Self.panelModeIsHDR(screen) {
+                    EngineLog.emit("[DisplayCriteria] switch settled after ~\(totalMs)ms (\(Self.headroom(screen)))", category: .engine)
                 } else {
-                    EngineLog.emit("[DisplayCriteria] WARN switch ended after ~\(totalMs)ms but EDR headroom still 1.0 (panel stayed SDR despite HDR criteria)", category: .engine)
+                    EngineLog.emit("[DisplayCriteria] WARN switch ended after ~\(totalMs)ms but panel mode still SDR (\(Self.headroom(screen)))", category: .engine)
                 }
                 return
             }
         }
-        EngineLog.emit("[DisplayCriteria] WARN switch did not settle within 5s; proceeding anyway (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
+        EngineLog.emit("[DisplayCriteria] WARN switch did not settle within 5s; proceeding anyway (\(Self.headroom(screen)))", category: .engine)
         #endif
     }
 
@@ -282,7 +282,7 @@ final class DisplayCriteriaController {
     func currentPanelIsHDR() -> Bool {
         #if os(tvOS)
         guard let window = resolveWindow() else { return false }
-        return window.screen.currentEDRHeadroom > 1.001
+        return Self.panelModeIsHDR(window.screen)
         #else
         return false
         #endif
@@ -320,6 +320,28 @@ final class DisplayCriteriaController {
         EngineLog.emit("[DisplayCriteria] RESET", category: .engine)
         #endif
     }
+
+    // MARK: - Panel-mode probe
+
+    #if os(tvOS)
+    /// Whether the panel's ACTIVE MODE is an HDR mode. `currentEDRHeadroom`
+    /// alone is NOT sufficient: it is content-dependent and can read 1.0 in
+    /// a genuine HDR display mode until EDR pixels actually render
+    /// (debug105: a settled HDR switch still read 1.0 because only the SDR
+    /// loading UI was on screen — the engine mis-concluded "panel stayed
+    /// SDR", routed the media playlist, and AVKit's criteria write flipped
+    /// the panel straight back out of HDR). `potentialEDRHeadroom` reflects
+    /// what the CURRENT MODE can present (1.0 in an SDR mode); trust either
+    /// signal.
+    static func panelModeIsHDR(_ screen: UIScreen) -> Bool {
+        screen.currentEDRHeadroom > 1.001 || screen.potentialEDRHeadroom > 1.001
+    }
+
+    private static func headroom(_ screen: UIScreen) -> String {
+        String(format: "EDR headroom cur=%.2f pot=%.2f",
+               screen.currentEDRHeadroom, screen.potentialEDRHeadroom)
+    }
+    #endif
 
     // MARK: - Window resolution
 

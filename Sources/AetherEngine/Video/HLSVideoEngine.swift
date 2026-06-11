@@ -3582,8 +3582,25 @@ private final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendabl
                 needsRestart = true
             } else if index >= r.0 && index <= r.1 {
                 // Producer might still be writing this index forward
-                // from its current write head. Wait briefly first.
-                if let waited = cache.fetch(index: index, timeout: 2.0) {
+                // from its current write head. Wait briefly first —
+                // and SUBSTANTIALLY longer when a relocation toward this
+                // very index is in flight: declareTarget's proactive
+                // restart resets the high-water to -1 and the fresh
+                // producer needs seek + several seconds per segment at
+                // remux bitrates before its first capture lands. A 2 s
+                // wait expires during that gap and the reactive leadIn=8
+                // restart below THROWS AWAY the in-flight relocation,
+                // re-demuxing 8 extra ~40 MB segments (debug105: rewind →
+                // proactive restart@29 in flight, seg31 hole hit the 2 s
+                // timeout → restart@23 → a 10.2 s serve that starved
+                // AVPlayer into dropping its audio renderer). Genuine
+                // holes keep the short wait: once the relocated producer
+                // has written anything, highWater is no longer -1.
+                let restartInFlightTowardIndex = highWater == -1
+                    && index >= lastRestartIndex
+                    && index <= lastRestartIndex + Self.forwardWaitWindow
+                let timeout = restartInFlightTowardIndex ? 15.0 : 2.0
+                if let waited = cache.fetch(index: index, timeout: timeout) {
                     return logServed(index: index, bytes: waited, totalStart: totalStart, restarted: false)
                 }
                 needsRestart = true

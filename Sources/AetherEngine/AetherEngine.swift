@@ -205,6 +205,17 @@ public final class AetherEngine: ObservableObject {
 
     /// Snapshot of what the active display can present right now.
     ///
+    /// Session memo for the plain-HDR pre-switch: set when a pre-switch
+    /// criteria was written, the handshake settled, and the panel STILL
+    /// ended in an SDR mode — Match Dynamic Range is off (rate-only
+    /// match-content users) or the panel can't do it. Skipping further
+    /// pre-switches for the rest of the process avoids paying a useless
+    /// mode-switch blackout on every play (debug105: the pre-switch
+    /// blacked out for a rate-only outcome, then AVKit's criteria write
+    /// blacked out AGAIN reverting it). Cleared on app relaunch, so a
+    /// settings change picks up after a restart at worst.
+    private static var panelRefusedRangeSwitch = false
+
     /// Reads `AVPlayer.eligibleForHDRPlayback` and
     /// `AVPlayer.availableHDRModes` at call time. tvOS and iOS report
     /// panel capabilities; macOS reports the built-in display only and
@@ -1136,6 +1147,7 @@ public final class AetherEngine: ObservableObject {
             }
         } else if let base = plainHDRPresentedBase, base != .sdr,
                   !options.panelIsInHDRMode,
+                  !Self.panelRefusedRangeSwitch,
                   options.matchContentEnabled,
                   Self.displayCapabilities.supportsHDR {
             // PLAIN-HDR PRE-SWITCH for AVKit-sole-writer hosts (debug104,
@@ -1170,6 +1182,18 @@ public final class AetherEngine: ObservableObject {
             )
             if willSwitch {
                 await displayCriteria.waitForSwitch()
+                if !displayCriteria.currentPanelIsHDR() {
+                    // The handshake ran but the panel ended in an SDR mode:
+                    // Match Dynamic Range is off (rate-only users — tvOS
+                    // honoured only the refresh-rate dimension) or the panel
+                    // refused. Remember for the rest of the session so
+                    // subsequent plays don't pay the mode-switch blackout.
+                    Self.panelRefusedRangeSwitch = true
+                    EngineLog.emit(
+                        "[AetherEngine] plain-HDR pre-switch did not yield an HDR panel mode; skipping pre-switches for the rest of this session",
+                        category: .engine
+                    )
+                }
             }
         }
 
