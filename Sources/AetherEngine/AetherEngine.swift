@@ -1612,6 +1612,11 @@ public final class AetherEngine: ObservableObject {
         // directly (dvh1 primary). Drives the plain-HDR panel pre-switch below for suppressed-criteria
         // (AVKit-sole-writer) hosts; see HLSVideoEngine.presentedPlainHDRBase.
         var plainHDRPresentedBase: VideoFormat? = nil
+        // Pre-switch target incl. direct-DV routes: those present dvh1 (plain base = nil), but on a
+        // panel idling SDR the dvh1 master would route media and DV never engages — pre-switch them
+        // through a synthetic HDR10 compatibility target (hvc1 criterion, NEVER dvh1: engine-written
+        // DV criteria fail delayed with -11868, debug22). AVKit then does the HDR→DV step itself.
+        var hdrCompatibilityPreflightBase: VideoFormat? = nil
         var probedAudioTracks: [TrackInfo] = []
         var probedSubtitleTracks: [TrackInfo] = []
         var probedDefaultAudioIndex: Int32 = -1
@@ -1666,6 +1671,10 @@ public final class AetherEngine: ObservableObject {
                 )
                 detectedVideoBitrate = probe.declaredBitrate(stream: stream)
                 lastDetectedVideoCodec = detectedCodecID
+                hdrCompatibilityPreflightBase = plainHDRPresentedBase
+                    ?? ((detectedFormat == .dolbyVision)
+                        && (Self.displayCapabilities.supportsDolbyVision || options.keepDvh1TagWithoutDV)
+                        ? .hdr10 : nil)
             }
             probedAudioTracks = probe.audioTrackInfos()
             probedSubtitleTracks = probe.subtitleTrackInfos()
@@ -1869,7 +1878,7 @@ public final class AetherEngine: ObservableObject {
                 criteriaUnchanged = true
             }
         case .clearStale:
-            if let base = plainHDRPresentedBase, base != .sdr,
+            if let base = hdrCompatibilityPreflightBase, base != .sdr,
                !options.panelIsInHDRMode,
                !Self.panelRefusedRangeSwitch,
                options.matchContentEnabled,
@@ -1900,6 +1909,9 @@ public final class AetherEngine: ObservableObject {
                     omitColorExtensions: options.omitCriteriaColorExtensions
                 ) {
                 case .willSwitch:
+                    // Arm the cold-master readiness gate: a DV/HDR master built right after this
+                    // SDR→HDR handshake is exactly the fresh-panel case that gate covers.
+                    didSwitchPanel = true
                     await displayCriteria.waitForSwitch()
                     // Superseded during panel handshake: close local probe and unwind.
                     if loadGeneration != gen {
