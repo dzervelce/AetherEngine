@@ -308,23 +308,27 @@ extension HLSVideoEngine {
                 dvVariant: dvVariant
             )
         case .profile81:
-            // P8.1 (HDR10-compat base).
-            // DV panel: hvc1 + dvvC (muxer writes dvvC automatically) + SUPPLEMENTAL dvh1.08.XX/db1p.
-            //   db1p required; without it AVPlayer treats variant as plain HDR10 and DV never engages.
+            // P8.1 (HDR10-compat base). Two branches based on display capability.
+            //
+            // DV-capable panel (`effectiveDvMode == true`): DIRECT DV. `dvh1` sample entry
+            //   + dvvC box (the mp4 muxer writes dvvC for profile 8 when DV side data is
+            //   preserved on the codecpar + strict=-2), primary CODECS `dvh1.08.XX`,
+            //   VIDEO-RANGE=PQ, NO SUPPLEMENTAL-CODECS (the primary codec already IS the DV
+            //   codec). This replaces the Apple-official backward-compat signaling (`hvc1`
+            //   sample entry + SUPPLEMENTAL-CODECS `dvh1.08.XX/db1p`), which is spec-correct
+            //   but on a real DV Apple TV FAILS: AVPlayer decodes the HEVC base -- a frame
+            //   even appears in the tvOS app-switcher snapshot -- but never engages AVKit's
+            //   Dolby Vision OUTPUT path, so the live HDMI signal stays black and the item
+            //   dies ~16s in with AVFoundationErrorDomain -11868 / CoreMediaErrorDomain
+            //   -17223 ("Cannot open" = DV video receiver), device-verified. Tagging the
+            //   bitstream `dvh1` (not `hvc1`) is what makes the TV switch into DV mode
+            //   instead of plain HDR -- the same direct-DV packaging the working P5 route
+            //   already uses.
             // Non-DV panel: strip dvvC (hvc1 + dvvC trips -11868 even without SUPPLEMENTAL, 2026-05-26).
             // "P8.6" malformed compat (#53): rewriteDoviConfigTo81 normalizes container to compat=1;
             //   on non-DV panel the strip path handles it without rewrite.
             let compat = Int(dvRecord?.dv_bl_signal_compatibility_id ?? 1)
             let needsCompatRewrite = compat != 1
-            let supplemental: String?
-            let strip: Bool
-            if effectiveDvMode {
-                supplemental = "dvh1.08.\(dvLevelStr)/db1p"
-                strip = false
-            } else {
-                supplemental = nil
-                strip = true
-            }
             if needsCompatRewrite && effectiveDvMode {
                 EngineLog.emit(
                     "[HLSVideoEngine] HEVC DV Profile 8 with invalid compat="
@@ -333,16 +337,28 @@ extension HLSVideoEngine {
                     category: .session
                 )
             }
-            return CodecRoute(
-                codecTagOverride: "hvc1",
-                videoRange: .pq,
-                primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
-                supplementalCodecs: supplemental,
-                stripDolbyVisionMetadata: strip,
-                convertP7ToProfile81: false,
-                rewriteDoviConfigTo81: needsCompatRewrite && effectiveDvMode,
-                dvVariant: dvVariant
-            )
+            if effectiveDvMode {
+                return CodecRoute(
+                    codecTagOverride: "dvh1",
+                    videoRange: .pq,
+                    primaryCodecs: "dvh1.08.\(dvLevelStr)",
+                    supplementalCodecs: nil,
+                    stripDolbyVisionMetadata: false,
+                    convertP7ToProfile81: false,
+                    rewriteDoviConfigTo81: needsCompatRewrite,
+                    dvVariant: dvVariant
+                )
+            } else {
+                return CodecRoute(
+                    codecTagOverride: "hvc1",
+                    videoRange: .pq,
+                    primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
+                    supplementalCodecs: nil,
+                    stripDolbyVisionMetadata: true,
+                    convertP7ToProfile81: false,
+                    dvVariant: dvVariant
+                )
+            }
         case .profile84:
             // P8.4 (HLG-compat base). Mirrors P8.1 routing.
             // DV panel: hvc1 + dvvC + SUPPLEMENTAL dvh1.08.XX/db4h. db4h marks HLG-base for AVKit criteria.

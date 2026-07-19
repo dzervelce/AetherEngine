@@ -422,6 +422,20 @@ extension AetherEngine {
                 self.state = .error("Source read failed before any media was produced (code \(code))")
             }
         }
+        // Footprint backstop: the pump exited cleanly under sustained memory pressure rather than
+        // riding into a jetsam kill; the session is dead (mirrors onVODSourceFailed above).
+        session.onProducerFatalError = { [weak self, weak session] err in
+            Task { @MainActor in
+                guard let self, let session, self.nativeVideoSession === session else {
+                    EngineLog.emit(
+                        "[AetherEngine] onProducerFatalError dropped: session superseded or deallocated",
+                        category: .session
+                    )
+                    return
+                }
+                self.state = .error(err.description)
+            }
+        }
         // prepareNativeSubtitles + non-bitmap text tracks: builds the native subtitle table; must be set before start().
         // Each text track becomes one WebVTT rendition served by HLSLocalServer (#15 / Sodalite#32, all-tracks; NOT
         // muxed into the A/V segments). Load-declared external tracks are already merged into subtitleTracks and join

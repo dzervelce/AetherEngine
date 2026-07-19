@@ -15,6 +15,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         case streamCreationFailed
         case copyParametersFailed(code: Int32)
         case writeHeaderFailed(code: Int32)
+        /// Sustained `phys_footprint` pressure never eased (or crossed the near-jetsam critical
+        /// line) while the pump was parked; see `awaitFootprintHeadroom`.
+        case memoryPressureAbort
 
         var description: String {
             switch self {
@@ -22,6 +25,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             case .streamCreationFailed:        return "HLSSegmentProducer: avformat_new_stream failed"
             case .copyParametersFailed(let c): return "HLSSegmentProducer: avcodec_parameters_copy failed (\(c))"
             case .writeHeaderFailed(let c):    return "HLSSegmentProducer: avformat_write_header failed (\(c))"
+            case .memoryPressureAbort:         return "HLSSegmentProducer: stopped under sustained memory pressure to avoid an out-of-memory kill"
             }
         }
     }
@@ -373,6 +377,174 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// never writes past the cache's forward edge (a drift is exactly what stalls AVPlayer).
     private let bufferAheadSegments: Int
 
+    // MARK: - Read-ahead gate + memory-pressure backstop
+    // Ported from fork commits 0c197dd/7e8fc70 (TrueHD/high-bitrate-remux OOM fix) onto upstream's
+    // #65 backpressure machinery below. `awaitBackpressureRelease` bounds production against
+    // AVPlayer's *requested* high-water (`cache.targetIndex`, request-driven — a thrashing/seeking
+    // player can walk it far ahead of real playback); neither it nor the #65 wedge detector bounds
+    // ABSOLUTE resident memory, which a very-high-per-segment-bitrate source (lossless TrueHD/DTS-HD
+    // remuxes) can balloon within an otherwise-normal window. The two backstops below are additive,
+    // not replacements.
+
+    /// Read-ahead gate: how many segments the producer may run ahead of the REAL playhead (clock),
+    /// independent of `bufferAheadSegments`/`awaitBackpressureRelease` above (which follows AVPlayer's
+    /// *requested* high-water, not its actual position). 12 ≈ 72 s at a 6 s segment duration; below the
+    /// observed OOM point on a high-bitrate remux, above normal prefetch so it never starves.
+    private static let playheadWindowSegments = 12
+
+    /// Real-playback playhead feed (absolute segment index), wired by the engine from the true
+    /// AVPlayer/playlist clock or an explicit-seek target — NEVER a request-driven or restart index
+    /// (`bufferAheadSegments` already tracks that). nil (until the engine wires it, and in tests/live)
+    /// makes `awaitPlayheadWithin` inert, matching this file's other nil-safe providers
+    /// (`wantsToPlayProvider` et al.): production stays bounded by the existing request-driven
+    /// backpressure alone until this is wired.
+    var playheadIndexProvider: (@Sendable () -> Int?)?
+
+    /// Pump-side wait: block once until producing `produced` is within `playheadWindowSegments` of
+    /// EITHER the real playhead OR `baseIndex` (the floor lets a freshly (re)started producer always
+    /// emit its `baseIndex … baseIndex+window` startup burst without deadlocking on a clock that still
+    /// lags a just-issued seek). One-shot contract like `cache.awaitFetchHighWater`: returns on the
+    /// first wake/timeout so the caller re-checks its own cancellation.
+    private func awaitPlayheadWithin(produced: Int, timeout: TimeInterval = 1.0) -> Bool {
+        guard let playhead = playheadIndexProvider?() else { return true }
+        if max(playhead, baseIndex) >= produced - Self.playheadWindowSegments { return true }
+        if checkShouldStop() { return false }
+        Thread.sleep(forTimeInterval: timeout)
+        let recheck = playheadIndexProvider?() ?? playhead
+        return max(recheck, baseIndex) >= produced - Self.playheadWindowSegments
+    }
+
+    /// Footprint-pressure backstop (the hard memory bound). Park the pump when the process's footprint
+    /// nears the tvOS jetsam limit; resume when it eases (see `awaitFootprintHeadroom`). Values for a
+    /// 4 GB Apple TV 4K (~2 GB per-app limit). AVPlayer's decode buffers live in a separate process
+    /// (`mediaserverd`), so the footprint bounded here is the engine's own (demuxer/AVIO/muxer).
+    private static let footprintHighWaterMB = 1500
+    private static let footprintLowWaterMB = 1200
+    private static let footprintCriticalMB = 1800             // ~jetsam edge → escalate
+    private static let footprintParkSliceUs: UInt32 = 250_000 // 250 ms re-poll cadence
+    private static let footprintEaseResumeMs: UInt64 = 3_000  // eased below HIGH → resume
+    private static let footprintAbortMs: UInt64 = 10_000      // never eases → clean abort
+
+    /// Pump-thread-only park state (no lock; touched solely by `runPumpLoop`/`awaitFootprintHeadroom`).
+    private var parked = false
+
+    /// Fires at most once if the pump aborts under sustained memory pressure (footprint stayed at/over
+    /// the high-water mark past the escalation budget, or hit the critical line); the pump exits right
+    /// after firing with `.memoryPressureAbort`. This is the AUTHORITATIVE signal for the abort (the
+    /// pump's own `PumpExitReason` surfaces it as a plain `.eof`, see `runPumpLoop`). The engine wires
+    /// this, generation+session-scoped, to an orderly teardown + `.error` state rather than risking a
+    /// jetsam kill (`ProducerError` conforms to `Error`, so the closure's payload can be surfaced or
+    /// wrapped as-is). Mirrors `onPumpFinished`/`onVideoShiftKnown` above.
+    var onFatalError: (@Sendable (ProducerError) -> Void)?
+
+    /// Current process physical footprint in MB (the tvOS jetsam metric), via `task_vm_info.phys_footprint`.
+    /// Cheap; polled at the park slice cadence. Returns nil if the mach call fails (caller treats nil as
+    /// "no pressure").
+    static func physFootprintMB() -> Int? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        return Int(info.phys_footprint / 1024 / 1024)
+    }
+
+    /// Footprint-pressure backstop. Blocks (cancel-aware) while the process footprint is over the
+    /// high-water mark, with hysteresis so it doesn't flap, a bounded "eased below HIGH → resume" path
+    /// so it never stalls forever, and a definite escalation (clean abort via `onFatalError`) if
+    /// pressure never eases or crosses the near-jetsam critical line. Returns `true` to keep producing,
+    /// `false` if the pump must exit.
+    ///
+    /// PARK-ONLY: pausing the pump idles the demuxer/AVIO/muxer — the anonymous allocators that drive
+    /// `phys_footprint` — which then drains on its own. It does NOT evict the cache (file-backed, wrong
+    /// bucket) nor tear down resources (would interrupt playback). It runs per packet-read, entirely
+    /// BEFORE `ensureMuxer`/`awaitBackpressureRelease` for the segment being produced, so it never
+    /// contends with those waits or with the #65 `BackpressureWedgeDetector` (which only evaluates once
+    /// per segment boundary inside `awaitBackpressureRelease`, and is simply never reached while parked
+    /// here — the read loop is stalled earlier, so `cache.targetIndex` freezing during a park is not
+    /// misread as a wedge).
+    private func awaitFootprintHeadroom() -> Bool {
+        if !parked {
+            guard let mb = Self.physFootprintMB(), mb >= Self.footprintHighWaterMB else { return true }
+            parked = true
+            EngineLog.emit(
+                "[HLSSegmentProducer] memory park: physFP=\(mb)MB >= \(Self.footprintHighWaterMB)MB high-water; pausing production",
+                category: .session
+            )
+        }
+        let parkStart = DispatchTime.now()
+        var easedBelowHighAt: DispatchTime?
+        func elapsedMs(since t: DispatchTime) -> UInt64 {
+            (DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1_000_000
+        }
+        while parked {
+            if checkShouldStop() { return false }
+            let mb = Self.physFootprintMB() ?? 0
+
+            if mb < Self.footprintLowWaterMB {
+                EngineLog.emit("[HLSSegmentProducer] memory park released: physFP=\(mb)MB < \(Self.footprintLowWaterMB)MB low-water", category: .session)
+                parked = false
+                return true
+            }
+            if mb < Self.footprintHighWaterMB {
+                // Eased below HIGH but not yet LOW: resume after a short grace so the pump always makes
+                // progress (no permanent stall). Safe — we're well under the jetsam limit here.
+                if easedBelowHighAt == nil { easedBelowHighAt = DispatchTime.now() }
+                else if elapsedMs(since: easedBelowHighAt!) >= Self.footprintEaseResumeMs {
+                    EngineLog.emit("[HLSSegmentProducer] memory park released: physFP=\(mb)MB eased below \(Self.footprintHighWaterMB)MB", category: .session)
+                    parked = false
+                    return true
+                }
+            } else {
+                easedBelowHighAt = nil
+            }
+            // Definite escalation: never eased within the abort budget, or hit the near-jetsam critical
+            // line → stop cleanly rather than hang or get OOM-killed.
+            if mb >= Self.footprintCriticalMB || elapsedMs(since: parkStart) >= Self.footprintAbortMs {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] memory-pressure ABORT: physFP=\(mb)MB after \(elapsedMs(since: parkStart))ms parked; stopping session",
+                    category: .session
+                )
+                onFatalError?(.memoryPressureAbort)
+                return false
+            }
+            usleep(Self.footprintParkSliceUs)
+        }
+        return true
+    }
+
+    /// TrueHD/MLP major-sync feed gate. The bridge decoder can't report stream parameters until it sees
+    /// a major-sync header (0xF8726FBA near the access-unit start); some sources don't carry one until
+    /// dozens of frames in at head-of-stream/after a seek, which floods decode failures and produces
+    /// nothing until it does. Derived LOCALLY from the source stream's codec id — NOT from `AudioBridge`
+    /// (whose `AudioConfig.codecpar` is the BRIDGE OUTPUT codec, e.g. FLAC, once bridged, not the source)
+    /// — so pre-sync packets can be discarded before ever reaching `bridge.feed`. TrueHD/MLP only; other
+    /// codecs (DTS, FLAC, …) are independently decodable per frame and must never be gated.
+    private static func audioSourceNeedsMajorSyncGate(
+        demuxer: Demuxer,
+        sideAudioDemuxer: Demuxer?,
+        audio: AudioConfig?
+    ) -> Bool {
+        guard let audio = audio, audio.bridge != nil else { return false }
+        let sourceDemuxer = sideAudioDemuxer ?? demuxer
+        guard let codecID = sourceDemuxer.stream(at: audio.sourceStreamIndex)?.pointee.codecpar.pointee.codec_id
+        else { return false }
+        return codecID == AV_CODEC_ID_TRUEHD || codecID == AV_CODEC_ID_MLP
+    }
+    private let bridgeNeedsMajorSyncGate: Bool
+    /// Latched once the major-sync signature has been seen for this producer's bridge session (or the
+    /// safety cap trips); gate goes silent for the remainder of the session/restart.
+    private var bridgeMajorSyncSeen = false
+    private var bridgeMajorSyncSkipped = 0
+    /// Bounds the discard so a source whose signature we can't fingerprint still plays (feeds ungated
+    /// past this many consecutive pre-sync packets).
+    private static let bridgeMajorSyncSkipCap = 256
+
     /// #65 stall diag: only log a park once it exceeds ~2 segment durations of zero playback progress, so normal
     /// backpressure (releases within one segment) stays silent and a real wedge surfaces its frozen tuple.
     private static let backpressureWedgeLogThresholdSeconds = 12
@@ -628,6 +800,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             framingIsAnnexB: a53NALFraming == .annexB)
         self.convertP7Active = video.convertP7ToProfile81
         self.audioConfig = audio
+        self.bridgeNeedsMajorSyncGate = Self.audioSourceNeedsMajorSyncGate(
+            demuxer: demuxer, sideAudioDemuxer: sideAudioDemuxer, audio: audio
+        )
         self.cache = cache
         self.baseIndex = baseIndex
         self.sourceVideoTimeBase = video.timeBase
@@ -958,6 +1133,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
             if !awaitBackpressureRelease(target: backpressureTarget, head: initialSegmentIndex, context: "alloc") { return nil }
         }
         if checkShouldStop() { return nil }
+        // Read-ahead gate: also cap distance ahead of the REAL playhead (see `awaitPlayheadWithin`).
+        // Unconditional (even when initialSegmentIndex == baseIndex, unlike the request-driven wait
+        // above): the `baseIndex` floor makes it a guaranteed no-op for the producer's own base
+        // segment, so it can never reintroduce the #93 first-alloc deadlock that guard exists to avoid.
+        while !checkShouldStop() {
+            if awaitPlayheadWithin(produced: initialSegmentIndex) { break }
+        }
+        if checkShouldStop() { return nil }
 
         var adPar: UnsafeMutablePointer<AVCodecParameters>?
         defer { if adPar != nil { avcodec_parameters_free(&adPar) } }
@@ -1101,6 +1284,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         currentMuxerSegmentIndex = newIdx
         let backpressureTarget = newIdx - bufferAheadSegments
         if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance") { return nil }
+        if checkShouldStop() { return nil }
+        // Read-ahead gate (see allocateMuxer): cap distance ahead of the real playhead, floored at
+        // baseIndex for deadlock-free startup bursts.
+        while !checkShouldStop() {
+            if awaitPlayheadWithin(produced: newIdx) { break }
+        }
         if checkShouldStop() { return nil }
 
         return muxer
@@ -1364,6 +1553,20 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 stateLock.unlock()
                 if stopRequested {
                     exitReason = .stopRequested
+                    break readLoop
+                }
+
+                // Footprint backstop: throttle the whole pump (read + mux) while the process footprint
+                // is over the high-water mark so it can't run resident memory into a jetsam kill.
+                // Returns false if the pump must exit — stop requested mid-park (labeled precisely so
+                // the VOD teardown-adopt check below discards the in-flight partial segment), or
+                // sustained pressure escalated to a clean abort. The abort itself is already reported
+                // via `onFatalError`, the engine's actual signal for it (no dedicated `PumpExitReason`
+                // case: that enum is switched exhaustively in `HLSVideoEngine+LiveReopen.swift`, outside
+                // this fix's scope — an abort here surfaces as the loop's still-default `.eof`, same as
+                // a natural end of stream, until that switch is extended).
+                if !awaitFootprintHeadroom() {
+                    if checkShouldStop() { exitReason = .stopRequested }
                     break readLoop
                 }
 
@@ -2292,6 +2495,44 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
                 if let audio = audioConfig, isAudioPkt {
                     if let bridge = audio.bridge {
+                        // TrueHD/MLP major-sync gate (see `bridgeNeedsMajorSyncGate`): discard pre-sync
+                        // packets instead of feeding them to a decoder that cannot yet report stream
+                        // parameters. No-op (skips the scan entirely) for every other bridged codec.
+                        if bridgeNeedsMajorSyncGate, !bridgeMajorSyncSeen {
+                            let sz = Int(packet.pointee.size)
+                            var hasMajorSync = false
+                            if let d = packet.pointee.data, sz >= 8 {
+                                let scan = min(sz - 3, 48)
+                                var i = 0
+                                while i < scan {
+                                    if d[i] == 0xF8, d[i + 1] == 0x72, d[i + 2] == 0x6F, d[i + 3] == 0xBA {
+                                        hasMajorSync = true
+                                        break
+                                    }
+                                    i += 1
+                                }
+                            }
+                            if hasMajorSync {
+                                bridgeMajorSyncSeen = true
+                                EngineLog.emit(
+                                    "[HLSSegmentProducer] audio bridge: major-sync reached after skipping "
+                                    + "\(bridgeMajorSyncSkipped) pre-sync pkt(s); feeding from here",
+                                    category: .session
+                                )
+                            } else {
+                                bridgeMajorSyncSkipped += 1
+                                if bridgeMajorSyncSkipped >= Self.bridgeMajorSyncSkipCap {
+                                    bridgeMajorSyncSeen = true   // safety: stop skipping, feed normally
+                                    EngineLog.emit(
+                                        "[HLSSegmentProducer] audio bridge: no major-sync in "
+                                        + "\(bridgeMajorSyncSkipped) pkts; feeding ungated (safety cap)",
+                                        category: .session
+                                    )
+                                } else {
+                                    continue   // discard this pre-sync packet (freed by the loop-top defer)
+                                }
+                            }
+                        }
                         let flacPackets: [UnsafeMutablePointer<AVPacket>]
                         do {
                             flacPackets = try bridge.feed(packet: packet)

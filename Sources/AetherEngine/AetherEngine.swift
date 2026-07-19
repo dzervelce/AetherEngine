@@ -515,6 +515,14 @@ public final class AetherEngine: ObservableObject {
     /// Programs AVDisplayManager.preferredDisplayCriteria from probed format + frame rate. No-op on iOS/macOS.
     let displayCriteria = DisplayCriteriaController()
 
+    /// Session memo for the plain-HDR panel pre-switch (`LoadOptions.suppressDisplayCriteria` hosts, see
+    /// `load()`): set once a pre-switch handshake has settled and the panel STILL ended in an SDR mode —
+    /// Match Dynamic Range is off (rate-only match-content users) or the panel refused. Skipping further
+    /// pre-switches for the rest of the process avoids paying a useless mode-switch blackout on every
+    /// play for a panel that will never accept the range switch. Cleared only on relaunch, so a settings
+    /// change picks up after a restart at worst.
+    private static var panelRefusedRangeSwitch = false
+
     /// Loopback HLS-fMP4 engine. Non-nil between load and stop.
     var nativeVideoSession: HLSVideoEngine?
     /// Thread-safe starvation inputs for session-coupled FrameExtractor yield closures
@@ -1599,6 +1607,11 @@ public final class AetherEngine: ObservableObject {
         var detectedDVProfile: Bool = false
         var detectedCodecID: AVCodecID = AV_CODEC_ID_NONE
         var detectedFieldOrder: AVFieldOrder = AV_FIELD_UNKNOWN
+        // What the HLS route will PRESENT to AVPlayer in the primary codec tag: a plain-HDR base
+        // (.hdr10/.hlg, incl. non-DV-panel-stripped DV), .sdr, or nil when the route signals DV
+        // directly (dvh1 primary). Drives the plain-HDR panel pre-switch below for suppressed-criteria
+        // (AVKit-sole-writer) hosts; see HLSVideoEngine.presentedPlainHDRBase.
+        var plainHDRPresentedBase: VideoFormat? = nil
         var probedAudioTracks: [TrackInfo] = []
         var probedSubtitleTracks: [TrackInfo] = []
         var probedDefaultAudioIndex: Int32 = -1
@@ -1646,6 +1659,11 @@ public final class AetherEngine: ObservableObject {
                 detectedFieldOrder = stream.pointee.codecpar.pointee.field_order
                 sourceVideoWidth = stream.pointee.codecpar.pointee.width
                 sourceVideoHeight = stream.pointee.codecpar.pointee.height
+                plainHDRPresentedBase = HLSVideoEngine.presentedPlainHDRBase(
+                    codecpar: stream.pointee.codecpar,
+                    codecID: detectedCodecID,
+                    effectiveDvMode: Self.displayCapabilities.supportsDolbyVision || options.keepDvh1TagWithoutDV
+                )
                 detectedVideoBitrate = probe.declaredBitrate(stream: stream)
                 lastDetectedVideoCodec = detectedCodecID
             }
@@ -1822,6 +1840,9 @@ public final class AetherEngine: ObservableObject {
         // starts a switch, so the post-load play-gate waitForSwitch() below has nothing to settle and would
         // otherwise burn its full ~3s cap on unobservable-DV panels. Skip it in exactly that case.
         var criteriaUnchanged = false
+        // Set when the plain-HDR pre-switch below actually ran; panelHDRAfterHandshake reads the fresh
+        // post-handshake headroom instead of the caller's pre-load snapshot in that case (2.5 below).
+        var ranPlainHDRPreflight = false
         switch Self.loadDisplayCriteriaAction(suppressDisplayCriteria: options.suppressDisplayCriteria, audioOnlyPath: false) {
         case .applyFresh:
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
@@ -1848,10 +1869,72 @@ public final class AetherEngine: ObservableObject {
                 criteriaUnchanged = true
             }
         case .clearStale:
-            // Suppressed host: the load seam preserved the criteria (#128 follow-up), and AVKit writes its
-            // own from the AVPlayerItem formatDescription later. Clear a leftover engine criteria now
-            // (didApply-gated no-op for hosts that always suppress) so the two writers can't fight.
-            displayCriteria.reset()
+            if let base = plainHDRPresentedBase, base != .sdr,
+               !options.panelIsInHDRMode,
+               !Self.panelRefusedRangeSwitch,
+               options.matchContentEnabled,
+               Self.displayCapabilities.supportsHDR {
+                // PLAIN-HDR PRE-SWITCH for suppressed-criteria (AVKit-sole-writer) hosts. Handing
+                // AVPlayer a VIDEO-RANGE=PQ/HLG master while the panel still sits in SDR loses a race
+                // INSIDE AVKit: with appliesPreferredDisplayCriteriaAutomatically it derives criteria
+                // from the manifest and starts the panel switch itself, but its variant filter evaluates
+                // against the CURRENT (still-SDR, mid-transition) display and rejects the item with
+                // -11868 a few hundred ms in — observed as HDR flipping on then off, a master->media
+                // retry reload, and a multi-second waitForSwitch spin on the reverted panel. Switching
+                // the panel BEFORE the asset exists — the engine's own pre-flight ordering above, run
+                // here for a suppressed host — is the only ordering that avoids the race.
+                //
+                // Scoped to sources presenting a plain HDR base (`presentedPlainHDRBase`, never dvh1
+                // primary): a DV-signaling master is untouched, since AVKit driving the SDR->DV switch
+                // itself from a `dvh1` track has no equivalent failure on record. `base` is never .sdr
+                // here (guarded above), so apply() always treats it as HDR and returns .willSwitch or
+                // .unchanged, never .applied. Rate-match-only users (combined tvOS flag): the panel
+                // honours only the refresh-rate dimension, the post-settle probe below reads SDR, and
+                // panelRefusedRangeSwitch stops paying this handshake again for the rest of the session.
+                ranPlainHDRPreflight = true
+                var wroteHDRCriteria = true
+                switch displayCriteria.apply(
+                    format: base,
+                    frameRate: snappedRate,
+                    codecTag: nil,
+                    omitColorExtensions: options.omitCriteriaColorExtensions
+                ) {
+                case .willSwitch:
+                    await displayCriteria.waitForSwitch()
+                    // Superseded during panel handshake: close local probe and unwind.
+                    if loadGeneration != gen {
+                        probe.markClosed()
+                        if probeOpened {
+                            Task.detached { [probe] in probe.close() }
+                        }
+                        try checkLoadCurrent(gen)
+                    }
+                case .unchanged:
+                    break
+                case .applied:
+                    wroteHDRCriteria = false
+                }
+                if wroteHDRCriteria, !displayCriteria.currentPanelIsHDR() {
+                    Self.panelRefusedRangeSwitch = true
+                    EngineLog.emit(
+                        "[AetherEngine] plain-HDR pre-switch did not yield an HDR panel mode; "
+                        + "skipping pre-switches for the rest of this session",
+                        category: .engine
+                    )
+                }
+                // AVKit owns the criteria lifecycle from here: it re-derives criteria from the master on
+                // every load and restores the panel at dismissal. Relinquish reset ownership so a later
+                // suppressed-host load's .clearStale (load() never resets criteria at the top, #128
+                // follow-up) can't nil-write this criteria and blink the panel before immediately
+                // re-negotiating the same mode.
+                displayCriteria.handOffToAVKit()
+            } else {
+                // Suppressed host, no (or already-settled/refused) plain-HDR pre-switch: the load seam
+                // preserved the criteria (#128 follow-up), and AVKit writes its own from the
+                // AVPlayerItem formatDescription later. Clear a leftover engine criteria now
+                // (didApply-gated no-op for hosts that always suppress) so the two writers can't fight.
+                displayCriteria.reset()
+            }
         }
 
         // 2.5. Post-handshake panel-mode snapshot.
@@ -1865,10 +1948,16 @@ public final class AetherEngine: ObservableObject {
         //      and HLSVideoEngine master-vs-media routing so they stay in step.
         //
         //      Suppressed-criteria hosts fall back to the caller's pre-load panelIsInHDRMode snapshot
-        //      (AVKit fires criteria later from the AVPlayerItem formatDescription).
+        //      (AVKit fires criteria later from the AVPlayerItem formatDescription) — UNLESS the
+        //      plain-HDR pre-switch above ran, in which case the post-handshake headroom read is
+        //      authoritative (that's the whole point of the pre-switch: have the panel's true mode in
+        //      hand, via `resolveUseMasterPlaylist`'s panel-empirical routing, before AVPlayer ever
+        //      sees the master).
         let panelHDRAfterHandshake: Bool
         if options.suppressDisplayCriteria {
-            panelHDRAfterHandshake = options.panelIsInHDRMode
+            panelHDRAfterHandshake = ranPlainHDRPreflight
+                ? displayCriteria.currentPanelIsHDR()
+                : options.panelIsInHDRMode
         } else {
             panelHDRAfterHandshake = displayCriteria.currentPanelIsHDR()
         }

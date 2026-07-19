@@ -81,4 +81,14 @@ struct AudioLanguageSelectionTests {
         #expect(AetherEngine.selectAudioIndex(
             tracks: tracks, override: nil, preferredLanguages: ["ja"]) == 0)
     }
+
+    @Test("within a matching language, the best-quality codec wins over container order")
+    func qualityTiebreak() {
+        let tracks = [
+            TrackInfo(id: 0, name: "a0", codec: "aac", language: "en", channels: 2, isDefault: false),
+            TrackInfo(id: 1, name: "a1", codec: "truehd", language: "en", channels: 8, isDefault: false)
+        ]
+        #expect(AetherEngine.selectAudioIndex(
+            tracks: tracks, override: nil, preferredLanguages: ["en"]) == 1)
+    }
 }

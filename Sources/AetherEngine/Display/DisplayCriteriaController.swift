@@ -189,8 +189,8 @@ final class DisplayCriteriaController {
 
         // Fast exit: panel already in HDR (headroom already raised, e.g. a prior
         // HDR/DV session left it there).
-        if screen.currentEDRHeadroom > 1.001 {
-            EngineLog.emit("[DisplayCriteria] no switch needed (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)) at entry)", category: .engine)
+        if Self.panelModeIsHDR(screen) {
+            EngineLog.emit("[DisplayCriteria] no switch needed (\(Self.headroomDescription(screen)) at entry)", category: .engine)
             return
         }
 
@@ -220,8 +220,8 @@ final class DisplayCriteriaController {
         // AVPlayer error on DV Profile 8.1.
         var sawSwitchStart = false
         for _ in 0..<100 {
-            if switchEnded.fired || screen.currentEDRHeadroom > 1.001 {
-                EngineLog.emit("[DisplayCriteria] settled during start phase (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
+            if switchEnded.fired || Self.panelModeIsHDR(screen) {
+                EngineLog.emit("[DisplayCriteria] settled during start phase (\(Self.headroomDescription(screen)))", category: .engine)
                 return
             }
             if switchStarted.fired || displayManager.isDisplayModeSwitchInProgress {
@@ -233,7 +233,7 @@ final class DisplayCriteriaController {
         if !sawSwitchStart {
             // No switch started within 1000ms: panel already satisfies the criteria
             // or the setter was a no-op. Don't block; AVPlayer tonemaps or errors for real.
-            EngineLog.emit("[DisplayCriteria] no switch started (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)) after 1000ms); proceeding", category: .engine)
+            EngineLog.emit("[DisplayCriteria] no switch started (\(Self.headroomDescription(screen)) after 1000ms); proceeding", category: .engine)
             return
         }
 
@@ -250,33 +250,50 @@ final class DisplayCriteriaController {
                 EngineLog.emit("[DisplayCriteria] switch settled via modeSwitchEnd (~\(elapsed)ms)", category: .engine)
                 return
             }
-            if screen.currentEDRHeadroom > 1.001 {
-                EngineLog.emit("[DisplayCriteria] switch settled via EDR (~\(elapsed)ms, headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
+            if Self.panelModeIsHDR(screen) {
+                EngineLog.emit("[DisplayCriteria] switch settled via EDR (~\(elapsed)ms, \(Self.headroomDescription(screen)))", category: .engine)
                 return
             }
             if !displayManager.isDisplayModeSwitchInProgress {
-                // Headroom is still 1.0 here (the EDR check above runs first each tick).
+                // Headroom is still SDR-range here (the EDR check above runs first each tick).
                 if didApply && !lastCriteriaWasHDR {
                     // SDR rate-only criteria: refresh-rate switch settled, panel correctly stayed SDR.
-                    EngineLog.emit("[DisplayCriteria] rate-only switch settled (~\(elapsed)ms, SDR, EDR headroom 1.0 as expected)", category: .engine)
+                    EngineLog.emit("[DisplayCriteria] rate-only switch settled (~\(elapsed)ms, SDR, \(Self.headroomDescription(screen)) as expected)", category: .engine)
                 } else {
                     // HDR was requested but panel ended in SDR: real dynamic-range handshake failure.
-                    EngineLog.emit("[DisplayCriteria] WARN switch ended (~\(elapsed)ms) but EDR headroom still 1.0 (panel stayed SDR despite HDR criteria)", category: .engine)
+                    EngineLog.emit("[DisplayCriteria] WARN switch ended (~\(elapsed)ms) but panel mode still SDR (\(Self.headroomDescription(screen)))", category: .engine)
                 }
                 return
             }
         }
-        EngineLog.emit("[DisplayCriteria] proceed after ~\(capTicks * 50 + 1000)ms cap (switch not observable, likely DV; EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
+        EngineLog.emit("[DisplayCriteria] proceed after ~\(capTicks * 50 + 1000)ms cap (switch not observable, likely DV; \(Self.headroomDescription(screen)))", category: .engine)
         #endif
     }
 
-    /// True when UIScreen.currentEDRHeadroom > 1.001 after apply() + waitForSwitch() settle. Reading headroom post-settle is the only authoritative way to distinguish Match Dynamic Range ON vs. rate-only (no public per-sub-toggle API).
+    /// True when the panel's ACTIVE MODE is HDR after apply() + waitForSwitch() settle. Reading this post-settle is the only authoritative way to distinguish Match Dynamic Range ON vs. rate-only (no public per-sub-toggle API).
     func currentPanelIsHDR() -> Bool {
         #if os(tvOS)
         guard let window = resolveWindow() else { return false }
-        return window.screen.currentEDRHeadroom > 1.001
+        return Self.panelModeIsHDR(window.screen)
         #else
         return false
+        #endif
+    }
+
+    /// Relinquish reset ownership after a criteria write whose lifecycle AVKit then adopts (the
+    /// plain-HDR pre-switch for `LoadOptions.suppressDisplayCriteria` hosts, AetherEngine.load): clears
+    /// `didApply`/`lastApplied` exactly like `reset()` but WITHOUT writing nil to the panel. AVKit
+    /// re-derives its own criteria from every master it loads afterward and restores the panel at
+    /// dismissal, so it does not depend on the engine's write surviving. Without this hand-off, `load()`
+    /// never resets criteria at the top of a reload (#128 follow-up) but DOES evaluate
+    /// `loadDisplayCriteriaAction` fresh every time — the next suppressed-host load's `.clearStale` would
+    /// see `didApply == true` from this session's pre-switch and fire a real `reset()`, nil-writing the
+    /// criteria and blinking the panel out of the mode AVKit now owns before immediately re-negotiating
+    /// the same mode.
+    func handOffToAVKit() {
+        #if os(tvOS)
+        didApply = false
+        lastApplied = nil
         #endif
     }
 
@@ -295,6 +312,24 @@ final class DisplayCriteriaController {
         EngineLog.emit("[DisplayCriteria] RESET", category: .engine)
         #endif
     }
+
+    // MARK: - Panel-mode probe
+
+    #if os(tvOS)
+    /// Whether the panel's ACTIVE MODE is an HDR mode. `currentEDRHeadroom` alone is NOT sufficient: it
+    /// is content-dependent and can read 1.0 in a genuine HDR display mode until EDR pixels actually
+    /// render (a settled HDR switch can still read 1.0 while only SDR chrome is on screen, which would
+    /// misclassify a successful switch as "panel stayed SDR" and, for a caller routing on the result,
+    /// undo the switch it just paid for). `potentialEDRHeadroom` reflects what the CURRENT MODE can
+    /// present (1.0 only in an actual SDR mode); trust either signal.
+    static func panelModeIsHDR(_ screen: UIScreen) -> Bool {
+        screen.currentEDRHeadroom > 1.001 || screen.potentialEDRHeadroom > 1.001
+    }
+
+    private static func headroomDescription(_ screen: UIScreen) -> String {
+        String(format: "EDR headroom cur=%.2f pot=%.2f", screen.currentEDRHeadroom, screen.potentialEDRHeadroom)
+    }
+    #endif
 
     // MARK: - Window resolution
 

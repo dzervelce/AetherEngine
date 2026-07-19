@@ -301,13 +301,39 @@ extension AetherEngine {
             return override
         }
         // Each preference is scanned across all tracks in order, so an earlier preference on a later
-        // track still beats a later preference on an earlier track.
+        // track still beats a later preference on an earlier track. Within a preference, the best-quality
+        // match wins (see `audioPickScore`), not just the first one in container order.
         for preferred in preferredLanguages {
-            if let match = tracks.first(where: { languageMatches($0.language, preferred) }) {
-                return Int32(match.id)
+            let matches = tracks.filter { languageMatches($0.language, preferred) }
+            // max(by:) keeps the first element on a tie, so equal-score ties keep container order.
+            if let best = matches.max(by: { audioPickScore($0) < audioPickScore($1) }) {
+                return Int32(best.id)
             }
         }
         return nil
+    }
+
+    /// Codec quality rank for `audioPickScore`: lossless (TrueHD/MLP, FLAC) > DTS (covers DTS-HD
+    /// profiles, which FFmpeg does not distinguish from core DTS by codec name alone) > EAC3 > AC3 >
+    /// Opus > AAC > everything else.
+    nonisolated static func audioCodecRank(_ codec: String) -> Int {
+        switch codec.lowercased() {
+        case "truehd", "mlp": return 9
+        case "flac": return 8
+        case "dts": return 7
+        case "eac3": return 6
+        case "ac3": return 5
+        case "opus": return 4
+        case "aac": return 3
+        default: return 1
+        }
+    }
+
+    /// Quality score used by `selectAudioIndex` to pick the best track among several matching the same
+    /// preferred language. `audioCodecRank` dominates; an Atmos flag and channel count are tiebreakers
+    /// WITHIN a codec rank, so lossless always beats lossy Atmos.
+    nonisolated static func audioPickScore(_ track: TrackInfo) -> Int {
+        audioCodecRank(track.codec) * 10_000 + (track.isAtmos ? 1_000 : 0) + track.channels
     }
 
     /// Resolve the subtitle track to auto-activate from `LoadOptions.preferredSubtitleLanguages`: within the

@@ -413,6 +413,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// written, empty cache). The playlist exists but no segment will ever land, so AVPlayer
     /// would sit in waitingToPlay forever; the engine surfaces a fatal error instead.
     var onVODSourceFailed: (@Sendable (Int32) -> Void)?
+    /// Footprint backstop: the pump aborted CLEANLY under sustained memory pressure instead of
+    /// riding the process into a jetsam kill (see `HLSSegmentProducer.onFatalError`). The session
+    /// is dead; AetherEngine surfaces it as a fatal `.error` like `onVODSourceFailed`.
+    var onProducerFatalError: (@Sendable (HLSSegmentProducer.ProducerError) -> Void)?
     /// Session-long FLAC bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
     var audioBridge: AudioBridge?
@@ -804,9 +808,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
 
         // 6. Reset demuxer cursor to 0 (cue prewarm moved it mid-file). Skipped for live
-        //    (no prewarm, forward-only feed).
+        //    (no prewarm, forward-only feed). snapEarlier: an uncapped max_ts can land the
+        //    head seek PAST the first TrueHD/MLP major-sync access unit on matroska (~10 s of
+        //    discarded audio frames + AVPlayer thrash-fetch).
         if !isLiveSession {
-            dem.seek(to: 0)
+            dem.seek(to: 0, snapEarlier: true)
         }
 
         // volumeAvailableCapacityForImportantUsage is unavailable on tvOS; the plain capacity key
@@ -1223,7 +1229,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         if initialProducerBaseIndex > 0, initialProducerBaseIndex < plan.count {
             let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
             let anchorSeconds = Double(plan[initialProducerBaseIndex].startPts) * Double(tb.num) / Double(tb.den)
-            dem.seek(to: anchorSeconds)
+            // snapEarlier: the gate only DROPS pre-target packets, so landing at-or-before is free;
+            // landing past the anchor loses packets from the target segment's cut.
+            dem.seek(to: anchorSeconds, snapEarlier: true)
         }
         prod.start()
 
@@ -1320,6 +1328,64 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let routingSafeForMaster = (videoRange == .sdr) || panelReadyForHDR
         if hasNativeSubs && routingSafeForMaster { return true }
         return sourceIsHDR && panelReadyForHDR
+    }
+
+    /// Probe-time classification of the plain-HDR base a source's route will PRESENT to AVPlayer in the
+    /// PRIMARY codec tag — `.hdr10`/`.hlg` for a `hvc1`/`avc1` track carrying PQ/HLG, `.sdr` for none, or
+    /// nil when the route signals Dolby Vision directly (`dvh1` primary). Drives AetherEngine.load's
+    /// plain-HDR panel pre-switch for `LoadOptions.suppressDisplayCriteria` (AVKit-sole-writer) hosts:
+    /// those hosts get zero engine display-criteria writes by default, which is correct for a
+    /// DV-signaling master (AVKit drives the SDR->DV switch itself from the `dvh1` track) but wrong for a
+    /// plain-HDR master — AVKit's variant filter races its own SDR->HDR switch there and can reject the
+    /// item (-11868) if AVPlayer sees the master before the panel is already in an HDR mode, so those
+    /// sources need the panel switched BEFORE the asset exists.
+    ///
+    /// Mirrors `CodecRoutePolicy.resolveCodecRoute`'s primary-codec-tag decision, which is `dvh1` only for
+    /// HEVC Profile 5 (always DV-only, no base layer) and Profile 8.1 on a DV-capable device
+    /// (`effectiveDvMode`); every other DV profile (7, 8.2, 8.4) and every non-DV HDR10/HLG/SDR source
+    /// route `hvc1`/`avc1` primary regardless of panel state, so their manifest VIDEO-RANGE is what AVKit
+    /// derives its switch criteria from. AV1 is out of scope: tvOS never native-decodes it (software path
+    /// only), which never touches AVKit's display-criteria lifecycle, so it always reports `.sdr` here
+    /// (no pre-switch attempted). Keep in sync with `CodecRoutePolicy.classifyDVVariant` /
+    /// `resolveCodecRoute` if HEVC DV routing changes.
+    static func presentedPlainHDRBase(
+        codecpar: UnsafePointer<AVCodecParameters>,
+        codecID: AVCodecID,
+        effectiveDvMode: Bool
+    ) -> VideoFormat? {
+        guard codecID != AV_CODEC_ID_AV1 else { return .sdr }
+        let plainBase: VideoFormat
+        switch codecpar.pointee.color_trc {
+        case AVCOL_TRC_SMPTE2084:    plainBase = .hdr10
+        case AVCOL_TRC_ARIB_STD_B67: plainBase = .hlg
+        default:                     plainBase = .sdr
+        }
+        guard codecID == AV_CODEC_ID_HEVC,
+              let record = Self.doviConfigRecordForPreflight(codecpar: codecpar) else {
+            return plainBase
+        }
+        let profile = Int(record.dv_profile)
+        let compat = Int(record.dv_bl_signal_compatibility_id)
+        if profile == 5 { return nil }                               // always dvh1 primary
+        if profile == 8, compat == 1, effectiveDvMode { return nil }  // P8.1 direct DV on a DV panel
+        return plainBase                                              // 7, 8.2, 8.4, non-DV P8.1, HDR10/HLG/SDR
+    }
+
+    /// Standalone DOVIDecoderConfigurationRecord read for `presentedPlainHDRBase`, which runs before an
+    /// `HLSVideoEngine` instance exists (AetherEngine.load's probe stage, ahead of `loadNative`) and so
+    /// cannot call `CodecRoutePolicy`'s instance-scoped `doviConfigRecord(from:)`.
+    private static func doviConfigRecordForPreflight(
+        codecpar: UnsafePointer<AVCodecParameters>
+    ) -> AVDOVIDecoderConfigurationRecord? {
+        let count = Int(codecpar.pointee.nb_coded_side_data)
+        guard count > 0, let sideData = codecpar.pointee.coded_side_data else { return nil }
+        for i in 0..<count {
+            let item = sideData.advanced(by: i).pointee
+            guard item.type == AV_PKT_DATA_DOVI_CONF else { continue }
+            guard let raw = item.data, item.size >= 8 else { continue }
+            return raw.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { $0.pointee }
+        }
+        return nil
     }
 
     /// `true` when `start()` chose the master playlist (HDR/DV signaling). Read after `start()`.
@@ -1629,6 +1695,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #93 retest: the rendered clock feeds the wedge detector's fast path (park + both signals
         // frozen -> single-digit detection). Threaded onto every producer like the play-intent guard.
         prod.playbackPositionProvider = currentPlaybackPositionProvider
+        // Read-ahead cap: absolute plan index of the rendered playhead (the gate's baseIndex floor
+        // covers a clock that still lags a just-issued seek — the restart re-bases the floor).
+        // VOD only: a live pump paces at the edge already, and DVR rebases skew the time axis.
+        // segmentIndexForPlaylistTime takes restartLock briefly; safe from the pump thread because
+        // restartLock is never held across waits (see its declaration).
+        if !isLiveSession {
+            prod.playheadIndexProvider = { [weak self] in
+                guard let self, let pos = self.currentPlaybackPositionProvider?() else { return nil }
+                return self.segmentIndexForPlaylistTime(pos)
+            }
+        }
+        // Footprint backstop: a clean memory-pressure abort is session-fatal — forward it out so
+        // the host gets a real error instead of a silent stall.
+        prod.onFatalError = { [weak self] err in
+            self?.onProducerFatalError?(err)
+        }
         // #35/#93 cold-startup: suspend the wedge detector until the first frame lands (pre-roll of a
         // slow high-bitrate DV master must not be misread as a wedge). Threaded onto every producer.
         prod.hasStartedRenderingProvider = hasStartedRenderingProvider
@@ -1876,7 +1958,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Seek outside restartLock (network-bound). Concurrent stop() calls markClosed() so the
         // seek fails fast instead of racing teardown.
         let seekStart = DispatchTime.now()
-        activeDem.seek(to: absoluteTargetSeconds)
+        // snapEarlier: same contract as the anchored initial seek — the pump's gate drops
+        // pre-target packets, while landing past the target breaks the restart segment's cut.
+        activeDem.seek(to: absoluteTargetSeconds, snapEarlier: true)
         // Re-arm bridge PTS rebase so the encoder timeline starts from the new demuxer cursor.
         ab?.startSegment()
         seekMs = msSince(seekStart)

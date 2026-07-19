@@ -263,10 +263,13 @@ struct SubtitlePumpTapTests {
 @Suite("ASS markup strip for the WebVTT rendition")
 struct ASSMarkupStripTests {
 
-    @Test("A raw ASS event line strips to plain text")
+    @Test("A raw ASS event line strips overrides, keeping inline style as tags")
     func rawEventStrips() {
+        // Inline italic/bold/underline overrides survive as <i>/<b>/<u> — the host overlay renders
+        // them, and WebVTT cue text supports the same tags natively. All other override blocks
+        // (positioning, colors, …) are stripped as before.
         let line = "1,0,Default,,0,0,0,,{\\i1}Hello{\\i0}\\NWorld, nice"
-        #expect(SubtitleRectText.plainText(fromASSEventLine: line) == "Hello\nWorld, nice")
+        #expect(SubtitleRectText.plainText(fromASSEventLine: line) == "<i>Hello</i>\nWorld, nice")
     }
 
     @Test("A non-event line passes through with tag cleaning only")

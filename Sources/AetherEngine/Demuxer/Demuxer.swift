@@ -904,13 +904,24 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     /// Seek via avformat_seek_file (not av_seek_frame: assertion failures
-    /// in matroskadec.c with nested elements).
-    func seek(to seconds: Double) {
+    /// in matroskadec.c with nested elements). Returns the seek result (>= 0 on
+    /// success, negative AVERROR on failure) for callers that must confirm a
+    /// mandatory reposition.
+    ///
+    /// `snapEarlier`: direction is expressed via the `[min_ts, max_ts]` window, not
+    /// `AVSEEK_FLAG_BACKWARD` (ignored by avformat_seek_file). When true, caps
+    /// `max_ts` at the target so the demuxer lands at-or-before it instead of at the
+    /// next cluster boundary after it — matters for the head-of-stream reset, where
+    /// landing past the first TrueHD/MLP access unit skips its major-sync header and
+    /// the decoder drops frames until the next one.
+    @discardableResult
+    func seek(to seconds: Double, snapEarlier: Bool = false) -> Int32 {
         accessLock.lock()
         defer { accessLock.unlock() }
-        guard let ctx = formatContext else { return }
+        guard let ctx = formatContext else { return -1 }
         let timestamp = Int64(seconds * Double(AV_TIME_BASE))
-        let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
+        let maxTs = snapEarlier ? timestamp : Int64.max
+        let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, maxTs, 0)
         if ret < 0 {
             #if DEBUG
             EngineLog.emit("[Demuxer] Seek to \(seconds)s failed: \(ret)", category: .demux)
@@ -918,6 +929,7 @@ public final class Demuxer: @unchecked Sendable {
         }
         avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
+        return ret
     }
 
     /// #112 round 10: latched by the side reader once a timestamp positioning seek timed out or failed on this
@@ -1190,8 +1202,21 @@ public final class Demuxer: @unchecked Sendable {
     }
 }
 
-enum DemuxerError: Error {
+enum DemuxerError: Error, LocalizedError {
     case openFailed(code: Int32)
     case streamInfoFailed(code: Int32)
     case readFailed(code: Int32)
+
+    /// Hosts surface `error.localizedDescription` directly in their error UI; without
+    /// this it reads "(AetherEngine.DemuxerError error 0.)".
+    var errorDescription: String? {
+        switch self {
+        case .openFailed(let code):
+            "Could not open the stream — the source did not deliver readable data (network error or dead link; FFmpeg \(code))"
+        case .streamInfoFailed(let code):
+            "Could not read stream info from the source (FFmpeg \(code))"
+        case .readFailed(let code):
+            "Reading from the source failed mid-stream (FFmpeg \(code))"
+        }
+    }
 }

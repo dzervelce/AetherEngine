@@ -187,8 +187,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private static let connStallTimeout: TimeInterval = 20
     // A reconnect that delivers at least this much counts as progress; resets streak.
     private static let minReconnectProgress: Int64 = 512 * 1024
-    // Cap on CONSECUTIVE unproductive reconnects; resets on real progress.
-    private static let reconnectMaxUnproductive = 12
+    // Give up after this many CONSECUTIVE unproductive reconnects against a PERMANENT
+    // failure (404/410 — a genuinely gone resource) on a source that has delivered data
+    // before. Small: these won't recover, so don't hammer the origin.
+    private static let permanentMaxUnproductive = 3
+    // For TRANSIENT failures (request timeout, socket stall, signed-URL expiry, 5xx,
+    // connection drop) on a source that has delivered data before, keep reconnecting with
+    // backoff and only give up after this long with ZERO progress. Debrid CDNs (Real-Debrid
+    // observed) time out under heavy range-seeking and recover shortly after; a fixed
+    // reconnect count gave up while the CDN was already back, freezing playback for
+    // minutes with nothing left to restart it. Bounded so a truly dead link still surfaces
+    // an error eventually.
+    private static let transientGiveUpSeconds: TimeInterval = 180
 
     // MARK: - Detour Block Cache (random-access parse reads; AetherEngine#69)
 
@@ -252,6 +262,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var connFirstDataSeen = false
     // Consecutive unproductive reconnects (demux-thread-only).
     private var unproductiveReconnects = 0
+    // Wall-clock start of the current no-progress streak (nil when making progress);
+    // bounds transient-failure retrying by time rather than just reconnect count.
+    // Demux-thread-only.
+    private var unproductiveSince: Date?
     private var bytesAtLastReconnect: Int64 = 0
     // Consecutive 429/503 attempts; survives seekReconnect, resets on real read progress (#71).
     private var rateLimitStreak = 0
@@ -1049,13 +1063,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     /// Increments the unproductive-reconnect streak (resets if progress exceeded
-    /// `minReconnectProgress`). Returns true when the cap is hit. Demux-thread-only.
+    /// `minReconnectProgress`). Returns true once the source should be given up on.
+    /// Demux-thread-only.
     private func recordReconnectAndShouldGiveUp(status: Int = 0) -> Bool {
         let now = cumulativeBytesFetched
         if now - bytesAtLastReconnect >= Self.minReconnectProgress {
             unproductiveReconnects = 0
+            unproductiveSince = nil
         } else {
             unproductiveReconnects += 1
+            if unproductiveSince == nil { unproductiveSince = Date() }
         }
         bytesAtLastReconnect = now
         // Hard 4xx/5xx (not 429/503 which carry Retry-After) on a source that has
@@ -1065,12 +1082,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if now == 0 && isHardError {
             return unproductiveReconnects > 1
         }
-        // Dead-on-arrival sources (never produced data) get a reduced budget;
-        // sources that ever produced data keep the full budget for mid-stream resilience.
-        let cap = now == 0
-            ? Self.reconnectMaxUnproductiveNeverProductive
-            : Self.reconnectMaxUnproductive
-        return unproductiveReconnects > cap
+        if now == 0 {
+            // Dead-on-arrival sources (never produced data) get a reduced budget.
+            return unproductiveReconnects > Self.reconnectMaxUnproductiveNeverProductive
+        }
+        // Source has delivered data before. 404/410 are permanent (the resource is
+        // genuinely gone) — give up quickly. Everything else (request timeout, socket
+        // stall, signed-URL expiry, 5xx, connection drop) is TRANSIENT: retry with
+        // backoff for as long as `transientGiveUpSeconds` of zero progress instead of a
+        // fixed reconnect count, so playback auto-resumes the moment the CDN responds
+        // again rather than freezing early.
+        if Self.isPermanentStatus(status) {
+            return unproductiveReconnects > Self.permanentMaxUnproductive
+        }
+        let stalledFor = unproductiveSince.map { Date().timeIntervalSince($0) } ?? 0
+        return stalledFor > Self.transientGiveUpSeconds
+    }
+
+    /// HTTP statuses that mean the resource is permanently gone (vs a transient
+    /// timeout / rate-limit / expiry the reader should retry through). `status` is 0
+    /// for a socket stall or connection drop with no HTTP response, which is transient.
+    private static func isPermanentStatus(_ status: Int) -> Bool {
+        status == 404 || status == 410
     }
 
     // 4 attempts ride out a transient transcode spin-up (~10-15s with backoff)
@@ -1164,7 +1197,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         request.timeoutInterval = budget
         applyExtraHeaders(&request)
         do {
-            let (data, response) = try syncRequest(request, budget: budget)
+            // Cap the body at the requested block size — a server that ignores Range
+            // must not drive reserveCapacity toward the full file (see ChunkFetchDelegate).
+            let (data, response) = try syncRequest(request, budget: budget, maxBodyBytes: size)
             if let http = response as? HTTPURLResponse {
                 let status = http.statusCode
                 if status == 429 || status == 503 {
@@ -1771,7 +1806,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         do {
             // Honour the still budget here too so the open-time HEAD fallback can't
             // ride the default 35s on a stalled origin during a cold/reopen scrub (#27).
-            let (_, response) = try syncRequest(request, budget: chunkRequestTimeout)
+            // HEAD has no body; the announced Content-Length is the FULL file size and must
+            // never drive allocation (it crashed exactly there — see ChunkFetchDelegate cap).
+            let (_, response) = try syncRequest(request, budget: chunkRequestTimeout, maxBodyBytes: 1 << 20)
             guard let http = response as? HTTPURLResponse,
                   (200...299).contains(http.statusCode) else {
                 EngineLog.emit("[AVIOReader] HEAD failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1))", category: .demux, level: .verbose)
@@ -1812,7 +1849,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var lastError: Error?
         for attempt in 0..<chunkMaxRetries {
             do {
-                let (data, response) = try syncRequest(request, budget: chunkRequestTimeout)
+                // Cap the body at the requested range size — a server that ignores Range
+                // must not drive reserveCapacity toward the full file (see ChunkFetchDelegate).
+                let (data, response) = try syncRequest(request, budget: chunkRequestTimeout, maxBodyBytes: size)
                 if let http = response as? HTTPURLResponse {
                     let status = http.statusCode
                     if status != 200 && status != 206 {
@@ -1838,6 +1877,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // bail at once instead of retrying into the abort (issue #27).
                 if isClosed || isPastReadDeadline { return nil }
                 lastError = error
+                // A server that ignores Range (full-file 200) won't change its mind on a
+                // retry — bail so fetchChunk's source-URL fallback (or a clean read error)
+                // runs instead of burning the backoff.
+                if case AVIOReaderError.oversizeResponse = error { break }
                 if attempt < chunkMaxRetries - 1 {
                     Thread.sleep(forTimeInterval: Double(1 << attempt) * 0.5)
                 }
@@ -1884,8 +1927,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
-    private func syncRequest(_ request: URLRequest, budget: TimeInterval = 35) throws -> (Data, URLResponse) {
-        let delegate = ChunkFetchDelegate(extraHeaders: extraHeaders)
+    private func syncRequest(
+        _ request: URLRequest,
+        budget: TimeInterval = 35,
+        maxBodyBytes: Int
+    ) throws -> (Data, URLResponse) {
+        let delegate = ChunkFetchDelegate(extraHeaders: extraHeaders, maxBodyBytes: maxBodyBytes)
         let task = Self.chunkSession.dataTask(with: request)
         task.delegate = delegate
 
@@ -2074,14 +2121,23 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
 /// via semaphore ensures no concurrent access to mutable fields.
 private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     let extraHeaders: [String: String]
+    /// Hard ceiling on the buffered body. A server that ignores `Range` and answers a small
+    /// chunk request with the whole multi-GB file — or a HEAD response, whose Content-Length
+    /// describes the full file with no body following — must NEVER drive allocation:
+    /// `reserveCapacity(expectedContentLength)` on tens of GB is an instant allocation-failure
+    /// trap (EXC_BREAKPOINT), and buffering would march to jetsam anyway. Reserve is clamped to
+    /// this cap and any bytes beyond it cancel the task with `.oversizeResponse`, so the fetch
+    /// fails cleanly and the caller's retry/fallback path runs.
+    let maxBodyBytes: Int
     var body = Data()
     var response: URLResponse?
     var error: Error?
     var onCompletion: (() -> Void)?
     var onResolved: ((URL) -> Void)?
 
-    init(extraHeaders: [String: String]) {
+    init(extraHeaders: [String: String], maxBodyBytes: Int) {
         self.extraHeaders = extraHeaders
+        self.maxBodyBytes = maxBodyBytes
     }
 
     func urlSession(
@@ -2104,7 +2160,9 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         self.response = response
         if let http = response as? HTTPURLResponse {
             let len = Int(http.expectedContentLength)
-            if len > 0 { body.reserveCapacity(len) }
+            // CLAMPED to maxBodyBytes — see the property doc; the announced length is
+            // untrusted input (full-file 200s, HEAD responses).
+            if len > 0 { body.reserveCapacity(min(len, maxBodyBytes)) }
             let status = http.statusCode
             if status == 200 || status == 206,
                let resolved = dataTask.currentRequest?.url {
@@ -2119,10 +2177,20 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         dataTask: URLSessionDataTask,
         didReceive data: Data
     ) {
-        // Force-copy: body.append(data) may retain source dispatch_data via CoW,
-        // defeating the per-delivery release. Manual memcpy guarantees drop on return.
         let count = data.count
         let baseCount = body.count
+        // Cap enforcement (belt-and-braces for chunked/no-length responses too): a response
+        // streaming past the expected body is a misbehaving server — cancel instead of
+        // buffering toward jetsam. The cancel's NSURLErrorCancelled must not mask this error.
+        guard baseCount + count <= maxBodyBytes else {
+            if error == nil {
+                error = AVIOReaderError.oversizeResponse(limit: maxBodyBytes)
+            }
+            dataTask.cancel()
+            return
+        }
+        // Force-copy: body.append(data) may retain source dispatch_data via CoW,
+        // defeating the per-delivery release. Manual memcpy guarantees drop on return.
         body.count = baseCount + count
         body.withUnsafeMutableBytes { dst in
             data.withUnsafeBytes { src in
@@ -2138,7 +2206,8 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
-        self.error = error
+        // Keep a deliberate oversize error — the cancellation it triggers must not overwrite it.
+        if self.error == nil { self.error = error }
         onCompletion?()
     }
 }
@@ -2249,12 +2318,16 @@ enum AVIOReaderError: Error, CustomStringConvertible {
     case allocationFailed
     case noResponse
     case requestTimeout
+    /// The response streamed past the requested body size (server ignored `Range`, or a
+    /// HEAD-style full-length body) — cancelled instead of buffering unbounded.
+    case oversizeResponse(limit: Int)
 
     var description: String {
         switch self {
         case .allocationFailed: return "Failed to allocate AVIO buffer"
         case .noResponse: return "No response from server"
         case .requestTimeout: return "Request timed out"
+        case .oversizeResponse(let limit): return "Response exceeded expected body size (limit \(limit) B)"
         }
     }
 }
