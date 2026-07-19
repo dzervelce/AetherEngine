@@ -11,7 +11,14 @@ extension HLSVideoEngine {
         packetsWritten: Int,
         cachedSegments: Int
     ) -> Bool {
-        guard !isLive, case .readError = reason else { return false }
+        guard !isLive else { return false }
+        // .eof included: forward-only streaming mode (unknown-size source) has no reconnect and
+        // returns EOF after its first-data wait expires, so a source that never delivered a byte
+        // exits as a zero-packet EOF — same dead-source outcome as the zero-packet readError.
+        switch reason {
+        case .readError, .eof: break
+        default: return false
+        }
         return packetsWritten == 0 && cachedSegments == 0
     }
 
@@ -37,15 +44,22 @@ extension HLSVideoEngine {
         // until the host's first-frame timeout. Surface it as fatal instead of dying silently.
         // Mid-session read errors (packets/segments already produced) keep the existing
         // behavior: AVIO absorbs transients, the scrub/wedge arms cover recovery.
-        if case .readError(let code) = reason, !isLiveSession {
+        let deadSourceCandidate: Bool
+        switch reason {
+        case .readError, .eof: deadSourceCandidate = true
+        default: deadSourceCandidate = false
+        }
+        if !isLiveSession, deadSourceCandidate {
             if Self.isFatalVODPumpExit(
                 reason: reason, isLive: isLiveSession,
                 packetsWritten: prod.packetsWrittenCount,
                 cachedSegments: cache?.count ?? 0
             ) {
+                // .eof carries no errno; report AVERROR_EOF so the host message stays truthful.
+                let code: Int32 = { if case .readError(let c) = reason { return c }; return FFmpegErr.eof }()
                 EngineLog.emit(
                     "[HLSVideoEngine] VOD pump died before producing anything "
-                    + "(readError \(code)); surfacing fatal source failure",
+                    + "(\(reason), code \(code)); surfacing fatal source failure",
                     category: .session
                 )
                 onVODSourceFailed?(code)

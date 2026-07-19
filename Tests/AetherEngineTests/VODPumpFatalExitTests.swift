@@ -35,11 +35,20 @@ struct VODPumpFatalExitTests {
             packetsWritten: 0, cachedSegments: 0))
     }
 
-    @Test("VOD eof with zero packets is not a fatal read exit")
-    func eofIsNotFatal() {
-        #expect(!HLSVideoEngine.isFatalVODPumpExit(
+    @Test("VOD eof with zero packets IS fatal (forward-only streaming exits dead sources as EOF)")
+    func zeroPacketEofIsFatal() {
+        // Unknown-size sources run forward-only with no reconnect: a source that never delivered
+        // a byte exits .eof, not .readError — same dead source, same AVPlayer-waits-forever hang.
+        #expect(HLSVideoEngine.isFatalVODPumpExit(
             reason: .eof, isLive: false,
             packetsWritten: 0, cachedSegments: 0))
+    }
+
+    @Test("VOD eof after packets were written is a normal end, not fatal")
+    func productiveEofIsNotFatal() {
+        #expect(!HLSVideoEngine.isFatalVODPumpExit(
+            reason: .eof, isLive: false,
+            packetsWritten: 42, cachedSegments: 3))
     }
 
     @Test("teardown exits are not fatal")

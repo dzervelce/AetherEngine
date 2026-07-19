@@ -383,28 +383,37 @@ extension HLSVideoEngine {
                 dvVariant: dvVariant
             )
         case .profile7:
-            // P7 dual-layer (UHD-BD). DV panel: convert RPU P7->P8.1 per-packet (DoviRpuConverter),
-            // drop EL, rewrite container dvcC to P8.1, route as hvc1 + SUPPLEMENTAL dvh1.08.XX/db1p.
+            // P7 dual-layer (UHD-BD remux). DV panel: convert RPU P7->P8.1 per-packet
+            // (DoviRpuConverter), drop EL, rewrite container dvcC to P8.1 — and serve the
+            // CONVERTED stream exactly like native P8.1: DIRECT DV (`dvh1` sample entry, primary
+            // CODECS dvh1.08.XX, NO SUPPLEMENTAL-CODECS). The served bits ARE a compliant P8.1
+            // stream, and the hvc1+SUPPLEMENTAL db1p signaling black-screens on a real DV Apple TV
+            // (base decodes, DV output path never engages, -11868 ~16 s in) — same device-verified
+            // failure as the .profile81 case above.
             // Non-DV panel: no Apple P7 decoder; strip dvcC, play PQ HEVC HDR10 base.
-            let supplemental: String?
-            let strip: Bool
             if effectiveDvMode {
-                supplemental = "dvh1.08.\(dvLevelStr)/db1p"
-                strip = false
+                return CodecRoute(
+                    codecTagOverride: "dvh1",
+                    videoRange: .pq,
+                    primaryCodecs: "dvh1.08.\(dvLevelStr)",
+                    supplementalCodecs: nil,
+                    stripDolbyVisionMetadata: false,
+                    convertP7ToProfile81: true,
+                    rewriteDoviConfigTo81: true,
+                    dvVariant: dvVariant
+                )
             } else {
-                supplemental = nil
-                strip = true
+                return CodecRoute(
+                    codecTagOverride: "hvc1",
+                    videoRange: .pq,
+                    primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
+                    supplementalCodecs: nil,
+                    stripDolbyVisionMetadata: true,
+                    convertP7ToProfile81: false,
+                    rewriteDoviConfigTo81: false,
+                    dvVariant: dvVariant
+                )
             }
-            return CodecRoute(
-                codecTagOverride: "hvc1",
-                videoRange: .pq,
-                primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
-                supplementalCodecs: supplemental,
-                stripDolbyVisionMetadata: strip,
-                convertP7ToProfile81: effectiveDvMode,
-                rewriteDoviConfigTo81: effectiveDvMode,
-                dvVariant: dvVariant
-            )
         case .unknown:
             let p = Int(dvRecord?.dv_profile ?? 0)
             let c = Int(dvRecord?.dv_bl_signal_compatibility_id ?? 0)
