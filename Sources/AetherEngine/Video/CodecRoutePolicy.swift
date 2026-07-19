@@ -384,19 +384,22 @@ extension HLSVideoEngine {
             )
         case .profile7:
             // P7 dual-layer (UHD-BD remux). DV panel: convert RPU P7->P8.1 per-packet
-            // (DoviRpuConverter), drop EL, rewrite container dvcC to P8.1 — and serve the
-            // CONVERTED stream exactly like native P8.1: DIRECT DV (`dvh1` sample entry, primary
-            // CODECS dvh1.08.XX, NO SUPPLEMENTAL-CODECS). The served bits ARE a compliant P8.1
-            // stream, and the hvc1+SUPPLEMENTAL db1p signaling black-screens on a real DV Apple TV
-            // (base decodes, DV output path never engages, -11868 ~16 s in) — same device-verified
-            // failure as the .profile81 case above.
+            // (DoviRpuConverter mode 2), drop EL, rewrite container dvcC to P8.1 — and signal it
+            // hvc1 PRIMARY + SUPPLEMENTAL dvh1.08.XX/db1p. Direct dvh1 (native-P8.1 style) is
+            // REFUTED for converted P7 on device (2026-07-19): AVPlayer plays it healthily, no
+            // -11868, but the DV output path renders BLACK — and black-without-error has no
+            // fallback. The supplemental route keeps a truthful HDR10 primary AVKit can always
+            // display; the historical -11868 against hvc1+supplemental came from an SDR-idling
+            // panel, which the HDR compatibility pre-switch has since eliminated. If this ALSO
+            // blacks out on device, the final P7 policy is the stripped-HDR10 branch below even
+            // on DV panels — do not revisit direct dvh1 for converted P7.
             // Non-DV panel: no Apple P7 decoder; strip dvcC, play PQ HEVC HDR10 base.
             if effectiveDvMode {
                 return CodecRoute(
-                    codecTagOverride: "dvh1",
+                    codecTagOverride: "hvc1",
                     videoRange: .pq,
-                    primaryCodecs: "dvh1.08.\(dvLevelStr)",
-                    supplementalCodecs: nil,
+                    primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
+                    supplementalCodecs: "dvh1.08.\(dvLevelStr)/db1p",
                     stripDolbyVisionMetadata: false,
                     convertP7ToProfile81: true,
                     rewriteDoviConfigTo81: true,

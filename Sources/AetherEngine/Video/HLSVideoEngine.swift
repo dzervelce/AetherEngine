@@ -1368,8 +1368,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let compat = Int(record.dv_bl_signal_compatibility_id)
         if profile == 5 { return nil }                               // always dvh1 primary
         if profile == 8, compat == 1, effectiveDvMode { return nil }  // P8.1 direct DV on a DV panel
-        if profile == 7, effectiveDvMode { return nil }               // P7→8.1 conversion serves dvh1 primary too
-        return plainBase                                              // 8.2, 8.4, non-DV P7/P8.1, HDR10/HLG/SDR
+        // P7 routes hvc1-primary (+SUPPLEMENTAL on DV panels) — its PQ base IS the plain base.
+        return plainBase                                              // 7, 8.2, 8.4, non-DV P8.1, HDR10/HLG/SDR
     }
 
     /// Standalone DOVIDecoderConfigurationRecord read for `presentedPlainHDRBase`, which runs before an
