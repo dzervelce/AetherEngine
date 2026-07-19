@@ -383,40 +383,24 @@ extension HLSVideoEngine {
                 dvVariant: dvVariant
             )
         case .profile7:
-            // P7 dual-layer (UHD-BD remux). DV panel: convert RPU P7->P8.1 per-packet
-            // (DoviRpuConverter mode 2), drop EL, rewrite container dvcC to P8.1 — and signal it
-            // hvc1 PRIMARY + SUPPLEMENTAL dvh1.08.XX/db1p. Direct dvh1 (native-P8.1 style) is
-            // REFUTED for converted P7 on device (2026-07-19): AVPlayer plays it healthily, no
-            // -11868, but the DV output path renders BLACK — and black-without-error has no
-            // fallback. The supplemental route keeps a truthful HDR10 primary AVKit can always
-            // display; the historical -11868 against hvc1+supplemental came from an SDR-idling
-            // panel, which the HDR compatibility pre-switch has since eliminated. If this ALSO
-            // blacks out on device, the final P7 policy is the stripped-HDR10 branch below even
-            // on DV panels — do not revisit direct dvh1 for converted P7.
-            // Non-DV panel: no Apple P7 decoder; strip dvcC, play PQ HEVC HDR10 base.
-            if effectiveDvMode {
-                return CodecRoute(
-                    codecTagOverride: "hvc1",
-                    videoRange: .pq,
-                    primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
-                    supplementalCodecs: "dvh1.08.\(dvLevelStr)/db1p",
-                    stripDolbyVisionMetadata: false,
-                    convertP7ToProfile81: true,
-                    rewriteDoviConfigTo81: true,
-                    dvVariant: dvVariant
-                )
-            } else {
-                return CodecRoute(
-                    codecTagOverride: "hvc1",
-                    videoRange: .pq,
-                    primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
-                    supplementalCodecs: nil,
-                    stripDolbyVisionMetadata: true,
-                    convertP7ToProfile81: false,
-                    rewriteDoviConfigTo81: false,
-                    dvVariant: dvVariant
-                )
-            }
+            // P7 dual-layer (UHD-BD remux): FINAL POLICY = stripped HDR10 on EVERY panel, DV or
+            // not. Converted-P7 DV is refuted on device (2026-07-19, two experiments): the
+            // P7→8.1 conversion plays healthily but the DV output path renders BLACK both as
+            // direct dvh1 primary AND as hvc1+SUPPLEMENTAL db1p after an HDR pre-switch — and
+            // black-without-error has no detectable failure to fall back on. Every mainstream
+            // player makes the same trade for FEL discs: full PQ/HDR10 picture, DV dynamic
+            // metadata dropped. Do NOT revisit converted-P7 DV routing on this hardware.
+            // (Native P8.1/P5 direct DV remain verified working — this is P7-only.)
+            return CodecRoute(
+                codecTagOverride: "hvc1",
+                videoRange: .pq,
+                primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
+                supplementalCodecs: nil,
+                stripDolbyVisionMetadata: true,
+                convertP7ToProfile81: false,
+                rewriteDoviConfigTo81: false,
+                dvVariant: dvVariant
+            )
         case .unknown:
             let p = Int(dvRecord?.dv_profile ?? 0)
             let c = Int(dvRecord?.dv_bl_signal_compatibility_id ?? 0)
