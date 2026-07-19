@@ -266,11 +266,13 @@ final class DisplayCriteriaController {
                 return
             }
         }
-        EngineLog.emit("[DisplayCriteria] proceed after ~\(capTicks * 50 + 1000)ms cap (switch not observable, likely DV; \(Self.headroomDescription(screen)))", category: .engine)
+        EngineLog.emit("[DisplayCriteria] proceed after ~\(capTicks * 50 + 1000)ms cap (switch started; completion unobservable on this display; \(Self.headroomDescription(screen)))", category: .engine)
         #endif
     }
 
-    /// True when the panel's ACTIVE MODE is HDR after apply() + waitForSwitch() settle. Reading this post-settle is the only authoritative way to distinguish Match Dynamic Range ON vs. rate-only (no public per-sub-toggle API).
+    /// True when EDR headroom evidences an HDR panel mode. CORROBORATING ONLY — some panels report
+    /// cur=pot=1.00 while physically sitting in an HDR mode (device-verified), so a false here must
+    /// never gate routing or set refusal state; AVPlayer's master-rejection fallback is the verifier.
     func currentPanelIsHDR() -> Bool {
         #if os(tvOS)
         guard let window = resolveWindow() else { return false }

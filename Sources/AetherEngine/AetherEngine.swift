@@ -515,13 +515,16 @@ public final class AetherEngine: ObservableObject {
     /// Programs AVDisplayManager.preferredDisplayCriteria from probed format + frame rate. No-op on iOS/macOS.
     let displayCriteria = DisplayCriteriaController()
 
-    /// Session memo for the plain-HDR panel pre-switch (`LoadOptions.suppressDisplayCriteria` hosts, see
-    /// `load()`): set once a pre-switch handshake has settled and the panel STILL ended in an SDR mode —
-    /// Match Dynamic Range is off (rate-only match-content users) or the panel refused. Skipping further
-    /// pre-switches for the rest of the process avoids paying a useless mode-switch blackout on every
-    /// play for a panel that will never accept the range switch. Cleared only on relaunch, so a settings
-    /// change picks up after a restart at worst.
-    private static var panelRefusedRangeSwitch = false
+    /// Optimistic route latch for the suppressed-host panel pre-switch (see `load()`): set once an HDR
+    /// compatibility criterion was successfully WRITTEN (.willSwitch/.unchanged). EDR headroom is NOT
+    /// authoritative — this panel reads cur=pot=1.00 while physically sitting in the HDR mode — so the
+    /// master route trusts the write and lets AVPlayer's master-rejection fallback be the empirical
+    /// verifier. Survives internal reloads (audio switch / next episode re-supply a false EDR snapshot);
+    /// cleared on final teardown, background teardown (HDMI reacquisition), and a definitive SDR probe.
+    var panelHDRRouteReady = false
+    /// Source-scoped rejection memo: -11868/-11848 can be source/codec-specific, so only the rejected
+    /// URL skips future pre-switches — not the whole process.
+    private var rangeRejectedSourceURL: URL?
 
     /// Loopback HLS-fMP4 engine. Non-nil between load and stop.
     var nativeVideoSession: HLSVideoEngine?
@@ -949,6 +952,14 @@ public final class AetherEngine: ObservableObject {
     /// playlist in place (single-variant); otherwise surface the failure normally.
     @MainActor
     func fallBackToMediaPlaylist(_ rejection: DisplayRejection) {
+        // The optimistic HDR route was empirically refuted for THIS source: drop the latch, publish
+        // the truthful SDR outcome, and memo the URL (range rejections can be source/codec-specific;
+        // -1002 is a transport failure, never a range refusal).
+        panelHDRRouteReady = false
+        videoFormat = .sdr
+        if MasterFallbackDecision.isDisplayRejectionCode(rejection.code) {
+            rangeRejectedSourceURL = loadedURL
+        }
         guard let host = nativeHost, let session = nativeVideoSession else {
             state = .error(rejection.message)
             return
@@ -1077,6 +1088,9 @@ public final class AetherEngine: ObservableObject {
                     throw StartupGateFailure(message: startupGateFailureMessage(host))
                 }
                 masterFallbackUsed = true
+                // Readiness-gate media fallback: the optimistic HDR route didn't materialize.
+                panelHDRRouteReady = false
+                videoFormat = .sdr
                 session.markServingMediaAfterFallback()
                 nativeSubtitleRenditionsServed = false
                 EngineLog.emit(
@@ -1879,8 +1893,8 @@ public final class AetherEngine: ObservableObject {
             }
         case .clearStale:
             if let base = hdrCompatibilityPreflightBase, base != .sdr,
-               !options.panelIsInHDRMode,
-               !Self.panelRefusedRangeSwitch,
+               !(options.panelIsInHDRMode || panelHDRRouteReady),
+               rangeRejectedSourceURL != url,
                options.matchContentEnabled,
                Self.displayCapabilities.supportsHDR {
                 // PLAIN-HDR PRE-SWITCH for suppressed-criteria (AVKit-sole-writer) hosts. Handing
@@ -1897,11 +1911,12 @@ public final class AetherEngine: ObservableObject {
                 // primary): a DV-signaling master is untouched, since AVKit driving the SDR->DV switch
                 // itself from a `dvh1` track has no equivalent failure on record. `base` is never .sdr
                 // here (guarded above), so apply() always treats it as HDR and returns .willSwitch or
-                // .unchanged, never .applied. Rate-match-only users (combined tvOS flag): the panel
-                // honours only the refresh-rate dimension, the post-settle probe below reads SDR, and
-                // panelRefusedRangeSwitch stops paying this handshake again for the rest of the session.
+                // .unchanged, never .applied. EDR headroom is deliberately NOT consulted for the
+                // outcome: this panel reads cur=pot=1.00 while physically sitting in HDR, so the route
+                // latches optimistically on a successful WRITE and AVPlayer's master-rejection fallback
+                // (source-scoped `rangeRejectedSourceURL`) is the empirical verifier. Rate-match-only
+                // users serve a master once, get the -11848 rejection, and fall back to media.
                 ranPlainHDRPreflight = true
-                var wroteHDRCriteria = true
                 switch displayCriteria.apply(
                     format: base,
                     frameRate: snappedRate,
@@ -1921,18 +1936,13 @@ public final class AetherEngine: ObservableObject {
                         }
                         try checkLoadCurrent(gen)
                     }
+                    panelHDRRouteReady = true
                 case .unchanged:
-                    break
+                    panelHDRRouteReady = true
                 case .applied:
-                    wroteHDRCriteria = false
-                }
-                if wroteHDRCriteria, !displayCriteria.currentPanelIsHDR() {
-                    Self.panelRefusedRangeSwitch = true
-                    EngineLog.emit(
-                        "[AetherEngine] plain-HDR pre-switch did not yield an HDR panel mode; "
-                        + "skipping pre-switches for the rest of this session",
-                        category: .engine
-                    )
+                    // Also covers "Match Content disabled" / no window / format-description failure —
+                    // no criterion was negotiated, so the route must not latch.
+                    break
                 }
                 // AVKit owns the criteria lifecycle from here: it re-derives criteria from the master on
                 // every load and restores the panel at dismissal. Relinquish reset ownership so a later
@@ -1959,19 +1969,24 @@ public final class AetherEngine: ObservableObject {
         //      means the panel accepted HDR (range matching on); == 1.0 means refused. Pass to both videoFormat
         //      and HLSVideoEngine master-vs-media routing so they stay in step.
         //
-        //      Suppressed-criteria hosts fall back to the caller's pre-load panelIsInHDRMode snapshot
-        //      (AVKit fires criteria later from the AVPlayerItem formatDescription) — UNLESS the
-        //      plain-HDR pre-switch above ran, in which case the post-handshake headroom read is
-        //      authoritative (that's the whole point of the pre-switch: have the panel's true mode in
-        //      hand, via `resolveUseMasterPlaylist`'s panel-empirical routing, before AVPlayer ever
-        //      sees the master).
+        //      Suppressed-criteria hosts route off the caller's snapshot OR the optimistic
+        //      `panelHDRRouteReady` latch (a successfully written pre-switch criterion) OR a live
+        //      headroom read. Headroom is corroborating, never gating — this panel reads 1.00 while
+        //      physically in HDR; AVPlayer's master-rejection fallback verifies the optimistic route.
         let panelHDRAfterHandshake: Bool
         if options.suppressDisplayCriteria {
-            panelHDRAfterHandshake = ranPlainHDRPreflight
-                ? displayCriteria.currentPanelIsHDR()
-                : options.panelIsInHDRMode
+            panelHDRAfterHandshake = options.panelIsInHDRMode
+                || panelHDRRouteReady
+                || displayCriteria.currentPanelIsHDR()
         } else {
             panelHDRAfterHandshake = displayCriteria.currentPanelIsHDR()
+        }
+        if options.suppressDisplayCriteria, panelHDRAfterHandshake, effectiveFormat != .sdr {
+            panelHDRRouteReady = true
+        }
+        if effectiveFormat == .sdr {
+            // A definitive SDR source must not leave a stale HDR-ready claim for a later HDR load.
+            panelHDRRouteReady = false
         }
         #if os(iOS)
         // The iPhone built-in display has no HDMI Match-Content handshake; it renders HDR/DV natively
@@ -2938,6 +2953,10 @@ public final class AetherEngine: ObservableObject {
 
         if resetDisplayCriteria {
             displayCriteria.reset()
+            // Genuine final teardown: the mode claim and the source-scoped rejection memo die with
+            // the session. Reload seams (resetDisplayCriteria: false) preserve both.
+            panelHDRRouteReady = false
+            rangeRejectedSourceURL = nil
         }
         playbackBackend = .none
         activeVideoDecoder = nil
@@ -3144,6 +3163,9 @@ public final class AetherEngine: ObservableObject {
         let app = UIApplication.shared
         let bgTask = app.beginBackgroundTask(withName: "AetherEngine.bgVideoTeardown")
         stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
+        // Suspend drops the HDMI link; reacquisition invalidates any active-mode assumption.
+        panelHDRRouteReady = false
+        rangeRejectedSourceURL = nil
         // Session torn down; host will reload + repause on foreground return.
         state = .paused
         // Wait for the loopback server's detached cleanup (<=3 s producer drain + socket shutdown) before releasing.

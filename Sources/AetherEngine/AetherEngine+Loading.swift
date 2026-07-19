@@ -1306,7 +1306,9 @@ extension AetherEngine {
                     audioSourceStreamIndex: audioStreamIndex,
                     keepDvh1TagWithoutDV: loadedOptions.keepDvh1TagWithoutDV,
                     matchContentEnabled: loadedOptions.matchContentEnabled,
-                    panelIsInHDRMode: loadedOptions.panelIsInHDRMode,
+                    // Latch-aware: the original snapshot predates the pre-switch (EDR read false on
+                    // this panel), so a bare re-use would route this reload to media and revert.
+                    panelIsInHDRMode: loadedOptions.panelIsInHDRMode || panelHDRRouteReady,
                     audioBridgeMode: loadedOptions.audioBridgeMode,
                     // isLive required: without it the reload rebuilds as VOD and HLSVideoEngine fails "cannot build segment plan" (device repro: KiKA).
                     isLive: loadedOptions.isLive,
