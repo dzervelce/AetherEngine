@@ -31,47 +31,69 @@ final class PacketRingBufferTests: XCTestCase {
         XCTAssertEqual(try ring.packets(fromPts: 0).first?.bytes, Data([9, 8, 7]))
     }
 
-    /// The SW DVR reseed interleaves video + audio packets. Audio packets
-    /// share `isKeyframe == false` with video non-keyframes, so the host
-    /// routes replay by the recorded `isVideo` flag. Verify that flag, and
-    /// the byte payloads, round-trip per packet so the reseed feeds each
-    /// packet to the correct decoder in order.
+    /// SW DVR reseed: host routes replay by `isVideo` (audio shares `isKeyframe == false`); verify flag + payload round-trip in order.
     func testReseedRoutingPreservesStreamKindInOrder() throws {
         let ring = try PacketRingBuffer(windowSeconds: 30, scratch: tmpDir())
-        // Interleave like a real demux: video keyframe, audio, video delta,
-        // audio, video delta...
         try ring.append(pts: 10.0, isKeyframe: true,  isVideo: true,  bytes: Data([1]))
         try ring.append(pts: 10.0, isKeyframe: false, isVideo: false, bytes: Data([2]))
         try ring.append(pts: 10.1, isKeyframe: false, isVideo: true,  bytes: Data([3]))
         try ring.append(pts: 10.1, isKeyframe: false, isVideo: false, bytes: Data([4]))
         try ring.append(pts: 10.2, isKeyframe: false, isVideo: true,  bytes: Data([5]))
 
-        // Reseed must anchor on the video keyframe at/before the target.
         let kf = try XCTUnwrap(try ring.keyframePts(atOrBefore: 10.15))
         XCTAssertEqual(kf, 10.0)
 
         let replay = try ring.packets(fromPts: kf)
         XCTAssertEqual(replay.count, 5)
-        // Stream-kind flags preserved in append order.
         XCTAssertEqual(replay.map(\.isVideo), [true, false, true, false, true])
         XCTAssertEqual(replay.map(\.isKeyframe), [true, false, false, false, false])
-        // Exactly one keyframe anchor (the reseed re-primes from it).
         XCTAssertEqual(replay.filter(\.isKeyframe).count, 1)
         XCTAssertTrue(replay.first?.isKeyframe == true && replay.first?.isVideo == true)
-        // Byte payloads intact (one tag byte per packet, in order).
         XCTAssertEqual(replay.map { $0.bytes.first }, [1, 2, 3, 4, 5])
     }
 
-    /// A target predating the retained window clamps to `oldestPts`, which
-    /// the ring guarantees is a keyframe, so a reseed there still begins at
-    /// a decodable access point.
+    /// #136: close() clears the in-RAM index synchronously (ring immediately unusable) and is
+    /// idempotent, so a second teardown from a racing thread is a no-op rather than a crash.
+    func testCloseClearsStateSynchronouslyAndIsIdempotent() throws {
+        let ring = try PacketRingBuffer(windowSeconds: 10, scratch: tmpDir())
+        try ring.append(pts: 0, isKeyframe: true,  isVideo: true, bytes: Data([0]))
+        try ring.append(pts: 1, isKeyframe: false, isVideo: true, bytes: Data([1]))
+        XCTAssertNotNil(ring.oldestPts)
+
+        ring.close()
+        XCTAssertNil(ring.oldestPts)
+        XCTAssertNil(try ring.keyframePts(atOrBefore: .infinity))
+        XCTAssertTrue(try ring.packets(fromPts: 0).isEmpty)
+        XCTAssertEqual(ring.seqBounds.first, ring.seqBounds.end)
+
+        ring.close()  // second teardown must be a harmless no-op
+    }
+
+    /// #136: scratch-directory removal is dispatched to a background queue so close() never blocks the
+    /// caller; the directory (and every spooled packet file under it) is gone shortly after.
+    func testCloseRemovesScratchDirectoryOffCaller() throws {
+        let scratch = tmpDir()
+        let ring = try PacketRingBuffer(windowSeconds: 10, scratch: scratch)
+        try ring.append(pts: 0, isKeyframe: true, isVideo: true, bytes: Data([0]))
+        try ring.append(pts: 1, isKeyframe: true, isVideo: true, bytes: Data([1]))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: scratch.path))
+
+        ring.close()
+
+        let deadline = Date().addingTimeInterval(5)
+        while FileManager.default.fileExists(atPath: scratch.path), Date() < deadline {
+            usleep(20_000)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path),
+                       "scratch dir should be removed by the background teardown")
+    }
+
+    /// Target predating the window: host clamps to `oldestPts`, which the ring guarantees is a keyframe.
     func testTargetBeforeWindowClampsToKeyframeOldest() throws {
         let ring = try PacketRingBuffer(windowSeconds: 5, scratch: tmpDir())
         for i in 0...20 { try ring.append(pts: Double(i), isKeyframe: i % 2 == 0, isVideo: true, bytes: Data([UInt8(i)])) }
         let oldest = try XCTUnwrap(ring.oldestPts)
-        // No keyframe exists at/before a target far below the window.
         XCTAssertNil(try ring.keyframePts(atOrBefore: -100))
-        // ... so the host clamps to oldestPts, which is itself a keyframe.
         let firstAtOldest = try XCTUnwrap(try ring.packets(fromPts: oldest).first)
         XCTAssertTrue(firstAtOldest.isKeyframe)
     }

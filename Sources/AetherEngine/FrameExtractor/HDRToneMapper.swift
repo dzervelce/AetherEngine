@@ -2,9 +2,8 @@ import Foundation
 import Libavfilter
 import Libavutil
 
-/// Tone-maps a single decoded HDR (PQ/HLG, BT.2020) AVFrame to an SDR
-/// BT.709 RGBA AVFrame via a zscale + tonemap libavfilter graph. One
-/// graph per call (decode dominates; the extractor is low-frequency).
+/// Tone-maps a decoded HDR (PQ/HLG, BT.2020) AVFrame to SDR BT.709 RGBA via a
+/// zscale + tonemap libavfilter graph (one graph per call; extractor is low-frequency).
 /// Caller owns the returned frame and must av_frame_free it.
 struct HDRToneMapper {
     static func toneMap(
@@ -36,8 +35,7 @@ struct HDRToneMapper {
             return nil
         }
 
-        // BT.2020 PQ/HLG -> linear light, Hable tone-map to SDR range,
-        // then encode to BT.709 (limited range) and pack to RGBA.
+        // BT.2020 PQ/HLG to linear, Hable tone-map to SDR, BT.709 (tv range), RGBA.
         let chain = "zscale=w=\(targetWidth):h=-2:t=linear:npl=100," +
                     "tonemap=tonemap=hable:desat=0," +
                     "zscale=p=bt709:t=bt709:m=bt709:r=tv," +
@@ -67,7 +65,11 @@ struct HDRToneMapper {
             return nil
         }
 
-        let addRet = av_buffersrc_add_frame_flags(srcCtx, frame, 0)
+        // KEEP_REF: without it buffersrc takes the frame's refs and resets it (w/h=0),
+        // so the caller's sws fallback after a failed tone-map gets an emptied frame and returns nil.
+        let addRet = av_buffersrc_add_frame_flags(
+            srcCtx, frame, Int32(AV_BUFFERSRC_FLAG_KEEP_REF)
+        )
         guard addRet >= 0 else {
             EngineLog.emit("[HDRToneMap] add_frame failed ret=\(addRet)", category: .swPlayback)
             return nil

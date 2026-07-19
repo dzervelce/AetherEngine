@@ -38,12 +38,9 @@ struct FrameRateSnapTests {
 
     @Test("Out-of-tolerance probes return nil")
     func outOfToleranceReturnsNil() {
-        // 35 is more than 0.5 away from any standard rate.
-        #expect(FrameRateSnap.snap(35) == nil)
-        // 45 is between 30 and 48, more than 0.5 from each.
-        #expect(FrameRateSnap.snap(45) == nil)
-        // 120 is far above any standard rate.
-        #expect(FrameRateSnap.snap(120) == nil)
+        #expect(FrameRateSnap.snap(35) == nil)   // >0.5 from any standard rate
+        #expect(FrameRateSnap.snap(45) == nil)   // between 30 and 48, >0.5 from each
+        #expect(FrameRateSnap.snap(120) == nil)  // above all standard rates
     }
 
     @Test("Invalid inputs return nil")

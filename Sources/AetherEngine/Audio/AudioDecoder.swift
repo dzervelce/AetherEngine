@@ -7,49 +7,44 @@ import Libavcodec
 import Libavutil
 import Libswresample
 
-/// FFmpeg software audio decoder. Takes compressed audio AVPackets and
-/// produces multichannel interleaved Float32 PCM wrapped in CMSampleBuffers,
-/// ready for AVSampleBufferAudioRenderer.
-///
-/// Uses libswresample to convert whatever FFmpeg decoded (planar float,
-/// int16, etc.) to interleaved Float32 at the source sample rate and
-/// channel count (up to 7.1). Proper AudioChannelLayout ensures correct
-/// speaker mapping for surround output.
-///
-/// For Dolby Atmos (EAC3+JOC), HLSAudioEngine handles passthrough via
-/// AVPlayer, this decoder is used for non-Atmos audio tracks only.
+/// FFmpeg software audio decoder: compressed AVPackets -> multichannel interleaved Float32 PCM in CMSampleBuffers
+/// for AVSampleBufferAudioRenderer. Uses libswresample to interleaved Float32 at source rate/channels (up to 7.1)
+/// with proper AudioChannelLayout. Non-Atmos tracks only; EAC3+JOC Atmos passes through AVPlayer.
 final class AudioDecoder: @unchecked Sendable {
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
+
+    /// Serializes decode (demux thread) against flush/close (main actor). Without it a MainActor
+    /// avcodec_flush_buffers could race an in-flight avcodec_send_packet on the same context (UB).
+    /// Mirrors SoftwareVideoDecoder's lock discipline.
+    private let stateLock = NSLock()
     private var swrContext: OpaquePointer?
     private var audioFormatDescription: CMAudioFormatDescription?
 
     /// Source stream time base for PTS conversion.
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
 
-    /// TrueHD / MLP / lossless codecs emit 40-sample frames (≈0.83ms at
-    /// 48kHz). Feeding 1200+ tiny CMSampleBuffers per second to
-    /// AVSampleBufferAudioRenderer makes it accept them (no error) and
-    /// then silently drop the stream on multichannel output. Coalesce
-    /// decoded frames until we have at least this many samples before
-    /// building a CMSampleBuffer, renders ~47 buffers/sec at ~21ms
-    /// each, which the renderer handles normally.
+    /// TrueHD/MLP/lossless emit ~40-sample frames (0.83ms @48kHz); feeding 1200+ tiny CMSampleBuffers/sec makes
+    /// AVSampleBufferAudioRenderer accept them then silently drop multichannel output. Coalesce to >= this many
+    /// samples before building a buffer (~47 buffers/sec at ~21ms each, which the renderer handles).
     private static let minSamplesPerBuffer = 1024
 
     private var pendingBytes = Data()
     private var pendingStartPTS: CMTime = .invalid
     private var pendingSampleCount: Int = 0
 
+    /// Gapless presentation clock (issue #89): stamps each buffer from a running sample count so
+    /// consecutive buffers abut to the sample, instead of from each buffer's container-quantized PTS
+    /// (which clicks at every frame for non-integer-ms frame durations like 1536-sample AC-3 @ 44.1 kHz).
+    private var clock = AudioClockAnchor()
+
     #if DEBUG
     private var _loggedZeroConvert = false
     #endif
 
-    /// Sample rate of the decoded audio (e.g. 48000).
     private(set) var sampleRate: Int32 = 0
-    /// Number of channels (up to 8 for 7.1).
     private(set) var channels: Int32 = 0
 
-    /// Open the decoder for the given audio stream.
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
             throw AudioDecoderError.noCodecParameters
@@ -77,20 +72,18 @@ final class AudioDecoder: @unchecked Sendable {
             throw AudioDecoderError.openFailed
         }
 
-        // Don't build the resampler yet. TrueHD (and other codecs that
-        // advertise AV_CHANNEL_ORDER_UNSPEC or sample_fmt=NONE in
-        // codecpar until the first frame is decoded) would make
-        // swr_alloc_set_opts2 fail here, bubbling up as "open failed"
-        // → audioAvailable=false → no sound. The first frame carries
-        // fully resolved layout/rate/format; initialise from it.
+        // Resampler built lazily from the first frame, not here: TrueHD (and codecs advertising
+        // AV_CHANNEL_ORDER_UNSPEC or sample_fmt=NONE in codecpar pre-frame) would fail swr_alloc_set_opts2 here,
+        // bubbling up as open-failed -> audioAvailable=false -> no sound. The first frame carries resolved layout/rate/format.
 
         #if DEBUG
         EngineLog.emit("[AudioDecoder] Opened: \(sampleRate)Hz, \(channels)ch, codec=\(String(cString: codec.pointee.name))", category: .swPlayback)
         #endif
     }
 
-    /// Decode an audio packet. Returns an array of CMSampleBuffers.
     func decode(packet: UnsafeMutablePointer<AVPacket>) -> [CMSampleBuffer] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         guard let ctx = codecContext else { return [] }
         var results: [CMSampleBuffer] = []
 
@@ -102,10 +95,8 @@ final class AudioDecoder: @unchecked Sendable {
         guard let f = frame else { return [] }
 
         while avcodec_receive_frame(ctx, f) >= 0 {
-            // Lazy resampler init, waits until we have a real frame
-            // with fully resolved layout and sample format. Drops the
-            // very first frame on failure, but that's one audio block
-            // at the most and the stream recovers immediately.
+            // Lazy resampler init off a real frame with resolved layout/format. On failure drops one frame at
+            // most and recovers immediately.
             if swrContext == nil {
                 if !initResamplerFromFrame(f) { continue }
             }
@@ -121,9 +112,7 @@ final class AudioDecoder: @unchecked Sendable {
     }
 
     private func initResamplerFromFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> Bool {
-        // Refresh sample-rate / channels from the frame, codecpar was
-        // a hint, the frame is truth. Happens once at the start of a
-        // track so the rest of the pipeline sees the final values.
+        // Refresh rate/channels from the frame (codecpar was a hint, the frame is truth). Once per track.
         if frame.pointee.sample_rate > 0 { sampleRate = frame.pointee.sample_rate }
         let frameChannels = frame.pointee.ch_layout.nb_channels
         if frameChannels > 0 && frameChannels <= 8 { channels = frameChannels }
@@ -131,15 +120,18 @@ final class AudioDecoder: @unchecked Sendable {
         var outLayout = AVChannelLayout()
         av_channel_layout_default(&outLayout, channels)
 
-        // Input layout: use the frame's if valid, otherwise synthesise
-        // a default for the channel count. For TrueHD 7.1 this is the
-        // key line, the frame always has it right after decoding even
-        // when codecpar didn't.
+        // Input layout: frame's if valid, else a synthesised default. Key for TrueHD 7.1 (the frame has it right
+        // after decoding even when codecpar didn't).
         var inLayout = AVChannelLayout()
         if frame.pointee.ch_layout.nb_channels > 0 {
             av_channel_layout_copy(&inLayout, &frame.pointee.ch_layout)
         } else {
             av_channel_layout_default(&inLayout, channels)
+        }
+        // copy() allocates a channel map for custom-order layouts; uninit the stack structs or that map leaks per init.
+        defer {
+            av_channel_layout_uninit(&inLayout)
+            av_channel_layout_uninit(&outLayout)
         }
 
         let inFmt = AVSampleFormat(rawValue: frame.pointee.format)
@@ -177,18 +169,51 @@ final class AudioDecoder: @unchecked Sendable {
 
     /// Flush the decoder (call at EOF or seek).
     func flush() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
-        // Drop whatever we were coalescing, after a seek the old
-        // samples would be at the wrong PTS anyway.
+        // Drop the coalesced samples; after a seek they'd be at the wrong PTS anyway.
         resetPending()
+        // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
+        clock.reset()
         #if DEBUG
         _loggedZeroConvert = false
         #endif
     }
 
-    /// Close the decoder and release resources.
+    /// Drain at source EOF: send a NULL packet to flush the decoder's internal delay frames into the
+    /// accumulator, then force-emit the residual (< minSamplesPerBuffer) tail that the gated decode()
+    /// path never emits. Without this the final ~21ms+ of every audio-only title was dropped (flush()
+    /// discards pending). Mirrors AudioBridge.flush(). Call once at demuxer EOF, before flush()/close().
+    func drain() -> [CMSampleBuffer] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let ctx = codecContext else { return [] }
+        var results: [CMSampleBuffer] = []
+
+        avcodec_send_packet(ctx, nil)
+        var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        defer { av_frame_free(&frame) }
+        if let f = frame {
+            while avcodec_receive_frame(ctx, f) >= 0 {
+                if swrContext == nil {
+                    if !initResamplerFromFrame(f) { continue }
+                }
+                appendFrameToPending(f)
+                if pendingSampleCount >= Self.minSamplesPerBuffer {
+                    if let sampleBuffer = emitPending() { results.append(sampleBuffer) }
+                }
+            }
+        }
+        // Force-emit whatever is left below the coalescing threshold (emitPending only needs > 0 samples).
+        if let sampleBuffer = emitPending() { results.append(sampleBuffer) }
+        return results
+    }
+
     func close() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         if codecContext != nil {
             avcodec_free_context(&codecContext)
         }
@@ -202,33 +227,6 @@ final class AudioDecoder: @unchecked Sendable {
 
     deinit {
         close()
-    }
-
-    // MARK: - Resampler
-
-    private func setupResampler(ctx: UnsafeMutablePointer<AVCodecContext>) throws {
-        var outLayout = AVChannelLayout()
-        av_channel_layout_default(&outLayout, channels)
-
-        let ret = swr_alloc_set_opts2(
-            &swrContext,
-            &outLayout,
-            AV_SAMPLE_FMT_FLT,
-            sampleRate,
-            &ctx.pointee.ch_layout,
-            ctx.pointee.sample_fmt,
-            ctx.pointee.sample_rate,
-            0,
-            nil
-        )
-        guard ret >= 0, swrContext != nil else {
-            throw AudioDecoderError.resamplerFailed
-        }
-
-        guard swr_init(swrContext) >= 0 else {
-            swr_free(&swrContext)
-            throw AudioDecoderError.resamplerFailed
-        }
     }
 
     // MARK: - Format Description
@@ -246,7 +244,7 @@ final class AudioDecoder: @unchecked Sendable {
             mReserved: 0
         )
 
-        let layoutTag = channelLayoutTag(for: channels)
+        let layoutTag = audioChannelLayoutTag(for: channels)
         var layout = AudioChannelLayout(
             mChannelLayoutTag: layoutTag,
             mChannelBitmap: [],
@@ -272,16 +270,10 @@ final class AudioDecoder: @unchecked Sendable {
         audioFormatDescription = desc
     }
 
-    private func channelLayoutTag(for channels: Int32) -> AudioChannelLayoutTag {
-        audioChannelLayoutTag(for: channels)
-    }
-
     // MARK: - Frame → pending buffer → CMSampleBuffer
 
-    /// Resample one decoded frame and append the float-interleaved bytes
-    /// to the pending accumulator. Remembers the frame's PTS the first
-    /// time the accumulator is non-empty so emitPending() can stamp the
-    /// coalesced buffer correctly.
+    /// Resample one frame and append float-interleaved bytes to the pending accumulator. Captures the frame's PTS
+    /// on the first append so emitPending() stamps the coalesced buffer correctly.
     private func appendFrameToPending(_ frame: UnsafeMutablePointer<AVFrame>) {
         guard let swr = swrContext else { return }
 
@@ -317,8 +309,7 @@ final class AudioDecoder: @unchecked Sendable {
         #endif
         guard convertedSamples > 0 else { return }
 
-        // First frame in a new accumulator → capture its PTS. Subsequent
-        // frames extend the same buffer, so only the start matters.
+        // First frame in a new accumulator captures the PTS; subsequent frames only extend the buffer.
         if pendingSampleCount == 0 {
             let pts = frame.pointee.pts
             pendingStartPTS = (pts != Int64.min)
@@ -330,8 +321,7 @@ final class AudioDecoder: @unchecked Sendable {
         pendingSampleCount += Int(convertedSamples)
     }
 
-    /// Build a CMSampleBuffer from whatever is currently in the pending
-    /// accumulator and reset it. Returns nil if nothing was pending.
+    /// Build a CMSampleBuffer from the pending accumulator and reset it. Nil if nothing pending.
     private func emitPending() -> CMSampleBuffer? {
         guard pendingSampleCount > 0,
               let formatDesc = audioFormatDescription,
@@ -373,9 +363,18 @@ final class AudioDecoder: @unchecked Sendable {
             return nil
         }
 
+        // Gapless PTS (issue #89): derive this buffer's start from the running sample count so
+        // consecutive buffers abut exactly, instead of from the container-quantized PTS (which leaves
+        // +/-0.5 ms gaps and per-frame clicks for non-integer-ms frame durations). Committed only on
+        // success below, so a dropped buffer never advances the clock.
+        let (outPTS, reanchor) = clock.resolve(startPTS: startPTS, sampleRate: sampleRate)
+
+        // Single timing entry: CoreMedia treats `duration` as per-SAMPLE, so LPCM must be 1/sampleRate. Stamping
+        // the buffer total made GetDuration report totalSamples^2/sampleRate (~22s for 1024 samples), wedging
+        // AudioPlaybackHost's buffer-ahead gate after one packet.
         var timing = CMSampleTimingInfo(
-            duration: CMTimeMake(value: Int64(totalSamples), timescale: sampleRate),
-            presentationTimeStamp: startPTS,
+            duration: CMTime(value: 1, timescale: sampleRate),
+            presentationTimeStamp: outPTS,
             decodeTimeStamp: .invalid
         )
 
@@ -396,6 +395,7 @@ final class AudioDecoder: @unchecked Sendable {
         )
         resetPending()
         guard status == noErr, let sample = sampleBuffer else { return nil }
+        clock.commit(pts: outPTS, reanchor: reanchor, sampleCount: totalSamples)
         return sample
     }
 
@@ -412,6 +412,5 @@ enum AudioDecoderError: Error {
     case contextAllocationFailed
     case parameterCopyFailed
     case openFailed
-    case resamplerFailed
     case formatDescriptionFailed
 }

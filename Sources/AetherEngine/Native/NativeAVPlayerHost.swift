@@ -3,21 +3,10 @@ import AVFoundation
 import AVKit
 import Combine
 
-/// `AVPlayer` + `AVPlayerLayer` wrapper owned by AetherEngine. Drives
-/// the AVKit side that consumes the loopback HLS-fMP4 URL produced by
-/// `HLSVideoEngine`. The reason this path exists at all: tvOS only
-/// exposes the HDMI HDR-mode handshake to Dolby Vision through
-/// `AVPlayer`-rooted playback, not through `AVSampleBufferDisplayLayer`.
-///
-/// This is the AVPlayer render path for sources that decode through
-/// AVPlayer's HLS-fMP4 pipeline (HEVC, H.264, and AV1 on devices with
-/// hardware AV1 decode). The dav1d software fallback for AV1 without
-/// HW support and the VP9 path both live in `SoftwarePlaybackHost`.
-///
-/// Display-criteria handling lives in `DisplayCriteriaController`,
-/// invoked from `AetherEngine.load(url:options:)` before the AVPlayer
-/// item is loaded so the HDMI HDR-mode handshake is in flight by the
-/// time AVPlayer's first segment fetch reaches the system.
+/// NativeAVPlayerHost: AVPlayer + AVPlayerLayer wrapper for the HLS-fMP4 loopback path.
+/// tvOS exposes the HDMI DV/HDR handshake only through AVPlayer-rooted playback, not AVSampleBufferDisplayLayer.
+/// Covers HEVC, H.264, and HW-AV1; SW fallback (AV1/VP9) lives in SoftwarePlaybackHost.
+/// DisplayCriteriaController writes preferredDisplayCriteria before item load so the handshake is in flight first.
 @MainActor
 final class NativeAVPlayerHost {
 
@@ -25,68 +14,95 @@ final class NativeAVPlayerHost {
 
     @Published private(set) var isReady: Bool = false
     @Published private(set) var currentTime: Double = 0
+    /// AVPlayer's actually-rendered position (pre-seek parked frame during in-flight seeks). Folded to clock.sourceTime so subtitle overlay tracks the picture, not the scrub target (issue #49).
+    @Published private(set) var renderedTime: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
     @Published private(set) var failureMessage: String?
-    /// Typed companion to `failureMessage`: the AVPlayerItem failure as an
-    /// NSError so consumers can branch on domain/code (the master-playlist
-    /// variant-rejection retry in AetherEngine.loadNative needs -11848 /
-    /// -11868). Set together with `failureMessage`.
-    @Published private(set) var failureError: NSError?
-    /// True after the AVPlayer item reaches the end of its stream.
-    /// Engine flips state to .idle so host end-of-content flows
-    /// (auto-dismiss, next-episode countdown if no marker) fire.
+    /// #50: monotonic token; bumped on each deferred .failed so a superseding failure or item swap cancels the in-flight confirmation.
+    private var failureConfirmToken: Int = 0
+    /// #50: latched on first .playing; discriminates startup failures (never played) from mid-playback transients. .failed and timeControlStatus KVOs are unsynchronized, so instantaneous status is unreliable. Reset with the item on a reused host.
+    private var hasEverPlayed = false
     @Published private(set) var didReachEnd: Bool = false
-    /// Mirrors `avPlayer.timeControlStatus`. The engine subscribes so it
-    /// can reconcile its own `state` when an external agent toggles the
-    /// AVPlayer directly, bypassing `engine.play()` / `pause()`: AVKit's
-    /// transport bar (kept active for Control Center skip routing), iPhone
-    /// Control Center, or the hardware play/pause button that AVKit handles
-    /// internally. Without this the engine's `state` goes stale and the
-    /// host's `togglePlayPause()` resolves to a no-op (the "swallowed
-    /// play/pause press" symptom).
+    /// Mirrors avPlayer.timeControlStatus so the engine can reconcile when AVKit's transport bar, Control Center, or hardware buttons toggle the player externally (without this, engine state goes stale and play/pause presses are swallowed).
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
+    /// Monotonic count of AVPlayerItem playbackStalled notifications (#93 residual): the engine
+    /// opens its spurious-pause recovery window on each stall.
+    @Published private(set) var stallCount: Int = 0
+    /// Monotonic count of loopback-path `failedToPlayToEndTime` deaths after playback was
+    /// established (#93 round 3). Accumulated -12889 media timeouts fail the item with tcs parked
+    /// at .paused, which every pause-guarded recovery layer misreads as user intent; the engine
+    /// subscribes and escalates into the stage-2 item reload with the pause guard bypassed.
+    @Published private(set) var endFailureCount: Int = 0
+    /// End of the last seekable time range (seconds); tracks the live edge for EVENT playlists.
+    /// KVO mirror of `seekableTimeRanges`, NOT a live read: the getter is a sync XPC round-trip
+    /// to mediaserverd, and clock-tick sinks plus the 1 Hz paused-live timer read this at a
+    /// cadence that turns a busy media server into a main-thread hang (#134).
+    @Published private(set) var seekableEnd: Double = 0
+
+    /// Published when a startup `.failed` is a display-rejection of the served master (#98). The
+    /// engine's fallback subscriber reads it, decides, and either reloads the media playlist or
+    /// surfaces the failure. Reset on each load.
+    @Published private(set) var pendingDisplayRejection: DisplayRejection?
+
+    /// #35 (Sodalite) cold-DV-master startup-readiness gate. While the engine drives the bounded
+    /// retry loop this is true, so a startup failure (`.failed` with any code, including a
+    /// display-rejection) is NOT published: the gate polls `awaitStartupReadiness` and decides to
+    /// reload the master, fall back to the media playlist, or give up. `lastSuppressedStartupFailure`
+    /// stashes the message so the engine can surface a real terminal error if the gate exhausts
+    /// every option (a timed-out silent 0-track park leaves it nil; the gate supplies a fallback).
+    var startupReadinessGateActive: Bool = false
+    private(set) var lastSuppressedStartupFailure: String?
+
+    // MARK: - Seek landing state
+
+    /// Monotonic seek counter; only the latest generation clears seekInFlight and publishes the landed time (abandoned seeks complete with finished==false).
+    private var seekGeneration: UInt64 = 0
+
+    /// Suppresses currentTime publishing while a seek is in flight; the loopback source lands seeks seconds after the call, so the observer would otherwise bounce the clock back through the pre-seek position (issue #37).
+    private(set) var seekInFlight: Bool = false
+    /// Set immediately before the latest seek completion publishes renderedTime. Deadline recovery
+    /// uses this as authoritative presented-frame evidence when that publication wins the MainActor
+    /// queue race against the resumed deadline continuation.
+    private(set) var latestSeekRenderedTimePublished = false
 
     // MARK: - Output
 
-    /// The AVPlayerLayer the engine attaches to the bound
-    /// `AetherPlayerView`. Created at init and reused for the lifetime
-    /// of this host, even across `replaceCurrentItem` swaps.
+    /// AVPlayerLayer attached to the bound AetherPlayerView; reused across replaceCurrentItem swaps.
     let playerLayer: AVPlayerLayer
 
-    /// The underlying `AVPlayer`. Exposed engine-internally so the
-    /// audio/subtitle track-selection layer can reach `AVMediaSelection`
-    /// once that wiring lands.
     let avPlayer: AVPlayer
 
     // MARK: - Private state
 
     private var playerItem: AVPlayerItem?
-    /// Latest external-metadata array the host wants on the playing
-    /// item. Applied immediately to the current `AVPlayerItem` when set,
-    /// and replayed onto a fresh item across internal reloads
-    /// (audio-track switch, background reopen) so the system Now Playing
-    /// surface keeps its title / artwork after the seam.
+    /// Applied immediately and replayed onto fresh items across internal reloads so Now Playing title/artwork survives audio-switch/background-reopen seams.
     private var pendingExternalMetadata: [AVMetadataItem] = []
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
-    /// One-shot guard so the settled audio-route capability check (route
-    /// dump + downmix warnings) runs once, after the first transition to
-    /// `.playing` when AVKit has finished negotiating the HDMI output
-    /// format. Sampling at readyToPlay was premature and false-positived
-    /// the downmix warning on stereo-idle sinks (issue #24).
+    /// One-shot guard; route capability check runs after first .playing, not readyToPlay -- early sampling false-positived the downmix warning on stereo-idle sinks (issue #24).
     private var didSampleSettledRoute = false
+    /// Latched transport intent; the readyToPlay observer re-asserts it if play() was swallowed during a replaceCurrentItem swap (keepNativeHost reload: AVPlayer drops rate to 0 and parks at readyToPlay+paused forever).
+    private var playIntent = false
     private var rateObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
+    private var seekableObservation: NSKeyValueObservation?
+    /// Diagnostic: isReadyForDisplay is the only signal for first-frame-on-screen; t+ stamps localize the audio-leads-black-video gap.
+    private var layerReadyObservation: NSKeyValueObservation?
+    /// t+ reference for startup diagnostics; written on MainActor, read off-main from KVO -- diagnostic-only, a torn read is harmless.
+    nonisolated(unsafe) private var loadStartTime = DispatchTime.now()
     private var notificationObservers: [NSObjectProtocol] = []
     private var accessLogCount = 0
 
-    /// Monotonic counter so multi-attempt sessions (DrHurt-style
-    /// "play, fail, back out, retry") produce distinguishable log
-    /// lines. Every load(url:) increments it; every async asset.load
-    /// log line tags itself with the current value so a chain of
-    /// "asset.load failed" entries can be matched back to the
-    /// originating load() invocation.
+    /// When true, AVPlayer's `failedToPlayToEndTime` (it gave up: rate 0, no more data) routes into the
+    /// deferred-failure confirmation instead of being log-only. Set only on the lean remote-HLS live path,
+    /// which has no loopback live-reopen / readiness watchdog to recover or surface a dead upstream. Reported
+    /// live-IPTV death: segments started 404ing after the initial buffer, AVPlayer fired failedToPlayToEnd and
+    /// parked at rate 0, but `item.status` stayed `readyToPlay`, so the `.failed` KVO never fired and the host
+    /// never learned playback died. The loopback/VOD path keeps log-only (it owns its own reopen machinery).
+    private var surfaceEndFailures = false
+
+    /// Monotonic counter tags every load() invocation so multi-attempt sessions produce distinguishable log lines.
     private static var nextSessionID: Int = 0
     private var sessionID: Int = 0
 
@@ -94,17 +110,7 @@ final class NativeAVPlayerHost {
 
     init() {
         let player = AVPlayer()
-        // Default (true) is right for VOD HLS, AVPlayer waits for
-        // buffer. HLSAudioEngine sets `false` for live-audio latency
-        // reasons, don't copy that pattern here: AVPlayer would try
-        // to play the moment seg0 has any bytes and stall because
-        // the lazy remuxer needs seconds to produce a full fragment.
-        //
-        // (Tried auto=false as a memory-bound experiment for the
-        // long-form 4K HDR HEVC RSS growth. Result: AVPlayer's rate
-        // dropped to 0 right after asset.load completed and never
-        // resumed — startup permanently stalls. The risk note above
-        // is real and the fix is to leave the default in place.)
+        // Keep automaticallyWaitsToMinimizeStalling at default true: false caused permanent startup stall on 4K HEVC (rate dropped to 0 after asset.load and never resumed).
         self.avPlayer = player
         self.playerLayer = AVPlayerLayer(player: player)
         self.playerLayer.videoGravity = .resizeAspect
@@ -118,69 +124,54 @@ final class NativeAVPlayerHost {
 
     // MARK: - Lifecycle
 
-    /// Load the URL produced by `HLSVideoEngine` (loopback HLS-fMP4).
-    /// `DisplayCriteriaController.apply(...)` must have been invoked
-    /// upstream so AVKit can configure the HDR pipeline against the
-    /// right target mode before the first segment is fetched.
-    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0) {
-        unloadCurrentItem()
+    /// AVURLAsset creation options for extra HTTP headers; nil when there are none, keeping the
+    /// loopback path's default asset untouched. AVFoundation applies AVURLAssetHTTPHeaderFieldsKey
+    /// to playlist and segment requests, which is what header-enforcing remote-HLS origins
+    /// (IPTV / Stremio per-stream Referer / User-Agent / Authorization) need (#119).
+    nonisolated static func assetCreationOptions(httpHeaders: [String: String]) -> [String: Any]? {
+        httpHeaders.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders]
+    }
 
+    /// Load the loopback HLS-fMP4 URL into AVPlayer. DisplayCriteriaController.apply must run first so the HDR pipeline is configured before the first segment fetch.
+    /// `inPlaceSwap`: atomic same-content item swap for the #93 recovery reload. The default
+    /// teardown pauses and drops the current item to nil before the new one exists; during PiP
+    /// that nil-item gap invalidates AVKit's content source (the PiP window was dismissed ~16 s
+    /// after an in-PiP recovery reload) and the pause bounces transport for nothing. The swap
+    /// keeps transport intent, clocks and the old item alive until replaceCurrentItem hands
+    /// AVPlayer the fresh one.
+    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:]) {
+        unloadCurrentItem(inPlaceSwap: inPlaceSwap)
+
+        self.surfaceEndFailures = surfaceEndFailures
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
+        let loadStart = DispatchTime.now()
+        loadStartTime = loadStart
 
-        EngineLog.emit("[NativeAVPlayerHost] #\(sid) load url=\(url.absoluteString) startPos=\(startPosition.map { String(format: "%.2fs", $0) } ?? "nil")", category: .engine)
+        EngineLog.emit("[NativeAVPlayerHost] #\(sid) load url=\(url.absoluteString) startPos=\(startPosition.map { String(format: "%.2fs", $0) } ?? "nil") headers=\(httpHeaders.isEmpty ? "none" : "\(httpHeaders.count)")", category: .engine)
 
-        let asset = AVURLAsset(url: url)
+        // First-frame-visible diagnostic (see `layerReadyObservation`).
+        layerReadyObservation = playerLayer.observe(
+            \.isReadyForDisplay, options: [.new, .initial]
+        ) { layer, change in
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - loadStart.uptimeNanoseconds) / 1_000_000_000
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sid) layer.isReadyForDisplay=\(change.newValue ?? layer.isReadyForDisplay) t+\(String(format: "%.2f", elapsed))s",
+                category: .engine
+            )
+        }
+
+        let asset = AVURLAsset(url: url, options: Self.assetCreationOptions(httpHeaders: httpHeaders))
         let item = AVPlayerItem(asset: asset)
-        // Forward-buffer floor before AVPlayer leaves
-        // `waitingToPlayAtSpecifiedRate` and starts rendering.
-        //
-        // VOD and loopback-live both use this 4 s default: it matches the
-        // loopback HLS segment cadence, enough to ride out a normal
-        // segment-generation hiccup from the local producer without
-        // ballooning resident memory. Loopback-live deliberately does NOT
-        // raise this — a deeper buffer makes AVPlayer pull the whole visible
-        // playlist up front and race to the live edge, then stall on the
-        // transcode warm-up gap; the 4 s buffer paces consumption instead
-        // (see AetherEngine.loadNative call site, verified on device).
-        //
-        // Live remote-HLS (loadRemoteHLS) passes 0 (system adaptive).
-        // Against a remote, bandwidth-limited Jellyfin live transcode the
-        // 4 s floor forced AVPlayer to pull ~4 s (~10 MB at 20 Mbps) before
-        // unblocking — a 3-4 s black screen at startup while the server
-        // transcoded + shipped that buffer. 0 hands buffering back to
-        // AVPlayer's own heuristic, which starts as soon as it has a
-        // playable lead. preferredForwardBufferDuration == 0.0 is the
-        // documented "let the player choose" value.
+        // 4s default matches loopback HLS segment cadence; raising it for live makes AVPlayer race to the edge and stall at the transcode warm-up gap.
+        // Remote-HLS passes 0 (system adaptive): 4s forced a 3-4s black screen on bandwidth-limited Jellyfin live transcodes.
         item.preferredForwardBufferDuration = forwardBufferDuration
 
-        // Forward per-frame HDR metadata (HDR10+ ST 2094-40 and Dolby
-        // Vision RPU) from the source bitstream into AVPlayer's
-        // display-mode handshake. Without this, AVPlayer renders DV
-        // sources in static HDR10 base only — the TV switches to
-        // generic HDR mode instead of Dolby Vision mode, and DV
-        // tone-mapping curves never engage. DrHurt's tests confirmed
-        // that P8 MKVs and DV-tagged MP4s played end-to-end but the
-        // Philips TV stayed in HDR mode for DV sources; he flagged
-        // the missing AVPlayerItem flag specifically.
-        //
-        // Caller can disable when the routing decision routes through
-        // the media playlist (panel locked SDR + match off path), where
-        // AVPlayer can't engage HDR mode anyway and the per-frame
-        // metadata pipeline is suspected of slow memory growth on long
-        // DV 8.1 sessions (rss ~3 MB/sec linear, no visible bound).
-        // Engine sets this to `false` for SDR-fallback paths so the
-        // 4K HDR per-frame metadata path is bypassed and the leak
-        // suspect is removed from those sessions.
+        // Enables per-frame HDR10+ / DV RPU metadata; without it DV sources show in HDR10 mode (DrHurt: Philips TV stayed in HDR mode for P8 MKVs).
+        // Set false on SDR-fallback paths -- the per-frame metadata pipeline is suspected of ~3 MB/sec RSS growth on long DV 8.1 sessions.
         item.appliesPerFrameHDRDisplayMetadata = perFrameHDR
-        // Apply any externalMetadata the host has pre-staged before this
-        // load (e.g. system Now Playing title + artwork). Setting it
-        // BEFORE AVPlayer.replaceCurrentItem-equivalent is the documented
-        // safe order; doing it after the asset has started loading races
-        // with AVPlayer's internal track-load. `AVPlayerItem.externalMetadata`
-        // is unavailable on macOS — macOS hosts must write
-        // `MPNowPlayingInfoCenter` directly.
+        // Apply before replaceCurrentItem (documented safe order; setting after races AVPlayer's track-load). externalMetadata is unavailable on macOS.
         #if !os(macOS)
         if !pendingExternalMetadata.isEmpty {
             item.externalMetadata = pendingExternalMetadata
@@ -189,13 +180,20 @@ final class NativeAVPlayerHost {
         playerItem = item
         accessLogCount = 0
         failureMessage = nil
-        failureError = nil
+        pendingDisplayRejection = nil
+        lastSuppressedStartupFailure = nil
         isReady = false
+        seekableEnd = 0
 
-        // Status observer to track readyToPlay / failed transitions.
-        // KVO observation runs on the same thread that mutated the
-        // observed value, in this case AVPlayerItem hops to its own
-        // queue, so we round-trip back to MainActor explicitly.
+        // #134: mirror seekableTimeRanges instead of reading it per call. The callback runs on
+        // the item's queue where the re-read is a harmless off-main XPC; live playlist refreshes
+        // keep it current, including while paused.
+        seekableObservation = item.observe(\.seekableTimeRanges, options: [.initial, .new]) { [weak self] item, _ in
+            let end = Self.seekableEnd(from: item.seekableTimeRanges)
+            Task { @MainActor in self?.seekableEnd = end }
+        }
+
+        // KVO fires on AVPlayerItem's queue; Task round-trips to MainActor.
         statusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             let statusStr: String
             switch item.status {
@@ -208,41 +206,14 @@ final class NativeAVPlayerHost {
             let errSuffix = nsErr.map { " err=\($0.domain)/\($0.code) '\($0.localizedDescription)'" } ?? ""
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.status=\(statusStr)\(errSuffix)", category: .engine)
 
-            // On .failed, dump the asset's track format descriptions
-            // so we can see what codec FourCC AVPlayer actually saw.
-            // Targets DrHurt's hev1 / dvhe rejection caveat: if a
-            // session fails because the source's sample-entry tag is
-            // hev1 instead of hvc1, that shows up here as "video
-            // codec='hev1'". Also surfaces the underlying NSError
-            // chain which often has the precise CoreMedia /
-            // VideoToolbox cause behind the AVFoundationErrorDomain
-            // wrapper.
-            //
-            // On .readyToPlay we also dump now (besides failures)
-            // because the audio-track row carries the parsed
-            // CMAudioFormatDescription: sample rate, channel count,
-            // channel layout tag. Critical for diagnosing the FLAC
-            // bridge surround-to-stereo downmix path — if the layout
-            // tag comes back <missing> or kAudioChannelLayoutTag_Stereo
-            // for an 8-channel source, the downmix is happening at
-            // AVPlayer's moov parse rather than at the route / soundbar.
+            // On .failed: dump track FourCCs (hev1 vs hvc1 rejection, dvhe vs dvh1) and full NSError chain.
+            // On .readyToPlay: dump audio CMAudioFormatDescription (channel layout tag diagnoses FLAC-bridge downmix vs route downmix).
             if item.status == .failed {
                 if let nsErr = nsErr,
                    let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.error.underlying=\(underlying.domain)/\(underlying.code) '\(underlying.localizedDescription)'", category: .engine)
                 }
-                Self.dumpAssetTracks(item.asset, sid: sid, reason: "item.failed")
-                // Dump every error-log event accumulated since item
-                // creation. AVPlayer's internal HLS pipeline writes
-                // granular diagnostics here (variant filter rejections,
-                // CODECS mismatches, init.mp4 parse failures, ATS
-                // blocks, manifest errors) that the wrapped
-                // AVFoundation/CoreMedia error codes hide. The
-                // `newErrorLogEntryNotification` observer only catches
-                // entries logged AFTER it registers, which races
-                // synchronous entries logged during replaceCurrentItem;
-                // polling the full log on .failed catches every entry
-                // regardless of timing.
+                // Poll full errorLog on .failed (notification observer misses synchronous entries during replaceCurrentItem).
                 if let log = item.errorLog() {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) errorLog dump: \(log.events.count) events", category: .engine)
                     for (idx, event) in log.events.enumerated() {
@@ -263,33 +234,12 @@ final class NativeAVPlayerHost {
                 } else {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) accessLog dump: <nil>", category: .engine)
                 }
-                // Item-level state diagnostics. For HLS assets `asset.tracks`
-                // is documented empty, but `item.tracks` may contain the
-                // AVPlayerItemTrack array AVPlayer constructed from the
-                // playlist alone (before init.mp4 parse). presentationSize,
-                // seekableTimeRanges, and currentMediaSelection reveal
-                // what AVPlayer DID manage to extract from the playlist
-                // versus what it couldn't.
-                EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.tracks count=\(item.tracks.count)", category: .engine)
-                for (idx, itrack) in item.tracks.enumerated() {
-                    let mediaType = itrack.assetTrack?.mediaType.rawValue ?? "?"
-                    let fdesc = itrack.assetTrack?.formatDescriptions.first
-                    let fourCC: String
-                    if let cm = fdesc {
-                        // swiftlint:disable:next force_cast
-                        let cmDesc = cm as! CMFormatDescription
-                        let code = CMFormatDescriptionGetMediaSubType(cmDesc)
-                        let b: [UInt8] = [
-                            UInt8((code >> 24) & 0xff),
-                            UInt8((code >> 16) & 0xff),
-                            UInt8((code >> 8) & 0xff),
-                            UInt8(code & 0xff),
-                        ]
-                        fourCC = String(bytes: b.map { ($0 >= 0x20 && $0 < 0x7f) ? $0 : 0x2e }, encoding: .ascii) ?? "????"
-                    } else {
-                        fourCC = "<no fdesc>"
-                    }
-                    EngineLog.emit("[NativeAVPlayerHost] #\(sid)   item.tracks[\(idx)] mediaType=\(mediaType) fourCC=\(fourCC) enabled=\(itrack.isEnabled)", category: .engine)
+                // AVAsset/AVAssetTrack track info is load-based + main-actor in current SDKs; dump it off
+                // the KVO callback on the main actor (HLS asset.tracks is empty; item.tracks shows what
+                // AVPlayer built from the playlist before init.mp4 parse).
+                Task { @MainActor in
+                    await Self.dumpAssetTracks(item.asset, sid: sid, reason: "item.failed")
+                    await Self.dumpFailedItemTracks(item, sid: sid)
                 }
                 EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.presentationSize=\(item.presentationSize)", category: .engine)
                 EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.seekableTimeRanges.count=\(item.seekableTimeRanges.count)", category: .engine)
@@ -298,24 +248,11 @@ final class NativeAVPlayerHost {
                 EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.duration=\(item.duration.seconds.isFinite ? String(format: "%.2f", item.duration.seconds) : "indef")", category: .engine)
                 EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.appliesPerFrameHDRDisplayMetadata=\(item.appliesPerFrameHDRDisplayMetadata)", category: .engine)
             } else if item.status == .readyToPlay {
-                // For HLS sources `asset.tracks` returns empty
-                // synchronously — the tracks live on AVPlayerItem
-                // instead. Dump the player-item's audio tracks so we
-                // can see what AVPlayer parsed from the moov for
-                // diagnostic, plus the active audio route's channel
-                // count after the route renegotiates against the
-                // loaded asset.
-                Self.dumpPlayerItemTracks(item, sid: sid)
-                // Dump the route here for reference, but do NOT warn yet:
-                // at readyToPlay the player is still paused and AVKit has
-                // not finished negotiating the HDMI output format. On a
-                // sink that idles at stereo (Continuous Audio off) the
-                // route still reads ch=2 at this instant and only lifts to
-                // the source channel count once playback actually starts.
-                // Warning here produced false "downmix" reports (issue
-                // #24). The capability check runs from the settled re-dump
-                // on the first .playing transition instead.
-                Self.dumpAudioRoute(sid: sid, phase: "readyToPlay, route may still be negotiating")
+                // HLS: asset.tracks is empty; dump item.tracks for audio codec/layout. Route not warned yet: stereo-idle sinks (Continuous Audio off) read ch=2 until first .playing (issue #24).
+                Task { @MainActor in
+                    await Self.dumpPlayerItemTracks(item, sid: sid)
+                    Self.dumpAudioRoute(sid: sid, phase: "readyToPlay, route may still be negotiating")
+                }
             }
 
             Task { @MainActor in
@@ -324,11 +261,18 @@ final class NativeAVPlayerHost {
                 case .readyToPlay:
                     self.duration = item.duration.seconds.isFinite ? item.duration.seconds : 0
                     self.isReady = true
+                    // Re-assert play() if the replaceCurrentItem swap swallowed it (playIntent latch).
+                    if self.playIntent, self.avPlayer.timeControlStatus == .paused {
+                        EngineLog.emit(
+                            "[NativeAVPlayerHost] #\(self.sessionID) readyToPlay with play intent "
+                            + "but player parked (swallowed play() during item swap); re-issuing play()",
+                            category: .engine
+                        )
+                        self.avPlayer.play()
+                    }
                 case .failed:
-                    self.failureError = (item.error as NSError?)
-                        ?? NSError(domain: AVFoundationErrorDomain, code: -1,
-                                   userInfo: [NSLocalizedDescriptionKey: "AVPlayerItem failed (no description)"])
-                    self.failureMessage = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
+                    let desc = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
+                    self.handleItemFailed(desc, item: item)
                 default:
                     break
                 }
@@ -343,11 +287,7 @@ final class NativeAVPlayerHost {
             }
         }
 
-        // timeControlStatus + reasonForWaitingToPlay together explain
-        // whether AVPlayer is paused, waiting on buffer, or actively
-        // playing. Critical for diagnosing "spinner forever" symptoms
-        // because reasonForWaitingToPlay surfaces the exact stall cause
-        // (.evaluatingBufferingRate / .toMinimizeStalls / etc.).
+        // timeControlStatus + reasonForWaitingToPlay diagnose "spinner forever" -- reason surfaces the exact stall cause.
         timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let status = player.timeControlStatus
             let statusStr: String
@@ -358,58 +298,64 @@ final class NativeAVPlayerHost {
             @unknown default:                      statusStr = "@unknown"
             }
             let reason = player.reasonForWaitingToPlay?.rawValue ?? "-"
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) reason=\(reason)", category: .engine)
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - (self?.loadStartTime ?? DispatchTime.now()).uptimeNanoseconds) / 1_000_000_000
+            EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) reason=\(reason) t+\(String(format: "%.2f", elapsed))s", category: .engine)
             Task { @MainActor in
                 guard let self = self else { return }
                 self.timeControlStatus = status
-                // On the first real .playing transition, re-sample the
-                // audio route after a short settle delay: AVKit negotiates
-                // the HDMI output format (stereo -> source channel count /
-                // Dolby) only once playback actually starts, so this is the
-                // first point the route reflects the true steady state. The
-                // downmix warnings run here, not at readyToPlay (issue #24).
+                // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
+                if status == .playing { self.hasEverPlayed = true }
                 if status == .playing, !self.didSampleSettledRoute {
                     self.didSampleSettledRoute = true
                     Task { @MainActor [weak self] in
                         try? await Task.sleep(nanoseconds: 2_500_000_000)
                         guard let self = self, let item = self.playerItem else { return }
                         Self.dumpAudioRoute(sid: sid, phase: "settled")
-                        Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
-                        Self.warnIfEAC3SurroundOnStereoRoute(item, sid: sid)
+                        await Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
+                        await Self.warnIfEAC3SurroundOnStereoRoute(item, sid: sid)
                     }
                 }
             }
         }
 
-        // Error log: AVPlayer surfaces transient HLS-level errors
-        // (404 on a segment, parse failure on a manifest, ATS rejection,
-        // codec mismatch) without flipping the item to .failed. These
-        // are the gold mine for "AVPlayer just sits there" diagnostics.
+        // errorLog: transient HLS-level errors (404, manifest parse failures, ATS, codec mismatch) without flipping .failed -- gold mine for "AVPlayer just sits there" diagnostics.
         let errLogObs = NotificationCenter.default.addObserver(
             forName: AVPlayerItem.newErrorLogEntryNotification,
             object: item,
             queue: .main
         ) { [weak self] _ in
-            guard let self = self, let event = self.playerItem?.errorLog()?.events.last else { return }
-            let comment = event.errorComment ?? "no comment"
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) errorLog code=\(event.errorStatusCode) domain=\(event.errorDomain) uri=\(event.uri ?? "-") '\(comment)'", category: .engine)
+            // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
+            MainActor.assumeIsolated {
+                guard let self = self, let event = self.playerItem?.errorLog()?.events.last else { return }
+                let comment = event.errorComment ?? "no comment"
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) errorLog code=\(event.errorStatusCode) domain=\(event.errorDomain) uri=\(event.uri ?? "-") '\(comment)'", category: .engine)
+                // #93 startup: -15628 is the loader-poison signature. Before the first frame no
+                // playbackStalled will ever fire (playback never started), so the stall-driven
+                // dead-consumer watchdog would never arm; surface the poison as a stall signal.
+                // The watchdog's own guards (fetches frozen, waitingToPlay, item healthy) drop
+                // transients where the loader in fact survived.
+                if event.errorStatusCode == -15628 {
+                    EngineLog.emit("[NativeAVPlayerHost] #\(sid) -15628 loader poison: surfacing as stall signal", category: .engine)
+                    self.stallCount += 1
+                }
+            }
         }
         notificationObservers.append(errLogObs)
 
-        // Access log: log only the first few entries so we know
-        // whether AVPlayer ever reached the segment-fetch stage.
-        // AVPlayer can pump hundreds of these for a long stream so
-        // capping at 5 keeps the overlay readable.
+        // Cap accessLog at 5 entries (AVPlayer pumps hundreds on long streams); confirms AVPlayer reached the segment-fetch stage.
         let accessLogObs = NotificationCenter.default.addObserver(
             forName: AVPlayerItem.newAccessLogEntryNotification,
             object: item,
             queue: .main
         ) { [weak self] _ in
-            guard let self = self,
-                  self.accessLogCount < 5,
-                  let event = self.playerItem?.accessLog()?.events.last else { return }
-            self.accessLogCount += 1
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) accessLog uri=\(event.uri ?? "-") server=\(event.serverAddress ?? "-") bytes=\(event.numberOfBytesTransferred) reqs=\(event.numberOfMediaRequests)", category: .engine)
+            // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
+            MainActor.assumeIsolated {
+                guard let self = self,
+                      self.accessLogCount < 5,
+                      let event = self.playerItem?.accessLog()?.events.last else { return }
+                self.accessLogCount += 1
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) accessLog uri=\(event.uri ?? "-") server=\(event.serverAddress ?? "-") bytes=\(event.numberOfBytesTransferred) reqs=\(event.numberOfMediaRequests)", category: .engine)
+            }
         }
         notificationObservers.append(accessLogObs)
 
@@ -417,10 +363,32 @@ final class NativeAVPlayerHost {
             forName: AVPlayerItem.failedToPlayToEndTimeNotification,
             object: item,
             queue: .main
-        ) { notification in
+        ) { [weak self] notification in
             let err = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
             let suffix = err.map { " \($0.domain)/\($0.code) '\($0.localizedDescription)'" } ?? ""
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) failedToPlayToEndTime\(suffix)", category: .engine)
+            // Capture only Sendable values (sid: Int, desc: String) across the actor hop; reach the item via
+            // self.playerItem on the main actor (the notification/item are non-Sendable). The sid==sessionID
+            // guard rejects a stale notification from a since-replaced session.
+            let desc = err?.localizedDescription
+                ?? "The live stream stopped (the source could not continue)."
+            // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
+            MainActor.assumeIsolated {
+                guard let self = self, self.sessionID == sid,
+                      let current = self.playerItem else { return }
+                if self.surfaceEndFailures {
+                    // AVPlayer gave up on this item (rate 0, no more segments) and `.failed` may never fire
+                    // (item.status can stay readyToPlay). Route into the same deferred confirmation as a .failed
+                    // KVO: a transient that resumes within the window self-clears; a dead upstream (live IPTV
+                    // token expiry, persistent segment 404) surfaces .error so the host can retune / show it.
+                    self.handleItemFailed(desc, item: current)
+                } else if Self.shouldCountEndFailureForRevive(
+                    surfaceEndFailures: false, hasEverPlayed: self.hasEverPlayed) {
+                    // #93 round 3: loopback path. Count the death for the engine's revive
+                    // escalation; a startup death (never played) stays with the startup watchdogs.
+                    self.endFailureCount += 1
+                }
+            }
         }
         notificationObservers.append(failedToEndObs)
 
@@ -428,15 +396,16 @@ final class NativeAVPlayerHost {
             forName: AVPlayerItem.playbackStalledNotification,
             object: item,
             queue: .main
-        ) { _ in
+        ) { [weak self] _ in
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) playbackStalled", category: .engine)
+            // #93 residual: the engine opens its spurious-pause recovery window on every stall.
+            // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
+            MainActor.assumeIsolated {
+                self?.stallCount += 1
+            }
         }
         notificationObservers.append(stalledObs)
 
-        // End-of-stream: AVPlayer fires didPlayToEndTime when the
-        // last sample is rendered. Flip the published flag so the
-        // engine knows the session reached its natural end (engine
-        // forwards that to state = .idle).
         let didEndObs = NotificationCenter.default.addObserver(
             forName: AVPlayerItem.didPlayToEndTimeNotification,
             object: item,
@@ -449,51 +418,37 @@ final class NativeAVPlayerHost {
         }
         notificationObservers.append(didEndObs)
 
-        // Periodic time observer at 100 ms drives the scrub bar
-        // and the resume-position progress reporter. The closure is
-        // already invoked on `.main`, so the `MainActor` mutation
-        // is safe; cast through a Task to satisfy the Sendable check.
+        // 100ms periodic observer drives scrub bar; Task wrapper satisfies Sendable check.
         timeObserver = avPlayer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.1, preferredTimescale: 600),
             queue: .main
         ) { [weak self] time in
             let value = time.seconds.isFinite ? time.seconds : 0
             Task { @MainActor in
-                self?.currentTime = value
+                guard let self else { return }
+                // renderedTime tracks the parked on-screen frame mid-seek (issue #49).
+                self.renderedTime = value
+                // seekInFlight suppresses currentTime: AVPlayer still reports pre-seek clock until physical landing (issue #37).
+                guard !self.seekInFlight else { return }
+                self.currentTime = value
             }
         }
 
         avPlayer.replaceCurrentItem(with: item)
 
-        // Explicitly kick off the async load of the asset's playable /
-        // tracks / duration values. AVPlayerItem(asset:) plus KVO on
-        // status SHOULD trigger this implicitly per Apple's docs, but
-        // the build-123 overlay showed AVPlayer stuck in waitingToPlay
-        // with the item never advancing past .unknown — consistent
-        // with the asset never beginning its async load. Forcing the
-        // load explicitly removes that ambiguity.
-        //
-        // We load each key in a separate await so DrHurt's
-        // "1 success, 3 failures" log signature can be decoded down
-        // to "which key is the -1008 hitting on": isPlayable, tracks,
-        // or duration. With the batch load they all share one error
-        // and we can't tell which probe AVFoundation gave up on.
+        // Explicitly load each key separately: AVPlayerItem(asset:)+KVO was observed stuck in .unknown (build-123), and separate awaits let DrHurt's "1 success, 3 failures" pattern identify which key -1008 hits.
         let urlStr = url.absoluteString
-        Task { [weak self] in
+        Task { @MainActor in
             for key in ["isPlayable", "tracks", "duration"] {
                 do {
-                    switch key {
-                    case "isPlayable": _ = try await asset.load(.isPlayable)
-                    case "tracks":     _ = try await asset.load(.tracks)
-                    case "duration":   _ = try await asset.load(.duration)
-                    default: continue
-                    }
+                    // Use the value returned by the async load instead of re-reading the deprecated
+                    // synchronous accessor (asset.isPlayable / .tracks / .duration).
                     let detail: String
                     switch key {
-                    case "isPlayable": detail = "value=\(asset.isPlayable)"
-                    case "tracks":     detail = "count=\(asset.tracks.count)"
-                    case "duration":   detail = "seconds=\(asset.duration.seconds)"
-                    default: detail = "-"
+                    case "isPlayable": detail = "value=\(try await asset.load(.isPlayable))"
+                    case "tracks":     detail = "count=\(try await asset.load(.tracks).count)"
+                    case "duration":   detail = "seconds=\(try await asset.load(.duration).seconds)"
+                    default: continue
                     }
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.load(\(key)) ok url=\(urlStr) \(detail)", category: .engine)
                 } catch {
@@ -502,124 +457,277 @@ final class NativeAVPlayerHost {
                     if let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
                         EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.load(\(key)) underlying=\(underlying.domain)/\(underlying.code) '\(underlying.localizedDescription)'", category: .engine)
                     }
-                    // Dump whatever track info AVFoundation managed
-                    // to populate before the load gave up. Targets
-                    // DrHurt's -1008 stall: even on failure the
-                    // asset's first probe often surfaces the
-                    // sample-entry FourCC (hev1 vs hvc1, dvhe vs
-                    // dvh1) that explains the rejection.
-                    Self.dumpAssetTracks(asset, sid: sid, reason: "asset.load(\(key)).failed")
-                    _ = self
+                    // Dump partial track info even on failure: DrHurt's -1008 stall still surfaces the FourCC (hev1 vs hvc1, dvhe vs dvh1).
+                    await Self.dumpAssetTracks(asset, sid: sid, reason: "asset.load(\(key)).failed")
                     return
                 }
             }
         }
 
-        // Always issue an explicit seek so AVPlayer doesn't fall back
-        // to its EVENT-playlist live-edge default. For VOD this is a
-        // no-op (default start is already time 0); for the sliding-
-        // window EVENT path it's what makes replay-from-beginning land
-        // at 0:00 instead of at the end of the initial visible window
-        // (~2 min in for a 30-segment initialFillSegments window).
-        // EXT-X-START:TIME-OFFSET=0 in the playlist is the spec-level
-        // hint but isn't enough on its own — AVPlayer treats EVENT
-        // playlists as "start near the live edge" unless the caller
-        // explicitly seeks first.
-        //
-        // Live remote-HLS (nativeRemoteHLS) WANTS AVPlayer's natural live-
-        // edge start, so it sets skipInitialSeek and we leave the position
-        // to AVPlayer. VOD / loopback (default) seeks to startPosition.
+        // Explicit seek prevents AVPlayer from defaulting to the EVENT-playlist live edge. Remote-HLS and loopback live REJOINS set skipInitialSeek (backlog-start seek was the prime suspect for permanent waitingToPlay on rejoin; see LiveReloadPolicy.skipInitialSeek).
         if !skipInitialSeek {
-            seek(to: startPosition ?? 0)
+            // Load-time seek (not a user scrub): no seekInFlight needed; the async seek(to:) carries #37/#38 semantics for user seeks.
+            avPlayer.seek(to: CMTime(seconds: startPosition ?? 0, preferredTimescale: 600),
+                          toleranceBefore: .zero, toleranceAfter: .zero)
         }
     }
 
-    /// Release the AVPlayerItem so a follow-up `load(...)` starts
-    /// from a clean state. Caller is responsible for resetting the
-    /// display-criteria (the engine does this from
-    /// `stopInternal()` after invoking `tearDown()` here).
     func tearDown() {
         unloadCurrentItem()
     }
 
+    // MARK: - Failure handling
+
+    /// Shared deferred-failure resolution: after the confirm window, surface a terminal failure only if the
+    /// player neither resumed playing nor advanced the clock past `threshold`. Pure so the `.failed` KVO and
+    /// the live `failedToPlayToEndTime` routing share one recovery contract (a self-healing transient that
+    /// resumes within the window must never surface, a frozen player must).
+    nonisolated static func shouldSurfaceDeferredFailure(
+        isPlaying: Bool, clockAtFailure: Double, clockNow: Double, threshold: Double = 0.5
+    ) -> Bool {
+        if isPlaying { return false }
+        if clockNow > clockAtFailure + threshold { return false }
+        return true
+    }
+
+    /// #93 round 3, pure decision: does a `failedToPlayToEndTime` count toward the loopback
+    /// revive escalation? The lean remote-live path (`surfaceEndFailures`) keeps its own
+    /// deferred-failure contract; a startup death before the first frame stays with the
+    /// startup watchdogs.
+    nonisolated static func shouldCountEndFailureForRevive(
+        surfaceEndFailures: Bool, hasEverPlayed: Bool
+    ) -> Bool {
+        !surfaceEndFailures && hasEverPlayed
+    }
+
+    /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).
+    /// Discriminates on hasEverPlayed, not instantaneous timeControlStatus: .failed and timeControlStatus KVOs are unsynchronized (426b45c: still published terminal failure at 27.3s while AVPlayer played smoothly).
+    /// Before first .playing: surface promptly (genuine startup failure). After: defer 5s and confirm -- clear if .playing or clock advanced, surface if both stopped.
+    @MainActor
+    private func handleItemFailed(_ desc: String, item: AVPlayerItem) {
+        // Ignore a late `.failed` KVO from an item we have already replaced.
+        guard playerItem === item else { return }
+
+        failureConfirmToken &+= 1
+        let token = failureConfirmToken
+
+        // Startup failure: never reached .playing, so nothing to recover here. A display-rejection
+        // of the served master (#98) is instead handed to the engine, which reloads the media
+        // playlist; only a non-rejection startup failure surfaces immediately.
+        if !hasEverPlayed {
+            let code = (item.error as NSError?)?.code
+            // #35: while the cold-DV-master readiness gate drives the retry loop it owns ALL startup
+            // failures (a display rejection AND the -11819 "Cannot Complete Action" cold handshake).
+            // Stash the message and stay silent; the gate polls item state and reloads the master /
+            // falls back to media / surfaces a terminal error itself. Publishing here would race it.
+            if startupReadinessGateActive {
+                lastSuppressedStartupFailure = desc
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sessionID) startup .failed (code=\(code.map(String.init) ?? "?")) "
+                    + "held by the readiness gate: \(desc)",
+                    category: .engine)
+                return
+            }
+            if let code, MasterFallbackDecision.isMasterRejectionCode(code) {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
+                    + "(code=\(code)); signalling engine for media fallback instead of surfacing",
+                    category: .engine)
+                pendingDisplayRejection = DisplayRejection(code: code, message: desc)
+                return
+            }
+            failureMessage = desc
+            return
+        }
+
+        let clockAtFailure = renderedTime
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sessionID) item.status=.failed after playback established "
+            + "(tcs=\(avPlayer.timeControlStatus.rawValue) clock=\(String(format: "%.2f", clockAtFailure))); "
+            + "deferring possibly-spurious failure: \(desc)",
+            category: .engine
+        )
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self = self,
+                  self.failureConfirmToken == token,
+                  self.playerItem === item else { return }
+            let advanced = self.renderedTime > clockAtFailure + 0.5
+            if Self.shouldSurfaceDeferredFailure(
+                isPlaying: self.avPlayer.timeControlStatus == .playing,
+                clockAtFailure: clockAtFailure,
+                clockNow: self.renderedTime
+            ) {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure confirmed: player stopped "
+                    + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
+                    + "clock=\(String(format: "%.2f", self.renderedTime)))",
+                    category: .engine
+                )
+                self.failureMessage = desc
+            } else {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: player recovered "
+                    + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
+                    + "clock=\(String(format: "%.2f", self.renderedTime)) advanced=\(advanced))",
+                    category: .engine
+                )
+            }
+        }
+    }
+
+    /// #35: poll the current item after `play()` until it becomes playable, dies, or the settle
+    /// window elapses. `.ready` as soon as the item reports a non-zero presentation size or actually
+    /// starts playing (`hasEverPlayed`); `.dead` on `item.status == .failed`; `.timedOut` if neither
+    /// happens within `timeoutSeconds` (the silent 0-track park, `AVPlayerWaitingWithNoItemToPlay`).
+    /// Bounded by construction, so the engine's gate loop can never spin forever. `item.status` only
+    /// advances once AVPlayer is told to play, so the caller must `play()` before awaiting.
+    func awaitStartupReadiness(timeoutSeconds: Double) async -> StartupReadiness {
+        let tickMs: UInt64 = 100
+        let ticks = max(1, Int((timeoutSeconds * 1000).rounded()) / Int(tickMs))
+        for _ in 0..<ticks {
+            guard let item = playerItem else { return .dead }
+            if hasEverPlayed || item.presentationSize != .zero { return .ready }
+            if item.status == .failed { return .dead }
+            try? await Task.sleep(nanoseconds: tickMs * 1_000_000)
+        }
+        if let item = playerItem, hasEverPlayed || item.presentationSize != .zero { return .ready }
+        return .timedOut
+    }
+
     // MARK: - Playback control
 
-    /// Live, synchronous read of whether the player intends to be playing
-    /// (`.playing`, or the transient `.waitingToPlayAtSpecifiedRate` buffer
-    /// stall). Read at the moment of a toggle so a rapid press can't act on
-    /// the async `timeControlStatus` mirror before it has caught up.
     var isEffectivelyPlaying: Bool { avPlayer.timeControlStatus != .paused }
+    var liveTimeControlStatus: AVPlayer.TimeControlStatus { avPlayer.timeControlStatus }
 
-    /// End (seconds) of the AVPlayer item's last seekable time range, or 0 when
-    /// no seekable range is available. For a live HLS playlist this tracks the
-    /// live edge in the AVPlayer clock.
-    var seekableEnd: Double {
-        guard let r = avPlayer.currentItem?.seekableTimeRanges.last?.timeRangeValue else { return 0 }
+    /// #122: durable engine-routed transport intent (the last play/pause/setRate command), untouched
+    /// by a seek. External AVKit / MediaRemote commands are reflected by `timeControlStatus` instead.
+    /// Unlike `isEffectivelyPlaying` (instantaneous, momentarily `.paused`/`.waitingToPlay` right
+    /// after a landing) this survives a scrub, so the engine's seek finalize can land a paused
+    /// scrub paused instead of forcing `.playing`.
+    var transportIntentIsPlaying: Bool { playIntent }
+
+    /// #123: true while AVPlayer is still buffering toward a seek target (`waitingToPlayAtSpecifiedRate`)
+    /// rather than presenting a frame. A paused or playing status is presenting the on-screen frame at
+    /// the current position (a paused scrub shows the seeked frame); only `waitingToPlay` has the
+    /// picture frozen BEHIND the target while it fills. The seek finalize / landing use this to avoid
+    /// stamping `sourceTime`/`renderedTime` to a target the picture has not reached yet (#123).
+    var isBufferingTowardSeekTarget: Bool { avPlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate }
+
+    /// Maps `seekableTimeRanges` to the end of the last range (seconds); 0 when empty or non-finite.
+    nonisolated static func seekableEnd(from ranges: [NSValue]) -> Double {
+        guard let r = ranges.last?.timeRangeValue else { return 0 }
         let end = CMTimeGetSeconds(r.start + r.duration)
         return end.isFinite ? end : 0
     }
 
+    /// End of the contiguous buffered span covering the playhead (AetherEngine#54); disjoint ranges ahead of a gap are ignored.
+    var bufferedEnd: Double {
+        guard let item = avPlayer.currentItem else { return 0 }
+        let now = item.currentTime().seconds
+        guard now.isFinite else { return 0 }
+        var end = now
+        for value in item.loadedTimeRanges {
+            let r = value.timeRangeValue
+            let s = r.start.seconds
+            let e = (r.start + r.duration).seconds
+            guard s.isFinite, e.isFinite else { continue }
+            // Contiguous with the playhead (small tolerance for the gap
+            // between the rendered frame and the range's reported start).
+            if s <= now + 1.0 && e >= now { end = max(end, e) }
+        }
+        return end
+    }
+
     func play() {
-        // AVPlayer with `automaticallyWaitsToMinimizeStalling=true`
-        // (the default) handles "play before ready" correctly: it
-        // sets rate=1, transitions to waitingToPlayAtSpecifiedRate,
-        // begins loading the asset, buffers, and once it has enough
-        // it transitions to playing. The earlier defer-until-ready
-        // pattern was a guard against a different bug (master playlist
-        // parse-rejection) and reintroduced a chicken-and-egg here:
-        // item.status doesn't advance until the player is actually
-        // told to play, so deferring play() on item.status kept the
-        // status stuck at .unknown forever.
+        // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
+        playIntent = true
+        // Call play() immediately (no defer-until-ready): item.status never advances past .unknown until AVPlayer is told to play.
         avPlayer.play()
     }
 
     func pause() {
+        playIntent = false
         avPlayer.pause()
     }
 
-    func seek(to seconds: Double) {
-        let target = CMTime(seconds: seconds, preferredTimescale: 600)
-        // Frame-accurate seek. Earlier experiment with
-        // `.positiveInfinity` tolerances to skip the IDR-to-target
-        // decode pre-roll caused AVPlayer to land on apparently-
-        // arbitrary sync samples far from the requested time — the
-        // user's TestFlight session showed the image "hanging" on
-        // wrong-position content during forward scrubs. AVPlayer's
-        // "most efficient seek" interpretation of unbounded tolerance
-        // appears to be undefined for HLS-fMP4 served over loopback,
-        // matching the long-standing openradar 44904505 bug report.
-        // Keep tolerances at zero until we have a different lever
-        // (predictive engine prefetch on scrub commit) that doesn't
-        // depend on tolerance semantics.
-        avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+    /// Resolve only when the seek physically lands (loopback source lands seeks seconds after the call; issue #37).
+    /// seekInFlight suppresses the periodic observer across the wait; only the latest seekGeneration clears it.
+    func seek(to seconds: Double) async {
+        _ = await seek(to: seconds, deadlineSeconds: nil)
     }
 
-    /// Transport-bar seek variant that reports completion + the ACTUAL landed
-    /// playlist time, so `HLSVideoEngine`'s read-ahead gate can resolve its
-    /// pending-seek epoch precisely (`AVPlayer.seek` is async and the periodic
-    /// clock mirror lags). The plain `seek(to:)` above is kept for startup /
-    /// reload callers that don't drive the gate. The completion fires on the
-    /// MainActor (we hop there to read the isolated player's current time).
-    func seek(to seconds: Double, completion: @escaping @Sendable (_ finished: Bool, _ actualSeconds: Double) -> Void) {
+    /// Deadline-bounded seek (#65). Returns `true` if AVPlayer physically landed (or no deadline was set),
+    /// `false` if `deadlineSeconds` elapsed with the seek still pending. On a deadline expiry the in-flight
+    /// `avPlayer.seek` is NOT cancelled (it lands later if it ever can), but `seekInFlight` is cleared for the
+    /// latest generation so the periodic observer resumes publishing AVPlayer's real position, letting the
+    /// engine reconcile a clock that would otherwise stay latched at an unreachable optimistic target.
+    @discardableResult
+    func seek(to seconds: Double, deadlineSeconds: Double?) async -> Bool {
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
-        avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
-            Task { @MainActor [weak self] in
-                let actual = self?.avPlayer.currentTime().seconds ?? seconds
-                completion(finished, actual.isFinite ? actual : seconds)
+        seekGeneration &+= 1
+        let gen = seekGeneration
+        seekInFlight = true
+        latestSeekRenderedTimePublished = false
+        let resumeGuard = SeekResumeGuard()
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            if let deadlineSeconds, deadlineSeconds > 0 {
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
+                    guard resumeGuard.claim() else { return } // landing already won the race
+                    // Clear seekInFlight for the latest generation so the periodic observer un-gates and the
+                    // engine can fold AVPlayer's real position back in. Do not cancel the underlying seek.
+                    if let self, gen == self.seekGeneration { self.seekInFlight = false }
+                    cont.resume(returning: false)
+                }
+            }
+            // Zero tolerances: unbounded tolerances caused AVPlayer to land on arbitrary sync samples for loopback HLS-fMP4 (openradar 44904505).
+            avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self else {
+                        if resumeGuard.claim() { cont.resume(returning: true) }
+                        return
+                    }
+                    // Settle the clock on a real landing even if the deadline already returned (late landing).
+                    // Superseded seek: leave the newer generation's flags intact.
+                    if gen == self.seekGeneration {
+                        self.seekInFlight = false
+                        let landed = self.avPlayer.currentTime().seconds
+                        if landed.isFinite {
+                            self.currentTime = landed
+                            // #49: settle renderedTime so sourceTime settles immediately, BUT only when the
+                            // landed frame is actually presented (playing or paused shows the target frame).
+                            // #123: while still buffering toward the target (`waitingToPlayAtSpecifiedRate`)
+                            // the picture is frozen behind it and `landed` is the target the player accepted,
+                            // not the on-screen frame; stamping it parks renderedTime (and thus sourceTime)
+                            // ahead of the picture for the whole chase, because the 100ms periodic observer is
+                            // silent while waiting and cannot walk it back. Hold renderedTime on the frozen
+                            // frame; the observer settles it to the target when playback resumes.
+                            if AetherEngine.seekLandingSettlesToTarget(
+                                bufferingTowardTarget: self.isBufferingTowardSeekTarget) {
+                                self.latestSeekRenderedTimePublished = true
+                                self.renderedTime = landed
+                            }
+                        }
+                    }
+                    if resumeGuard.claim() { cont.resume(returning: true) }
+                }
             }
         }
     }
 
     func setRate(_ value: Float) {
+        // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
+        playIntent = (value != 0)
         avPlayer.rate = value
     }
 
-    /// Stage the metadata items the host wants on the current and any
-    /// future `AVPlayerItem` of this session. The system Now Playing
-    /// surface reads from `AVPlayerItem.externalMetadata` when an
-    /// `MPNowPlayingSession` is active with automatic publishing on.
-    /// Applied immediately if an item exists; otherwise replays onto the
-    /// next item created by `load(url:startPosition:)`.
+    var volume: Float {
+        get { avPlayer.volume }
+        set { avPlayer.volume = newValue }
+    }
+
+    /// Stage Now Playing metadata; applied immediately and replayed onto future items created by load().
     func setExternalMetadata(_ items: [AVMetadataItem]) {
         pendingExternalMetadata = items
         #if !os(macOS)
@@ -629,7 +737,7 @@ final class NativeAVPlayerHost {
 
     // MARK: - Internal
 
-    private func unloadCurrentItem() {
+    private func unloadCurrentItem(inPlaceSwap: Bool = false) {
         if let to = timeObserver {
             avPlayer.removeTimeObserver(to)
             timeObserver = nil
@@ -640,46 +748,51 @@ final class NativeAVPlayerHost {
         rateObservation = nil
         timeControlObservation?.invalidate()
         timeControlObservation = nil
+        seekableObservation?.invalidate()
+        seekableObservation = nil
+        layerReadyObservation?.invalidate()
+        layerReadyObservation = nil
         for obs in notificationObservers {
             NotificationCenter.default.removeObserver(obs)
         }
         notificationObservers.removeAll()
         accessLogCount = 0
-        // Force the player rate to 0 before swapping the item. On a
-        // native->native reload the host (and its AVPlayer) is reused to
-        // keep AVKit's system Now-Playing registration alive (issue #15),
-        // so the instance carries its previous `rate=1.0` across the swap.
-        // Without this pause, `replaceCurrentItem` lets the new item
-        // auto-resume the moment it buffers — which beats the engine's
-        // `waitForSwitch` + explicit `play()` gate (AetherEngine.load step
-        // 3) and starts audio while the panel is still mid Match-Frame-Rate
-        // refresh switch (HDMI output blanked). The result is "audio leads,
-        // video appears a beat later" on episode autoplay. Pausing here
-        // restores the intended gate: the new item stays parked until the
-        // explicit post-handshake `play()`. No-op on a cold load (rate is
-        // already 0).
+        // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failureMessage/didReachEnd corrupt the new session (issue #15).
+        failureMessage = nil
+        didReachEnd = false
+        didSampleSettledRoute = false
+        // Re-arm #50 hasEverPlayed: reused host must not inherit prior session's established state.
+        hasEverPlayed = false
+        // #93 recovery reload: same content, same position, playback must continue. Skip the
+        // pause + nil-item gap below (PiP content-source invalidation + transport bounce); the
+        // old item keeps playing until replaceCurrentItem swaps in the fresh one, and playIntent
+        // stays latched so the new item's readyToPlay re-asserts play().
+        if inPlaceSwap {
+            isReady = false
+            return
+        }
+        // Pause before item swap: keepNativeHost reload carries rate=1.0 across replaceCurrentItem; without this the new item auto-resumes and beats the waitForSwitch gate (audio leads video on episode autoplay, issue #15).
+        // Clear playIntent so the previous session can't restart the next item at ITS readyToPlay.
+        playIntent = false
         avPlayer.pause()
         avPlayer.replaceCurrentItem(with: nil)
         playerItem = nil
         isReady = false
-        didReachEnd = false
         currentTime = 0
+        renderedTime = 0
         duration = 0
         rate = 0
     }
 
-    /// Log the asset's URL plus every track's media type, codec
-    /// FourCC, enabled flag, and playable flag. Called from both the
-    /// `item.status == .failed` path and the per-key `asset.load`
-    /// failure path so DrHurt's "AVPlayer stalls in waitingToPlay
-    /// instead of failing" sessions still surface the codec FourCCs
-    /// (item.status never going `.failed` was the reason d9b8aa5's
-    /// dump didn't fire in DrHurt's P5 MKV log).
-    private static func dumpAssetTracks(_ asset: AVAsset, sid: Int, reason: String) {
+    /// Dump asset URL + track FourCCs on .failed and asset.load failure; d9b8aa5 added the asset.load path because item.status never went .failed in DrHurt's P5 MKV session.
+    // async: AVAsset.tracks and AVAssetTrack.formatDescriptions/isEnabled/isPlayable are load-based in
+    // current SDKs (the synchronous accessors are deprecated). @MainActor (implicit on this @MainActor
+    // type) so the AVAsset/AVAssetTrack reads stay on the main actor.
+    private static func dumpAssetTracks(_ asset: AVAsset, sid: Int, reason: String) async {
         if let urlAsset = asset as? AVURLAsset {
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.url=\(urlAsset.url.absoluteString) (\(reason))", category: .engine)
         }
-        let tracks = asset.tracks
+        let tracks = (try? await asset.load(.tracks)) ?? []
         if tracks.isEmpty {
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.tracks empty (\(reason))", category: .engine)
             return
@@ -687,8 +800,7 @@ final class NativeAVPlayerHost {
         for track in tracks {
             let fourcc: String
             var extra = ""
-            if let fmt = track.formatDescriptions.first {
-                let cm = fmt as! CMFormatDescription
+            if let cm = (try? await track.load(.formatDescriptions))?.first {
                 fourcc = fourccString(CMFormatDescriptionGetMediaSubType(cm))
                 if track.mediaType == .audio {
                     extra = " " + audioFormatDescription(cm)
@@ -696,17 +808,14 @@ final class NativeAVPlayerHost {
             } else {
                 fourcc = "?"
             }
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.track type=\(track.mediaType.rawValue) codec='\(fourcc)' enabled=\(track.isEnabled) playable=\(track.isPlayable)\(extra) (\(reason))", category: .engine)
+            let enabled = (try? await track.load(.isEnabled)) ?? false
+            let playable = (try? await track.load(.isPlayable)) ?? false
+            EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.track type=\(track.mediaType.rawValue) codec='\(fourcc)' enabled=\(enabled) playable=\(playable)\(extra) (\(reason))", category: .engine)
         }
     }
 
-    /// AVPlayerItem.tracks-based audio track dump. For HLS sources
-    /// `asset.tracks` is empty synchronously, only AVPlayerItem.tracks
-    /// returns the resolved track list once the playlist + init.mp4
-    /// have been parsed. Logs one line per audio track with sample
-    /// rate, channel count, bit depth, format ID, and channel layout
-    /// tag (the multichannel-routing diagnostic).
-    private static func dumpPlayerItemTracks(_ item: AVPlayerItem, sid: Int) {
+    /// Dump item.tracks at readyToPlay (HLS: asset.tracks is empty; item.tracks has the resolved list after playlist+init.mp4 parse). Channel layout tag diagnoses multichannel-routing path.
+    private static func dumpPlayerItemTracks(_ item: AVPlayerItem, sid: Int) async {
         let tracks = item.tracks
         if tracks.isEmpty {
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.tracks empty (readyToPlay)", category: .engine)
@@ -716,8 +825,7 @@ final class NativeAVPlayerHost {
             guard let assetTrack = itemTrack.assetTrack else { continue }
             let fourcc: String
             var extra = ""
-            if let fmt = assetTrack.formatDescriptions.first {
-                let cm = fmt as! CMFormatDescription
+            if let cm = (try? await assetTrack.load(.formatDescriptions))?.first {
                 fourcc = fourccString(CMFormatDescriptionGetMediaSubType(cm))
                 if assetTrack.mediaType == .audio {
                     extra = " " + audioFormatDescription(cm)
@@ -743,14 +851,36 @@ final class NativeAVPlayerHost {
         }
     }
 
-    /// Compact one-line summary of a CMFormatDescription for video
-    /// tracks. Reads the picture dimensions plus the color attachments
-    /// AVPlayer applied (primaries / transfer / matrix / range), which
-    /// is what we need to compare against the source-side codecpar
-    /// values that we log from the engine in `[HLSVideoEngine] DV
-    /// source` / `prepared`. A mismatch here is a strong signal the
-    /// DV / HDR signaling didn't survive the muxer round-trip.
-    private static func videoFormatDescription(_ fmt: CMFormatDescription) -> String {
+    /// Compact video track summary: dimensions + color attachments (primaries/transfer/matrix). Mismatch vs source-side codecpar signals DV/HDR signaling didn't survive the muxer.
+    /// Dump item.tracks on .failed (FourCC per track). Async: AVAssetTrack.formatDescriptions is
+    /// load-based; assetTrack access is main-actor.
+    private static func dumpFailedItemTracks(_ item: AVPlayerItem, sid: Int) async {
+        EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.tracks count=\(item.tracks.count)", category: .engine)
+        for (idx, itrack) in item.tracks.enumerated() {
+            let assetTrack = itrack.assetTrack
+            let mediaType = assetTrack?.mediaType.rawValue ?? "?"
+            var fdesc: CMFormatDescription?
+            if let assetTrack {
+                fdesc = (try? await assetTrack.load(.formatDescriptions))?.first
+            }
+            let fourCC: String
+            if let cm = fdesc {
+                let code = CMFormatDescriptionGetMediaSubType(cm)
+                let b: [UInt8] = [
+                    UInt8((code >> 24) & 0xff),
+                    UInt8((code >> 16) & 0xff),
+                    UInt8((code >> 8) & 0xff),
+                    UInt8(code & 0xff),
+                ]
+                fourCC = String(bytes: b.map { ($0 >= 0x20 && $0 < 0x7f) ? $0 : 0x2e }, encoding: .ascii) ?? "????"
+            } else {
+                fourCC = "<no fdesc>"
+            }
+            EngineLog.emit("[NativeAVPlayerHost] #\(sid)   item.tracks[\(idx)] mediaType=\(mediaType) fourCC=\(fourCC) enabled=\(itrack.isEnabled)", category: .engine)
+        }
+    }
+
+    nonisolated private static func videoFormatDescription(_ fmt: CMFormatDescription) -> String {
         var parts: [String] = []
         let dims = CMVideoFormatDescriptionGetDimensions(fmt)
         parts.append("dim=\(dims.width)x\(dims.height)")
@@ -770,35 +900,15 @@ final class NativeAVPlayerHost {
         return parts.joined(separator: " ")
     }
 
-    /// One-line warning when the FLAC bridge has produced an N-channel
-    /// track but the active audio route can only carry M < N channels
-    /// of LPCM. Fires only for FLAC tracks because:
-    ///
-    ///   - Stream-copy paths (EAC3 / AC3 / AAC) tunnel through HDMI as
-    ///     encoded bitstream, bypassing the LPCM channel-count limit.
-    ///     A Sonos Arc with route.ch=2 still receives 7.1 surround via
-    ///     EAC3 bitstream over eARC.
-    ///   - FLAC bridge output is decoded to LPCM by AVPlayer, then
-    ///     routed via the active port's LPCM channel count. If the
-    ///     port can carry only stereo (e.g. Sonos Arc reports 2ch
-    ///     LPCM via HDMI even with eARC, because the soundbar handles
-    ///     multichannel exclusively via bitstream), the 8-channel
-    ///     LPCM gets downmixed before reaching the sink. End result:
-    ///     stereo from a TrueHD / DTS-HD MA source.
-    ///
-    /// This is a route capability mismatch, not a bug in the bridge.
-    /// AVR setups with proper 7.1 LPCM-over-HDMI support (Denon /
-    /// Marantz / NAD) carry the full 7.1 LPCM cleanly and don't
-    /// trigger this warning.
-    private static func warnIfFLACSurroundExceedsRoute(_ item: AVPlayerItem, sid: Int) {
+    /// Warn when the FLAC bridge produced N-channel LPCM but the route carries fewer channels. FLAC bridge decodes to LPCM (unlike stream-copy EAC3/AC3 which tunnels encoded); Sonos Arc reports ch=2 LPCM even with eARC. Not a bridge bug -- a route capability mismatch.
+    private static func warnIfFLACSurroundExceedsRoute(_ item: AVPlayerItem, sid: Int) async {
         #if os(iOS) || os(tvOS)
         var trackChannels: Int = 0
         var isFLAC = false
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack else { continue }
             guard assetTrack.mediaType == .audio else { continue }
-            guard let fmt = assetTrack.formatDescriptions.first else { continue }
-            let cm = fmt as! CMFormatDescription
+            guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
             let codec = fourccString(CMFormatDescriptionGetMediaSubType(cm))
             if codec.lowercased() == "flac" {
                 isFLAC = true
@@ -817,7 +927,7 @@ final class NativeAVPlayerHost {
         guard routeChannels > 0, routeChannels < trackChannels else { return }
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sid) WARNING: FLAC bridge produced \(trackChannels)-channel "
-            + "LPCM but active audio route carries only \(routeChannels) LPCM channels — tvOS "
+            + "LPCM but active audio route carries only \(routeChannels) LPCM channels, tvOS "
             + "will downmix. Common cause: soundbars (Sonos Arc, etc.) accept multichannel only "
             + "via bitstream codecs (EAC3, Atmos, DD+), not LPCM. Stream-copy paths bypass this; "
             + "TrueHD / DTS-HD MA sources route through the FLAC bridge and hit the LPCM limit. "
@@ -828,39 +938,15 @@ final class NativeAVPlayerHost {
         #endif
     }
 
-    /// Warn when an EAC3 / AC3 multichannel track plays into a route
-    /// the HDMI sink is reporting as stereo-only. Atmos (EAC3 with the
-    /// `flag_ec3_extension_type_a` JOC marker set in dec3) is excluded
-    /// from this warning because Atmos uses a 2-channel MAT 2.0 / IEC
-    /// 61937 carrier — `ch=2` on the route is the correct, working
-    /// state for an Atmos passthrough and does NOT mean stereo output.
-    ///
-    /// Why: plain DD+ 5.1 and DD 5.1 need either ch=6 LPCM or a
-    /// bitstream passthrough negotiation that the sink advertises in
-    /// its EDID. Sonos Arc (and similar soundbars) report ch=2 on the
-    /// HDMI port when the sink is in stereo PCM mode — usually after a
-    /// boot, an HDMI handshake glitch, or after the AVR/soundbar lost
-    /// the Apple TV's audio format hint. AVPlayer can still try the
-    /// bitstream-passthrough path, but Sonos can apparently reject it
-    /// when ch=2 is advertised, falling back to PCM stereo. Common fix
-    /// is a power cycle of the soundbar so EDID re-negotiates and ch=6
-    /// becomes available, OR the user can flip Apple TV's audio format
-    /// setting once to force a re-handshake.
-    ///
-    /// This is a route capability mismatch, not a bug in our pipeline.
-    /// The EAC3 bitstream we deliver is identical across runs (we
-    /// proved this with byte-level diff of the dec3 box and the first
-    /// audio packet), so when one run plays surround and the next
-    /// stereo on the same source, the difference is at the sink layer.
-    private static func warnIfEAC3SurroundOnStereoRoute(_ item: AVPlayerItem, sid: Int) {
+    /// Warn when EAC3/AC3 multichannel plays into a stereo-only HDMI route. Atmos excluded (ch=2 MAT carrier is correct for Atmos passthrough). Cause: Sonos Arc reports ch=2 LPCM after boot or HDMI handshake glitch; fix is power-cycling the sink. Not a pipeline bug (dec3 bitstream is identical across runs).
+    private static func warnIfEAC3SurroundOnStereoRoute(_ item: AVPlayerItem, sid: Int) async {
         #if os(iOS) || os(tvOS)
         var trackChannels: Int = 0
         var codecID: String = ""
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack else { continue }
             guard assetTrack.mediaType == .audio else { continue }
-            guard let fmt = assetTrack.formatDescriptions.first else { continue }
-            let cm = fmt as! CMFormatDescription
+            guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
             let codec = fourccString(CMFormatDescriptionGetMediaSubType(cm))
             let lower = codec.lowercased()
             if lower == "ec-3" || lower == "ac-3" {
@@ -894,19 +980,8 @@ final class NativeAVPlayerHost {
         #endif
     }
 
-    /// Dump the active audio route's channel capability after the
-    /// AVPlayerItem reaches readyToPlay. The route renegotiates when
-    /// AVPlayer loads an asset, so the channel count we polled at
-    /// AVAudioSession setup (engine init, before any asset existed)
-    /// can differ from the post-load capability.
-    ///
-    /// `outputNumberOfChannels` is the actual channel count the route
-    /// will carry — if the asset is 8-channel FLAC but the soundbar /
-    /// AVR doesn't accept 7.1 LPCM via HDMI, the route stays at 2 and
-    /// AVPlayer's PCM decoder downmixes upstream. EAC3 / Atmos avoids
-    /// this because the bitstream tunnels through as encoded data
-    /// without an LPCM intermediate.
-    private static func dumpAudioRoute(sid: Int, phase: String) {
+    /// Dump audio route channel capability post-load (route renegotiates on asset load; pre-load poll is stale). outputNumberOfChannels is the actual LPCM limit; EAC3/Atmos bypasses it via bitstream tunnel.
+    nonisolated private static func dumpAudioRoute(sid: Int, phase: String) {
         #if os(iOS) || os(tvOS)
         let session = AVAudioSession.sharedInstance()
         let out = session.outputNumberOfChannels
@@ -927,16 +1002,8 @@ final class NativeAVPlayerHost {
         #endif
     }
 
-    /// Read sample rate, channel count, and channel layout tag from
-    /// a CMAudioFormatDescription. Used by `dumpAssetTracks` to expose
-    /// what AVPlayer actually parsed for the audio track. Critical for
-    /// multichannel sources: if libavformat's mov muxer wrote the
-    /// codec / dfLa / chnl / chan boxes correctly, the channel layout
-    /// tag here matches the source's spatial layout (kAudio...7_1_A for
-    /// MPEG-style 7.1). If the tag comes back unknown or stereo, the
-    /// downmix is happening at the AVPlayer parse layer rather than at
-    /// the soundbar / route layer.
-    private static func audioFormatDescription(_ fmt: CMFormatDescription) -> String {
+    /// Read sr/ch/bits/layoutTag from CMAudioFormatDescription. Layout tag diagnoses where downmix occurs: unknown/stereo tag = AVPlayer parse layer; correct 7.1 tag = route/soundbar layer.
+    nonisolated private static func audioFormatDescription(_ fmt: CMFormatDescription) -> String {
         var parts: [String] = []
         if let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fmt) {
             let asbd = asbdPtr.pointee
@@ -959,22 +1026,4 @@ final class NativeAVPlayerHost {
         return parts.joined(separator: " ")
     }
 
-    /// Render a 4-byte CoreMedia FourCC subtype (e.g. 'hvc1', 'hev1',
-    /// 'dvh1', 'avc1', 'mp4a') as a printable ASCII string. Used in
-    /// failure-path diagnostics to surface the exact sample-entry
-    /// codec tag AVPlayer saw, which lets us tell whether the source
-    /// was hev1 / dvhe (DrHurt's known-rejected forms from
-    /// AetherEngine#2) versus hvc1 / dvh1 (the accepted forms).
-    private static func fourccString(_ code: FourCharCode) -> String {
-        let bytes: [UInt8] = [
-            UInt8((code >> 24) & 0xff),
-            UInt8((code >> 16) & 0xff),
-            UInt8((code >> 8) & 0xff),
-            UInt8(code & 0xff),
-        ]
-        let chars = bytes.map { (b: UInt8) -> Character in
-            (b >= 0x20 && b < 0x7f) ? Character(UnicodeScalar(b)) : "."
-        }
-        return String(chars)
-    }
 }

@@ -1,6 +1,6 @@
 # DemoPlayerMac
 
-Standalone macOS demonstrator for AetherEngine. Single window, drop a video file onto it, video plays. No menus, no transport bar, no settings — the entire UI surface is one `AetherPlayerSurface` plus a placeholder for the empty state.
+Standalone macOS demonstrator for AetherEngine. Single window, drop a video file onto it, video plays. No menus, no transport bar, no settings: the entire UI surface is one `AetherPlayerSurface` plus a placeholder for the empty state.
 
 Intended for two audiences:
 
@@ -61,7 +61,7 @@ NOTARY_PROFILE="NOTARY_PROFILE" \
 
 The output lands in `build/AetherEngine-Demo-<version>.dmg`. Six phases run in sequence: universal release build, `.app` wrap with Info.plist + entitlements, code-sign with Hardened Runtime, notarize + staple the `.app`, package into `.dmg`, sign + notarize the `.dmg`. Takes 1–3 minutes mostly waiting on Apple's notary service.
 
-Optional env overrides: `VERSION` (default `2.0.2`), `APP_NAME`, `BUNDLE_ID`. If `NOTARY_PROFILE` is unset the script still builds + signs but skips notarization — useful for local smoke tests; the output won't pass Gatekeeper on other machines.
+Optional env overrides: `VERSION` (default `2.0.2`), `APP_NAME`, `BUNDLE_ID`. If `NOTARY_PROFILE` is unset the script still builds + signs but skips notarization, useful for local smoke tests; the output won't pass Gatekeeper on other machines.
 
 ## Why a separate `Package.swift`
 
@@ -69,4 +69,4 @@ Optional env overrides: `VERSION` (default `2.0.2`), `APP_NAME`, `BUNDLE_ID`. If
 
 ## Scope
 
-The demonstrator deliberately stops where DrHurt's [issue #18](https://github.com/superuser404notfound/AetherEngine/issues/18) does: *"Just a super simple wrapper app, no menus, no nothing. One window → drop file on top → play."* Adding a transport bar, subtitle picker, audio track switcher, etc. is feature creep that would turn this into a "real" player and miss the point — those things belong in a host app like [Sodalite](https://github.com/superuser404notfound/Sodalite). The demonstrator's job is to prove the engine plays files; the host's job is to ship the experience around that.
+The demonstrator deliberately stops where DrHurt's [issue #18](https://github.com/superuser404notfound/AetherEngine/issues/18) does: *"Just a super simple wrapper app, no menus, no nothing. One window → drop file on top → play."* Adding a transport bar, subtitle picker, audio track switcher, etc. is feature creep that would turn this into a "real" player and miss the point, those things belong in a host app like [Sodalite](https://github.com/superuser404notfound/Sodalite). The demonstrator's job is to prove the engine plays files; the host's job is to ship the experience around that.

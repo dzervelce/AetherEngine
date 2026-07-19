@@ -1,10 +1,7 @@
 // Sources/AetherEngine/Video/LiveWindow.swift
 import Foundation
 
-/// Session-relative DVR timeline. Coordinate = seconds since the first
-/// decoded frame, monotonic. Path-agnostic: native and SW hosts both call
-/// `noteEdge` (as new content arrives) and `notePlayhead` (as playback moves).
-/// `windowSeconds == nil` means live-only: no rewind range is offered.
+/// Session-relative DVR timeline in seconds since first decoded frame, monotonic. `windowSeconds == nil` = live-only (no rewind).
 struct LiveWindow: Equatable {
     let windowSeconds: Double?
     private(set) var edgeTime: Double = 0

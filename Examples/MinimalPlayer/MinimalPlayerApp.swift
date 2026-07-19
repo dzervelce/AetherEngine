@@ -3,7 +3,7 @@
 // Smallest viable AetherEngine integration. Drop this file into a new
 // SwiftUI tvOS / iOS / macOS app, add the AetherEngine Swift Package as
 // a dependency, set the file's @main App as the app entry point, and
-// run. About 90 lines of host code — everything else (HDR routing,
+// run. About 90 lines of host code, everything else (HDR routing,
 // Atmos passthrough, codec dispatch, subtitle decoding) is the engine.
 //
 // See Examples/README.md for the click-by-click setup.
@@ -36,7 +36,7 @@ struct MinimalPlayerApp: App {
 struct ContentView: View {
     let engine: AetherEngine
 
-    /// Replace with a real source URL — file://, http://, or https://.
+    /// Replace with a real source URL, file://, http://, or https://.
     /// AetherEngine probes the container, picks the right pipeline,
     /// and starts segment production automatically once `load` returns.
     @State private var sourceURL = URL(string: "https://example.com/your-video.mkv")!
@@ -76,7 +76,7 @@ struct ContentView: View {
 
             // State readout. videoFormat tells you what dynamic range
             // the panel is currently presenting (already clamped to
-            // panel capability — a DV source on a non-DV TV reads as
+            // panel capability, a DV source on a non-DV TV reads as
             // .hdr10, not .dolbyVision).
             VStack(alignment: .leading, spacing: 4) {
                 Text("State: \(String(describing: playerState))")
@@ -90,7 +90,10 @@ struct ContentView: View {
         }
         .padding()
         .onReceive(engine.$state) { playerState = $0 }
-        .onReceive(engine.$currentTime) { currentTime = $0 }
+        // The playback clock lives on engine.clock (a separate
+        // ObservableObject) so its ~10 Hz ticks only re-render views
+        // that explicitly opt in, like this one.
+        .onReceive(engine.clock.$currentTime) { currentTime = $0 }
         .onReceive(engine.$duration) { duration = $0 }
         .onReceive(engine.$videoFormat) { videoFormat = $0 }
     }

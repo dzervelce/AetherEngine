@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# build-dmg.sh — build a notarized .dmg of AetherEngine Demo for
+# build-dmg.sh, build a notarized .dmg of AetherEngine Demo for
 # distribution as a GitHub Release asset.
 #
 # Pre-flight (one-time setup on the build machine):
@@ -80,7 +80,7 @@ cp "$BINARY" "$APP_DIR/Contents/MacOS/DemoPlayerMac"
 chmod +x "$APP_DIR/Contents/MacOS/DemoPlayerMac"
 
 # FFmpeg / dav1d / etc. are statically linked into the binary (verified
-# via `otool -L` — no LC_LOAD_DYLIB entries for the custom frameworks),
+# via `otool -L`, no LC_LOAD_DYLIB entries for the custom frameworks),
 # so the .app's Frameworks/ directory stays empty. If FFmpegBuild ever
 # switches to dynamic frameworks, this is where they'd be copied to.
 

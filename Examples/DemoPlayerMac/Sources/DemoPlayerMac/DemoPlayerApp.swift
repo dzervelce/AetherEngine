@@ -1,7 +1,7 @@
-// DemoPlayerMac — standalone macOS demonstrator app for AetherEngine.
+// DemoPlayerMac, standalone macOS demonstrator app for AetherEngine.
 //
 // Single window, drop a video file onto it, video plays. No menus,
-// no transport bar, no settings — the entire UI surface is one
+// no transport bar, no settings, the entire UI surface is one
 // AetherPlayerSurface plus a placeholder for the empty state.
 // Click or press space to toggle play/pause; press escape to stop.
 //
@@ -92,7 +92,7 @@ struct ContentView: View {
         .onReceive(engine.$state) { playerState = $0 }
         .overlay(alignment: .topTrailing) {
             // Tiny corner indicator showing which backend rendered the
-            // current video. Useful for repro reports — "did this play
+            // current video. Useful for repro reports, "did this play
             // on the native or software path?".
             if loadedURL != nil {
                 Text(backendBadge)

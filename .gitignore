@@ -16,7 +16,7 @@ build/
 # when the engine starts importing a newly-added FFmpeg module (it pinned
 # a pre-avfilter FFmpegBuild for the 2.1.1 dmg). Let swift build resolve it
 # fresh each time instead. (The engine's own root Package.resolved stays
-# tracked — that pin is bumped deliberately.)
+# tracked, that pin is bumped deliberately.)
 Examples/DemoPlayerMac/Package.resolved
 
 # Generated test clips from Scripts/fetch-fixtures.sh + user-supplied

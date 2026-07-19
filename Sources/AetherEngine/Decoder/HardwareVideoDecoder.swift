@@ -6,39 +6,44 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
-/// Hardware-accelerated video decoder via VideoToolbox. Built as a
-/// drop-in counterpart to `SoftwareVideoDecoder` so the
-/// `SoftwarePlaybackHost` (which is misnamed — it really hosts any
-/// non-AVPlayer decode + render pipeline) can pick the right backend
-/// per codec.
-///
-/// Currently supports HEVC. H.264 / AV1 could be added with small
-/// codec-type changes; we leave them on libavcodec or dav1d
-/// respectively for now because the immediate motivation is the
-/// 4K HDR HEVC memory-pressure work where AVPlayer's opaque internal
-/// state grows unbounded over long sessions, and routing HEVC
-/// through our own VT decoder lets us own the decoded-frame pool,
-/// the IOSurface lifetime, and the session teardown explicitly.
-///
-/// Same public surface as `SoftwareVideoDecoder` (open / decode /
-/// flush / close + onFrame + onFirstHDR10PlusDetected) so the host
-/// can swap implementations without rewiring the demux loop.
+/// VTDecompressionSession-backed HEVC decoder for the SoftwarePlaybackHost pipeline.
+/// Owns the decoded-frame pool, IOSurface lifetime, and session teardown explicitly
+/// (AVPlayer's opaque state grows unbounded on long 4K HDR sessions).
+/// Same surface as SoftwareVideoDecoder so the host can swap without rewiring the demux loop.
 final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Public surface (mirrors SoftwareVideoDecoder)
 
-    var onFrame: DecodedFrameHandler?
-    /// HDR10+ side data isn't extracted in the POC; the flag is here
-    /// so the host's wiring stays identical to the software path.
-    /// A follow-up pass will mirror `SoftwareVideoDecoder.extractHDR10PlusBytes`
-    /// for the VT side, reading dynamic metadata off the packet's
-    /// `AV_PKT_DATA_DYNAMIC_HDR10_PLUS` side data before decode.
-    var onFirstHDR10PlusDetected: (() -> Void)?
+    /// Guarded by `skipLock` (not `lock`): close() holds `lock` across the VT drain that calls back into onFrame,
+    /// so using `lock` here would deadlock. Multi-word closure swap is a data race without the guard.
+    var onFrame: DecodedFrameHandler? {
+        get { skipLock.lock(); defer { skipLock.unlock() }; return _onFrame }
+        set { skipLock.lock(); _onFrame = newValue; skipLock.unlock() }
+    }
+    private var _onFrame: DecodedFrameHandler?
+    /// Not yet wired on the VT side (follow-up: read AV_PKT_DATA_DYNAMIC_HDR10_PLUS before decode,
+    /// mirror SoftwareVideoDecoder.extractHDR10PlusBytes). Flag kept so host wiring stays identical to SW path.
+    var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
+    var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
 
-    /// After a seek, skip frames before this PTS to avoid the
-    /// "fast forward" effect of dumping pre-seek RASL frames to the
-    /// renderer. Decoded for reference but not delivered upstream.
-    var skipUntilPTS: CMTime?
+    /// Skip pre-seek RASL frames to avoid the "fast forward" effect; decoded for reference but not delivered.
+    /// Guarded by `skipLock` not `lock`: close() holds `lock` across VTDecompressionSessionWaitForAsynchronousFrames,
+    /// which waits for the very callback that would need it (deadlock). CMTime is multi-word: old unsynchronized access was torn-read + ARC race.
+    var skipUntilPTS: CMTime? {
+        get { skipLock.lock(); defer { skipLock.unlock() }; return _skipUntilPTS }
+        set { skipLock.lock(); _skipUntilPTS = newValue; skipLock.unlock() }
+    }
+    private var _skipUntilPTS: CMTime?
+    private let skipLock = NSLock()
+
+    /// Clear the skip threshold only if it is still the one we acted on.
+    private func clearSkip(ifStillAt threshold: CMTime) {
+        skipLock.lock()
+        if let current = _skipUntilPTS, CMTimeCompare(current, threshold) == 0 {
+            _skipUntilPTS = nil
+        }
+        skipLock.unlock()
+    }
 
     // MARK: - Internals
 
@@ -48,40 +53,21 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var width: Int32 = 0
     private var height: Int32 = 0
 
-    /// True when the source's transfer characteristic indicates HDR
-    /// (PQ ST.2084 or HLG). Surfaced so the host can flip the
-    /// `SampleBufferRenderer` into HDR mode at load time.
-    private(set) var isHDR: Bool = false
-
-    /// Color attachments captured from the source's `codecpar` at
-    /// `open()` time and re-applied to every decoded CVPixelBuffer.
-    /// VTDecompressionSession should propagate these from the SPS
-    /// + hvcC by itself but it's been observed not to in practice,
-    /// and an HDR pixel buffer that ships without the
-    /// `kCVImageBufferColorPrimaries` / `kCVImageBufferTransferFunction`
-    /// / `kCVImageBufferYCbCrMatrix` attachments renders as
-    /// desaturated SDR on `AVSampleBufferDisplayLayer`. Setting
-    /// them ourselves is belt-and-suspenders.
+    /// Color metadata from codecpar, re-applied to every CVPixelBuffer.
+    /// VTDecompressionSession should propagate these from SPS+hvcC but has been observed not to;
+    /// without them an HDR buffer renders as desaturated SDR on AVSampleBufferDisplayLayer.
     private var colorPrimaries: CFString?
     private var colorTransfer: CFString?
     private var colorMatrix: CFString?
 
-    /// Protects `session` from concurrent access between the demux
-    /// thread (decode), the main thread (close/flush), and the
-    /// VT callback (frame delivery).
+    /// Protects `session` across the demux thread (decode), main thread (close/flush), and VT callback (delivery).
     private let lock = NSLock()
 
-    /// Pointer back to self for the C decompression callback. Set in
-    /// `open`, cleared in `close`. The session holds this in its
-    /// `decompressionOutputRefCon` so the callback can resolve `self`
-    /// without capturing it in a Swift closure (the VT API is C-only).
+    /// Heap-allocated box carrying a weak self reference for the C decompression callback's refCon.
+    /// Separate object so we can pass UnsafeMutablePointer<RefConBox> to VT without unsafe bit-casts.
+    /// `fileprivate` so the file-level C callback can access the type.
     private var refConBox: Unmanaged<RefConBox>?
 
-    /// Small heap-allocated box for the unsafe pointer-to-self the
-    /// C callback dereferences. Separate object so we can pass a
-    /// `UnsafeMutablePointer<RefConBox>` to VT and still get the
-    /// Swift instance back without unsafe bit-casts. `fileprivate`
-    /// so the file-level C callback below can reference the type.
     fileprivate final class RefConBox {
         weak var decoder: HardwareVideoDecoder?
         init(_ decoder: HardwareVideoDecoder) { self.decoder = decoder }
@@ -104,12 +90,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
         }
 
-        // 1. Build CMVideoFormatDescription from the source's hvcC
-        //    extradata. CMVideoFormatDescriptionCreate with
-        //    kCMVideoCodecType_HEVC accepts the hvcC bytes via the
-        //    `kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms`
-        //    extension dictionary, the same shape AVFoundation builds
-        //    internally when consuming an .mp4/.mkv HEVC track.
+        // 1. Build CMVideoFormatDescription from the hvcC extradata via
+        //    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms (same shape AVFoundation uses for .mp4/.mkv).
         guard let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 else {
             throw VideoDecoderError.noExtradata
         }
@@ -132,14 +114,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         formatDescription = formatDesc
 
-        // 2. Decoder specification: REQUIRE hardware on tvOS 17+ so VT
-        //    refuses session creation outright rather than silently
-        //    falling back to SW decode (which we'd see only as
-        //    pathological CPU + frame drops at 4K, not a clear
-        //    failure). The Require key was added in tvOS 17 / iOS 17;
-        //    pre-17 we pass nil which lets VT choose, but Sodalite's
-        //    deployment target is tvOS 26 so the if-available branch
-        //    is the only one taken in production.
+        // 2. Require hardware on tvOS 17+ so VT fails outright rather than silently falling back to SW
+        //    (which would show only as pathological CPU + frame drops at 4K). Deployment target is tvOS 26
+        //    so the if-available branch is always taken in production.
         var decoderSpec: NSDictionary?
         if #available(tvOS 17.0, iOS 17.0, *) {
             decoderSpec = [
@@ -147,44 +124,14 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             ]
         }
 
-        // 3. Destination pixel buffer attributes. We let VT pick a
-        //    bit-depth-appropriate biplanar YCbCr format
-        //    (10BiPlanar for HDR, 8BiPlanar for SDR) by setting
-        //    BiPlanarType8/10 hints. IOSurface-backed + Metal-compat
-        //    so the layer can render via the GPU path.
+        // 3. Pixel buffer attributes: 10-bit biplanar for HDR, 8-bit for SDR; IOSurface-backed for Metal rendering.
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
-        let isHDRTransfer = codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
-            || codecpar.pointee.color_trc == AVCOL_TRC_ARIB_STD_B67
+        let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         let use10Bit = bitsPerSample > 8 || isHDRTransfer
-        self.isHDR = isHDRTransfer
 
-        // Capture color metadata from codecpar so every decoded
-        // pixel buffer gets the right attachments. Mapping matches
-        // SoftwareVideoDecoder.attachColorSpace.
-        self.colorPrimaries = {
-            switch codecpar.pointee.color_primaries {
-            case AVCOL_PRI_BT709:       return kCVImageBufferColorPrimaries_ITU_R_709_2
-            case AVCOL_PRI_BT2020:      return kCVImageBufferColorPrimaries_ITU_R_2020
-            case AVCOL_PRI_SMPTE432:    return kCVImageBufferColorPrimaries_P3_D65
-            default:                    return nil
-            }
-        }()
-        self.colorTransfer = {
-            switch codecpar.pointee.color_trc {
-            case AVCOL_TRC_BT709:        return kCVImageBufferTransferFunction_ITU_R_709_2
-            case AVCOL_TRC_SMPTE2084:    return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
-            case AVCOL_TRC_ARIB_STD_B67: return kCVImageBufferTransferFunction_ITU_R_2100_HLG
-            default:                     return nil
-            }
-        }()
-        self.colorMatrix = {
-            switch codecpar.pointee.color_space {
-            case AVCOL_SPC_BT709:       return kCVImageBufferYCbCrMatrix_ITU_R_709_2
-            case AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL:
-                                        return kCVImageBufferYCbCrMatrix_ITU_R_2020
-            default:                    return nil
-            }
-        }()
+        self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
+        self.colorTransfer = ColorAttachments.transfer(codecpar.pointee.color_trc)
+        self.colorMatrix = ColorAttachments.matrix(codecpar.pointee.color_space)
         let pixelFormat: OSType = use10Bit
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -195,8 +142,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             kCVPixelBufferMetalCompatibilityKey: true,
         ]
 
-        // 4. Output callback record. The C callback dispatches back
-        //    into our `handleDecodedFrame` via the refCon pointer.
+        // 4. Output callback: C function dispatches into handleDecodedFrame via refCon.
         let box = RefConBox(self)
         let unmanaged = Unmanaged.passRetained(box)
         refConBox = unmanaged
@@ -222,10 +168,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         session = createdSession
 
-        // 5. Ask VT to pass through per-frame HDR metadata so the
-        //    display layer can drive correct tone mapping. Pre-iOS 18
-        //    / tvOS 18 this property is set unconditionally; on older
-        //    OSes the unknown-key set returns -12911 which we swallow.
+        // 5. Pass through per-frame HDR metadata for correct tone mapping; unknown-key set returns -12911 on older OSes (swallowed).
         if #available(tvOS 17.0, iOS 17.0, *) {
             VTSessionSetProperty(
                 createdSession,
@@ -252,16 +195,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         lock.unlock()
 
-        // Build a CMSampleBuffer from the AVPacket. The packet's data
-        // is HEVC bitstream in length-prefix (MP4-style) framing as
-        // delivered by FFmpeg's matroska demuxer. VT expects exactly
-        // that, so we wrap the bytes in a CMBlockBuffer + CMSampleBuffer
-        // without rewriting.
-        //
-        // We copy the bytes once: VT may retain the buffer past the
-        // decode call (asynchronous decoders), and AVPacket's storage
-        // gets reused for the next packet, so a shallow reference
-        // would race.
+        // Wrap the packet (HEVC length-prefix framing from FFmpeg's matroska demuxer, already the VT-expected format)
+        // in a CMBlockBuffer+CMSampleBuffer. Copy once: VT may retain the buffer past the call (async decode),
+        // and AVPacket storage is reused for the next packet.
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return }
         let size = Int(packet.pointee.size)
         let copied = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 1)
@@ -280,16 +216,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             blockBufferOut: &blockBuffer
         )
         guard blockStatus == kCMBlockBufferNoErr, let bb = blockBuffer else {
-            // CMBlockBuffer takes ownership only on success; on failure
-            // we still own the allocation.
+            // CMBlockBuffer takes ownership only on success; we own the allocation on failure.
             copied.deallocate()
             return
         }
-
-        // Build the sample buffer with a single sample timing entry
-        // derived from the packet's PTS / DTS. CMTime needs a positive
-        // timescale and a nominal duration; we fill these from the
-        // stream's time_base and packet's duration when available.
         let ptsRaw = packet.pointee.pts
         let dtsRaw = packet.pointee.dts
         let durRaw = packet.pointee.duration
@@ -325,11 +255,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
         guard sbStatus == noErr, let sb = sampleBuffer else { return }
 
-        // Mark the keyframe attachment so VT can drop pre-key frames
-        // after a flush (seek path).
+        // Tag non-keyframes as DependsOnOthers so VT can drop pre-seek RASL frames after a flush.
         if (packet.pointee.flags & AV_PKT_FLAG_KEY) == 0 {
-            // Non-key: tag as DependsOnOthers so the decoder knows
-            // it can't be used as a sync sample.
             if let attachArray = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true),
                CFArrayGetCount(attachArray) > 0 {
                 let dict = unsafeBitCast(
@@ -344,9 +271,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
         }
 
-        // Submit to VT. Flags request asynchronous decode (with
-        // temporal queueing) so VT can pipeline across multiple
-        // packets. The callback fires on VT's internal queue.
+        // Async decode with temporal queueing; callback fires on VT's internal queue.
         var infoFlags = VTDecodeInfoFlags()
         let decodeStatus = VTDecompressionSessionDecodeFrame(
             session,
@@ -368,8 +293,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let session = self.session
         lock.unlock()
         guard let session else { return }
-        // Wait for any in-flight async frames to drain, then signal
-        // a discontinuity so VT drops its reference picture state.
+        // Drain in-flight frames then signal a discontinuity so VT drops its reference picture state.
         VTDecompressionSessionWaitForAsynchronousFrames(session)
         VTDecompressionSessionFinishDelayedFrames(session)
     }
@@ -397,26 +321,20 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Callback handling (called from VT's queue)
 
-    /// Invoked by `hwDecoderOutputCallback` once a frame has decoded.
-    /// Delivers the CVPixelBuffer + PTS to the configured handler,
-    /// honouring `skipUntilPTS` for seek-pre-roll trimming.
+    /// Invoked by `hwDecoderOutputCallback`; delivers CVPixelBuffer+PTS, honouring `skipUntilPTS` for seek-pre-roll.
     fileprivate func handleDecodedFrame(
         imageBuffer: CVImageBuffer,
         pts: CMTime
     ) {
-        // Seek-pre-roll trim: while skipUntilPTS is set, drop frames
-        // whose PTS is earlier than the target. The renderer would
-        // skip them anyway but dropping here saves an enqueue.
-        if let threshold = skipUntilPTS, CMTimeCompare(pts, threshold) < 0 {
-            return
-        }
-        if skipUntilPTS != nil, CMTimeCompare(pts, skipUntilPTS!) >= 0 {
-            skipUntilPTS = nil
+        if let threshold = skipUntilPTS {
+            if CMTimeCompare(pts, threshold) < 0 {
+                return
+            }
+            // Compare-and-clear: a concurrent seek can install a new threshold; blindly nil-ing would discard it.
+            clearSkip(ifStillAt: threshold)
         }
 
-        // Attach color metadata so AVSampleBufferDisplayLayer renders
-        // with correct primaries / transfer / matrix. Without these,
-        // HDR PQ content shows up as desaturated SDR.
+        // Attach color metadata; without it HDR PQ content shows as desaturated SDR on AVSampleBufferDisplayLayer.
         if let primaries = colorPrimaries {
             CVBufferSetAttachment(imageBuffer, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate)
         }

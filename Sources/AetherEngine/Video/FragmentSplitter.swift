@@ -1,46 +1,12 @@
 import Foundation
 
-/// Streaming ISOBMFF box parser that splits the mp4 muxer's output
-/// into "header" (ftyp + moov) and "fragment" (moof + mdat) portions.
-///
-/// The per-segment mp4 muxer pattern produces:
-///
-/// ```
-/// ftyp │ moov │ moof │ mdat │ (mfra)
-///  ─┬─ │ ─┬─  │ ─────┬───── │ ─┬─
-///   └──── header ──┘ │  one fragment   │  trailing
-///                                          (discard)
-/// ```
-///
-/// Each per-segment muxer emits its own ftyp+moov pair byte-identical
-/// to every other segment's (the muxer state is fresh, codec params
-/// are the same, mvhd creation_time is the only drift and we work
-/// around it by pre-building init.mp4 once at session start). The
-/// splitter captures the header once, hands it to a callback, then
-/// streams every subsequent byte through the fragment callback until
-/// the muxer is torn down.
-///
-/// ISOBMFF box format reminder:
-///
-/// ```
-/// [4 byte size][4 byte type ASCII][... body ...]
-/// ```
-///
-/// If size == 1, an 8-byte largesize follows the type (used for mdat
-/// when fragments exceed 4 GB; we still handle it defensively).
-/// Size == 0 means "to end of file", treated as discard.
+/// Streaming ISOBMFF box parser that splits mp4 muxer output into header (ftyp+moov, fired once via `onHeaderComplete`) and fragment (moof+mdat, streamed via `onFragmentBytes`) portions. Handles largesize (size==1) and discards mfra/unknown boxes.
 final class FragmentSplitter {
 
-    /// Called once when the moov box closes. Carries the complete
-    /// ftyp + moov byte sequence (= init.mp4 content). Caller can
-    /// dedupe against a pre-built init or cache the first occurrence.
+    /// Fires once when moov closes; carries the complete ftyp+moov bytes (init.mp4 content).
     let onHeaderComplete: (Data) -> Void
 
-    /// Called for every byte that belongs to a fragment box (moof,
-    /// mdat, or any defensive styp / sidx if the muxer ever emits
-    /// those). Receives raw bytes including the box headers themselves
-    /// — the caller can write directly to a segment file without
-    /// reconstructing box framing.
+    /// Called for every fragment-box byte (moof, mdat, styp, sidx), including box headers.
     let onFragmentBytes: (UnsafePointer<UInt8>, Int) -> Void
 
     private enum Phase {
@@ -52,15 +18,8 @@ final class FragmentSplitter {
     }
     private var phase: Phase = .awaitingBoxHeader
 
-    /// Partial 8-byte box header accumulator. Boxes can land split
-    /// across feed() calls if the muxer's avio buffer flush boundary
-    /// lands mid-header. Buffered here until we have all 8 bytes
-    /// (size + type) and can switch to the appropriate inside-box state.
+    /// Accumulates the 8-byte box header (size+type) across split feed() calls.
     private var pendingHeaderBytes: [UInt8] = []
-
-    /// Captured init.mp4 content. Accumulates while phase is
-    /// .insideHeaderBox(ftyp) or .insideHeaderBox(moov). Flushed via
-    /// `onHeaderComplete` when moov ends. Reset to empty after.
     private var headerBuffer = Data()
 
     init(onHeaderComplete: @escaping (Data) -> Void,
@@ -70,10 +29,7 @@ final class FragmentSplitter {
         self.pendingHeaderBytes.reserveCapacity(16)
     }
 
-    /// Feed `count` bytes of muxer output into the splitter. The
-    /// splitter classifies each byte into header / fragment / discard
-    /// and routes it via the appropriate callback. Safe to call with
-    /// any chunk size; boxes can span multiple feed() calls.
+    /// Feed `count` bytes of muxer output; boxes may span multiple calls.
     func feed(_ bytes: UnsafePointer<UInt8>, count: Int) {
         var offset = 0
         while offset < count {
@@ -146,17 +102,13 @@ final class FragmentSplitter {
         pendingHeaderBytes.removeAll(keepingCapacity: true)
 
         if size == 1 {
-            // 64-bit largesize follows. Stash the 8 header bytes we
-            // already saw via the same dispatch path as the largesize
-            // continuation, then enter the awaitingLargeSize state.
+            // 64-bit largesize follows in the next 8 bytes.
             pendingHeaderBytes = headerBytes
             phase = .awaitingLargeSize(boxType: boxType)
             return offset
         }
         if size == 0 {
-            // "To end of file" — only valid on the final box. Treat
-            // as discard; route the 8 header bytes to fragment if
-            // it's a fragment box, otherwise drop.
+            // "To end of file": discard.
             startBox(type: boxType, headerBytes: headerBytes, bodySize: Int.max)
             return offset
         }
@@ -167,9 +119,7 @@ final class FragmentSplitter {
 
     private func consumeLargeSize(_ bytes: UnsafePointer<UInt8>, offset: Int, count: Int, boxType: String) -> Int {
         var offset = offset
-        // pendingHeaderBytes already holds the 8 initial header bytes
-        // (size=1 marker + type). We need 8 more for the largesize.
-        let needed = 16 - pendingHeaderBytes.count
+        let needed = 16 - pendingHeaderBytes.count  // pendingHeaderBytes already holds the 8-byte initial header
         let available = count - offset
         let take = min(needed, available)
         for i in 0..<take {
@@ -185,15 +135,11 @@ final class FragmentSplitter {
         let headerBytes = pendingHeaderBytes
         pendingHeaderBytes.removeAll(keepingCapacity: true)
 
-        let bodySize = max(0, Int(largesize) - 16)
+        let bodySize = max(0, Int(clamping: largesize) - 16)  // Int(clamping:) guards against corrupt >Int.max sizes
         startBox(type: boxType, headerBytes: headerBytes, bodySize: bodySize)
         return offset
     }
 
-    /// Classify the just-parsed box header by type and switch to the
-    /// matching inside-box state. The header bytes themselves are
-    /// routed through the appropriate channel (header accumulator or
-    /// fragment callback) before the body starts streaming through.
     private func startBox(type: String, headerBytes: [UInt8], bodySize: Int) {
         switch type {
         case "ftyp", "moov":
@@ -208,9 +154,7 @@ final class FragmentSplitter {
             phase = .insideFragmentBox(boxType: type, bytesRemaining: bodySize)
 
         default:
-            // mfra, free, skip, udta, unknown — discard. The mp4
-            // muxer can emit these around trailer time; none are
-            // part of the segment AVPlayer needs.
+            // mfra, free, skip, udta, unknown: discard.
             phase = .insideDiscardBox(boxType: type, bytesRemaining: bodySize)
         }
     }

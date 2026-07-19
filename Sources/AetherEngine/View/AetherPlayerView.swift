@@ -99,6 +99,12 @@ public final class AetherPlayerView: PlatformBaseView {
         self.layer.addSublayer(layer)
         #elseif canImport(AppKit)
         self.layer?.addSublayer(layer)
+        // Resize the video layer in lockstep with the view's bounds during a
+        // live window drag. Without this it only catches up on the next layout()
+        // pass, and because an NSView's layer is anchored bottom-left that lag
+        // reads as the image sliding off-center while resizing. Starting at full
+        // bounds with both axes flexible keeps it full-bounds throughout.
+        layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         #endif
         layer.frame = bounds
         hostedLayer = layer
@@ -148,7 +154,6 @@ public struct AetherPlayerSurface: UIViewRepresentable {
     }
 
     public func updateUIView(_ uiView: AetherPlayerView, context: Context) {
-        // No-op. State updates flow through engine's @Published properties.
     }
 
     public static func dismantleUIView(_ uiView: AetherPlayerView, coordinator: ()) {

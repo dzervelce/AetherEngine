@@ -1,6 +1,6 @@
 // swift-tools-version: 6.0
 //
-// DemoPlayerMac — standalone macOS demonstrator for AetherEngine.
+// DemoPlayerMac, standalone macOS demonstrator for AetherEngine.
 // Builds against the AetherEngine package via a local path so the
 // demonstrator stays in lock-step with the engine source it ships
 // alongside. `swift run` from this directory launches the window;

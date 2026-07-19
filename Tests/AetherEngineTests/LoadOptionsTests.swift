@@ -20,6 +20,10 @@ struct LoadOptionsTests {
         #expect(opts.audioBridgeMode == .surroundCompat)
         #expect(opts.isLive == false)
         #expect(opts.audioOnly == false)
+        // #68: probe-budget overrides default to nil so the engine keeps the
+        // built-in .playback budget (50 MB / 60 s) unless a caller opts in.
+        #expect(opts.probesize == nil)
+        #expect(opts.maxAnalyzeDuration == nil)
     }
 
     @Test("Equatable holds for identical inputs")
@@ -60,5 +64,32 @@ struct LoadOptionsTests {
         let audio = LoadOptions(audioOnly: true)
         #expect(audio.audioOnly == true)
         #expect(video != audio)
+    }
+
+    // MARK: - Probe budget (#68)
+
+    @Test("probesize / maxAnalyzeDuration round-trip through init")
+    func probeBudgetRoundTrips() {
+        let opts = LoadOptions(probesize: 10, maxAnalyzeDuration: 20)
+        #expect(opts.probesize == 10)
+        #expect(opts.maxAnalyzeDuration == 20)
+    }
+
+    @Test("probe-budget fields affect equality")
+    func probeBudgetEquatable() {
+        #expect(LoadOptions() == LoadOptions())
+        #expect(LoadOptions(probesize: 10) != LoadOptions())
+        #expect(LoadOptions(maxAnalyzeDuration: 20) != LoadOptions())
+        #expect(LoadOptions(probesize: 10) == LoadOptions(probesize: 10))
+    }
+
+    @Test("existing positional/labeled callers stay source-compatible")
+    func sourceCompatibleWithExistingCallers() {
+        // The two new params are appended at the end with nil defaults, so a
+        // pre-#68 call site that omits them must still compile and leave the
+        // probe budget unset.
+        let opts = LoadOptions(httpHeaders: ["a": "b"])
+        #expect(opts.probesize == nil)
+        #expect(opts.maxAnalyzeDuration == nil)
     }
 }

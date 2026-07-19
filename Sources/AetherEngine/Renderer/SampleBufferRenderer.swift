@@ -8,72 +8,49 @@ import CoreVideo
 /// Includes a small reorder buffer (4 frames) to handle B-frame decode
 /// order from VTDecompressionSession. Frames are sorted by PTS before
 /// being enqueued to the display layer in strict presentation order.
+/// Which display-layer flush operation a flush request maps to. Split out of SampleBufferRenderer.flush()
+/// as a pure value so the seek-holds-frame contract (issue #90) is testable without a live
+/// AVSampleBufferDisplayLayer.
+enum DisplayFlushOp: Equatable {
+    /// tvOS 18+/iOS 18+/macOS 15+: AVSampleBufferVideoRenderer.flush(removingDisplayedImage:).
+    case rendererFlush(removingDisplayedImage: Bool)
+    /// Legacy AVSampleBufferDisplayLayer.flushAndRemoveImage(), clears the visible frame.
+    case removeImage
+    /// Legacy AVSampleBufferDisplayLayer.flush(), keeps the last frame on screen (hold through seek).
+    case holdImage
+
+    static func resolve(removingDisplayedImage: Bool, modernRenderer: Bool) -> DisplayFlushOp {
+        if modernRenderer {
+            return .rendererFlush(removingDisplayedImage: removingDisplayedImage)
+        }
+        return removingDisplayedImage ? .removeImage : .holdImage
+    }
+}
+
 final class SampleBufferRenderer: @unchecked Sendable {
 
     private(set) var displayLayer: AVSampleBufferDisplayLayer
 
-    /// Fired when the display layer instance is replaced. The host view
-    /// must swap the old sublayer out of its CALayer hierarchy and add
-    /// the new one. Required because once the layer has ping-ponged
-    /// between AVSampleBufferRenderSynchronizer and controlTimebase a
-    /// few times, Apple's "undefined behavior" warning cashes in: the
-    /// layer stays status=.rendering but silently stops consuming
-    /// frames, and no flush() can revive it. Only a fresh layer works.
-    var onLayerReplaced: ((AVSampleBufferDisplayLayer) -> Void)?
-
-    /// Track the HDR output setting so we can restore it on recreated
-    /// layers. Defaults match init().
-    private var currentlyHDR: Bool = false
-
-    /// Track the requested video gravity so it survives the
-    /// recreate-display-layer-on-every-load() dance. The host sets it
-    /// once via `setVideoGravity` and we reapply on every fresh layer.
-    private var currentGravity: AVLayerVideoGravity = .resizeAspect
-
-    /// Reorder buffer: collects frames from the decoder (which may arrive
-    /// out of display order due to B-frames) and flushes them to the
-    /// display layer in ascending PTS order. The third tuple slot
-    /// carries optional per-frame HDR10+ metadata (T.35 SEI bytes) so
-    /// the data stays paired with its frame across the reorder, then
-    /// rides along to `flushFrame` where it's attached to the
-    /// CMSampleBuffer via `kCMSampleAttachmentKey_HDR10PlusPerFrameData`.
+    /// B-frame reorder buffer (4 frames): collects decoder output, flushes to display layer in ascending PTS order. Third tuple slot carries per-frame HDR10+ T.35 SEI bytes, paired through the reorder to kCMSampleAttachmentKey_HDR10PlusPerFrameData.
     private let reorderLock = NSLock()
     private var reorderBuffer: [(CVPixelBuffer, CMTime, Data?)] = []
-    private let reorderDepth = 4  // B-frame reorder (handles up to 3 consecutive B-frames)
+    private let reorderDepth = 4  // handles up to 3 consecutive B-frames
 
-    /// After a seek, frames decoded between the keyframe and the actual
-    /// seek target should be dropped to prevent visual "fast forward".
-    /// Set via `setSkipThreshold(_:)`, cleared automatically.
+    /// Drop frames before this PTS after a seek (prevents keyframe-to-target fast-forward). Cleared after the first passing frame.
     private var skipUntilPTS: CMTime?
 
-    /// Cached CMVideoFormatDescription for sample-buffer wrapping.
-    /// Format descriptions are expensive to create (allocation + Core
-    /// Foundation refcount), cache keyed by pixel buffer dimensions +
-    /// format so we only rebuild when the stream changes.
+    /// Cached CMVideoFormatDescription keyed by dimensions + pixel format + colorimetry. CMVideoFormatDescriptionCreateForImageBuffer snapshots color attachments at creation, so a mid-stream colorimetry change at same dimensions must invalidate the cache. Guarded by reorderLock; nil'd by flush().
     private var cachedFormatDesc: CMVideoFormatDescription?
-    private var cachedFormatKey: UInt64 = 0
+    private var cachedFormatKey: FormatDescriptionKey?
 
-    /// Tracks whether at least one frame has reached the display layer
-    /// since the last reset. Used by `AetherEngine.load()` to wait for
-    /// the first video frame to actually render before returning, so
-    /// callers that pause immediately after load (foreground reload)
-    /// don't freeze on an empty layer (black). Touched from both the
-    /// decoder callback thread (set) and the engine actor (read +
-    /// reset), hence the explicit lock.
-    private let firstFrameLock = NSLock()
-    nonisolated(unsafe) private var _hasRenderedFirstFrame = false
-    nonisolated var hasRenderedFirstFrame: Bool {
-        firstFrameLock.lock(); defer { firstFrameLock.unlock() }
-        return _hasRenderedFirstFrame
-    }
-
-    /// Reset the first-frame tracker. Call before waiting for the
-    /// next post-flush frame so a pre-flush frame doesn't satisfy
-    /// the wait spuriously.
-    func resetFirstFrameTracking() {
-        firstFrameLock.lock()
-        _hasRenderedFirstFrame = false
-        firstFrameLock.unlock()
+    /// Cache key for cachedFormatDesc. Colorimetry fields are Strings (not CF references) so the struct stays Equatable without CF identity traps.
+    private struct FormatDescriptionKey: Equatable {
+        var width: Int
+        var height: Int
+        var pixelFormat: OSType
+        var primaries: String?
+        var transfer: String?
+        var matrix: String?
     }
 
     private var loggedLayerFailed = false
@@ -87,18 +64,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     // MARK: - Queue rendering target
 
-    /// The queue-rendering target the display layer exposes. On
-    /// iOS 18 / tvOS 18 / macOS 15 Apple decoupled the queue ops onto a
-    /// dedicated `AVSampleBufferVideoRenderer` reachable via
-    /// `displayLayer.sampleBufferRenderer`; the layer's own `enqueue` /
-    /// `flush` / `isReadyForMoreMediaData` were deprecated and route to
-    /// the renderer internally. On tvOS 26+ at least, attaching the
-    /// layer directly to `AVSampleBufferRenderSynchronizer` and calling
-    /// the deprecated layer methods has been observed to fail with
-    /// `FigVideoQueueRemote err=-12080` after the first enqueue,
-    /// stopping rendering entirely. Going through the renderer instead
-    /// resolves it. Older OSes use the layer directly via the same
-    /// `AVQueuedSampleBufferRendering` protocol.
+    /// tvOS 18+ / iOS 18+ / macOS 15+: use AVSampleBufferVideoRenderer via displayLayer.sampleBufferRenderer. Calling the deprecated layer enqueue/flush/isReadyForMoreMediaData on tvOS 26+ with AVSampleBufferRenderSynchronizer fails with FigVideoQueueRemote -12080 after the first enqueue. Older OSes use the layer directly via AVQueuedSampleBufferRendering.
     var queueTarget: any AVQueuedSampleBufferRendering {
         if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
             return displayLayer.sampleBufferRenderer
@@ -106,14 +72,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         return displayLayer
     }
 
-    /// Public wrapper around `queueTarget.isReadyForMoreMediaData` so the
-    /// engine's demux loop can back-pressure against the actual queue.
-    /// Reading the layer's own `isReadyForMoreMediaData` is misleading
-    /// after the iOS 18 / tvOS 18 / macOS 15 split: queue ops route
-    /// through `sampleBufferRenderer`, but the layer's own property
-    /// stays optimistically true and never reflects actual back-pressure,
-    /// so the loop happily over-enqueues into a full renderer queue and
-    /// trips `FigVideoQueueRemote err=-12080`.
+    /// Demux-loop back-pressure gate. Post-tvOS 18 split: reading the layer's own isReadyForMoreMediaData stays optimistically true even when the sampleBufferRenderer queue is full, causing FigVideoQueueRemote -12080 on over-enqueue.
     var isReadyForMoreMediaData: Bool {
         queueTarget.isReadyForMoreMediaData
     }
@@ -148,22 +107,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
         return layer
     }
 
-    /// Set how the rendered video frame fills its CALayer rect.
-    /// Survives layer recreation across `load()` cycles, the renderer
-    /// caches the value and re-applies it on every fresh layer.
-    func setVideoGravity(_ gravity: AVLayerVideoGravity) {
-        currentGravity = gravity
-        displayLayer.videoGravity = gravity
-    }
-
-    var videoGravity: AVLayerVideoGravity { currentGravity }
-
-    /// Opt the display layer into HDR output. Call with `true` only when
-    /// the decoder is delivering HDR10/DV pixel buffers directly (no
-    /// tone-map). Call with `false` (or leave at default) for SDR output
-    /// including the HDR→SDR tone-mapped path.
+    /// Opt the display layer into HDR mode. Pass true only when the decoder delivers raw HDR10/DV pixel buffers; false for SDR or tone-mapped output.
     func setHDROutput(_ isHDR: Bool) {
-        currentlyHDR = isHDR
         if #available(tvOS 26.0, iOS 26.0, macOS 26.0, *) {
             displayLayer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
@@ -175,54 +120,16 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
     }
 
-    /// Swap the display layer for a fresh instance. Called by
-    /// AetherEngine on every load() to avoid carrying over stale
-    /// Synchronizer/controlTimebase state across sessions, the
-    /// observed failure mode is status=.rendering but no frame
-    /// consumption, which no in-place reset can recover from.
-    /// The host view is notified via onLayerReplaced and must
-    /// remove the old sublayer and add the new one.
-    func recreateDisplayLayer() {
-        // Drop the cached format description, it's associated with
-        // the old layer's pipeline, and a new layer starts clean.
-        reorderLock.lock()
-        reorderBuffer.removeAll()
-        cachedFormatDesc = nil
-        cachedFormatKey = 0
-        reorderLock.unlock()
-
-        firstFrameLock.lock()
-        _hasRenderedFirstFrame = false
-        firstFrameLock.unlock()
-
-        let newLayer = Self.makeDisplayLayer(isHDR: currentlyHDR, gravity: currentGravity)
-        displayLayer = newLayer
-        onLayerReplaced?(newLayer)
-
-        #if DEBUG
-        enqueueCount = 0
-        loggedLayerFailed = false
-        EngineLog.emit("[Renderer] display layer recreated", category: .swPlayback)
-        #endif
-    }
-
-    /// After seek, drop frames with PTS before the target to prevent
-    /// the visual "fast forward" effect from keyframe to seek target.
     func setSkipThreshold(_ time: CMTime?) {
         reorderLock.lock()
         skipUntilPTS = time
         reorderLock.unlock()
     }
 
-    /// Enqueue a decoded video frame. Frames are buffered and reordered
-    /// by PTS before being sent to the display layer. `hdr10PlusData`,
-    /// when non-nil, carries the per-frame ST 2094-40 dynamic metadata
-    /// already serialised to the T.35 SEI byte format Apple's
-    /// `kCMSampleAttachmentKey_HDR10PlusPerFrameData` expects.
+    /// Enqueue a decoded frame through the B-frame reorder buffer. `hdr10PlusData` carries per-frame ST 2094-40 metadata serialised to T.35 SEI format for kCMSampleAttachmentKey_HDR10PlusPerFrameData.
     func enqueue(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data? = nil) {
         reorderLock.lock()
 
-        // Drop pre-seek frames (between keyframe and actual seek target)
         if let threshold = skipUntilPTS {
             if CMTimeCompare(pts, threshold) < 0 {
                 reorderLock.unlock()
@@ -231,14 +138,12 @@ final class SampleBufferRenderer: @unchecked Sendable {
             skipUntilPTS = nil
         }
 
-        // Insert into reorder buffer, sorted by PTS
         let ptsSeconds = CMTimeGetSeconds(pts)
         let insertIdx = reorderBuffer.firstIndex(where: {
             CMTimeGetSeconds($0.1) > ptsSeconds
         }) ?? reorderBuffer.endIndex
         reorderBuffer.insert((pixelBuffer, pts, hdr10PlusData), at: insertIdx)
 
-        // Flush oldest frames when buffer exceeds reorder depth
         while reorderBuffer.count > reorderDepth {
             let (pb, t, hdr) = reorderBuffer.removeFirst()
             reorderLock.unlock()
@@ -249,33 +154,32 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
     }
 
-    /// Discard all buffered and displayed frames (call on seek/stop).
-    /// Uses flushAndRemoveImage to clear the currently visible frame
-    /// immediately, prevents showing stale content after seeking.
-    func flush() {
+    /// Discard all buffered frames. `removingDisplayedImage: true` (stop/teardown) also clears the visible
+    /// frame; `false` (seek) holds the last frame on screen until the post-seek frame is enqueued, so a seek
+    /// doesn't flash black between the old and new positions (matches the hardware path's hold-last-frame).
+    func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
-        // Drop the cached format description, a following load() may open
-        // a stream with different color attachments at the same resolution,
-        // and CMVideoFormatDescriptionCreateForImageBuffer snapshots those
-        // into the description at creation time.
+        // Invalidate the format description cache; the next load() may open a stream with different colorimetry at the same resolution.
         cachedFormatDesc = nil
-        cachedFormatKey = 0
+        cachedFormatKey = nil
         reorderLock.unlock()
 
-        firstFrameLock.lock()
-        _hasRenderedFirstFrame = false
-        firstFrameLock.unlock()
-
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true) { }
-        } else {
+        let modern: Bool
+        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) { modern = true } else { modern = false }
+        switch DisplayFlushOp.resolve(removingDisplayedImage: removingDisplayedImage, modernRenderer: modern) {
+        case .rendererFlush(let remove):
+            if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
+                displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: remove) { }
+            }
+        case .removeImage:
             displayLayer.flushAndRemoveImage()
+        case .holdImage:
+            displayLayer.flush()
         }
     }
 
-    /// Flush the reorder buffer and send all frames to the display layer
-    /// (call at EOF to drain the last frames).
+    /// Send all buffered frames to the display layer (call at EOF).
     func drainReorderBuffer() {
         reorderLock.lock()
         let remaining = reorderBuffer
@@ -293,10 +197,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         guard let sampleBuffer = createSampleBuffer(from: pixelBuffer, pts: pts) else {
             return
         }
-        // Attach HDR10+ dynamic metadata before enqueue. Per Apple's
-        // doc this attachment overrides any HDR10+ payload baked into
-        // the compressed bitstream, which is exactly what we want
-        // because VT may strip per-frame SEI on the way out.
+        // HDR10+ attachment overrides any payload baked into the bitstream (VT may strip per-frame SEI on decode).
         if let hdr10PlusData {
             CMSetAttachment(
                 sampleBuffer,
@@ -309,10 +210,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
                 EngineLog.emit("[Renderer] HDR10+ attachment count: \(hdr10PlusAttachedCount) (last payload \(hdr10PlusData.count) bytes)", category: .swPlayback)
             }
         }
-        // If the queue target has entered the failed state (undefined-
-        // behavior races during Synchronizer↔controlTimebase handoffs
-        // push it here, and once it's failed it stays failed until
-        // flushed), attempt an in-place recovery via flush.
+        // Recover from failed queue target (Synchronizer/controlTimebase handoff races can push it here; flush recovers it).
         let target = queueTarget
         if queueStatus == .failed {
             if !loggedLayerFailed {
@@ -327,18 +225,8 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
         target.enqueue(sampleBuffer)
 
-        // Mark first frame after the most recent reset. Lock-protected
-        // because flushFrame runs on the decoder callback thread while
-        // AetherEngine reads / resets this from its actor.
-        firstFrameLock.lock()
-        _hasRenderedFirstFrame = true
-        firstFrameLock.unlock()
-
         enqueueCount += 1
-        // Sparse progress trail so a stall after enqueue #30 (the
-        // existing log point) is distinguishable from "we just stop
-        // logging at #30 but actually keep enqueueing". Logging cost
-        // is bounded: at 60 fps for 1 hour we emit 4 lines total.
+        // Sparse milestones so a stall is distinguishable from "logging stopped at #30"; bounded to 4 lines/hour at 60 fps.
         if enqueueCount == 1 || enqueueCount == 30 || enqueueCount == 100 || enqueueCount == 1000 || enqueueCount == 5000 {
             EngineLog.emit("[Renderer] enqueue #\(enqueueCount): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueError?.localizedDescription ?? "nil")", category: .swPlayback)
         }
@@ -354,17 +242,25 @@ final class SampleBufferRenderer: @unchecked Sendable {
     }
 
     private func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
-        // Reuse the format description unless dimensions or pixel format
-        // changed, rebuilding per frame wastes an allocation and Core
-        // Foundation refcount churn in the hot path.
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
-        let key = (UInt64(width) << 40) | (UInt64(height) << 16) | UInt64(fmt & 0xFFFF)
+        // Cache hit avoids CMVideoFormatDescriptionCreateForImageBuffer allocation + CF refcount churn on every frame.
+        let key = FormatDescriptionKey(
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer),
+            pixelFormat: CVPixelBufferGetPixelFormatType(pixelBuffer),
+            primaries: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nil) as? String,
+            transfer: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil) as? String,
+            matrix: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil) as? String
+        )
+
+        // Guarded by reorderLock: flush() nils the cache from other threads.
+        reorderLock.lock()
+        let cachedDesc: CMVideoFormatDescription? =
+            (cachedFormatKey == key) ? cachedFormatDesc : nil
+        reorderLock.unlock()
 
         let desc: CMVideoFormatDescription
-        if let cached = cachedFormatDesc, key == cachedFormatKey {
-            desc = cached
+        if let cachedDesc {
+            desc = cachedDesc
         } else {
             var formatDesc: CMVideoFormatDescription?
             let status = CMVideoFormatDescriptionCreateForImageBuffer(
@@ -373,8 +269,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
                 formatDescriptionOut: &formatDesc
             )
             guard status == noErr, let new = formatDesc else { return nil }
+            reorderLock.lock()
             cachedFormatDesc = new
             cachedFormatKey = key
+            reorderLock.unlock()
             desc = new
         }
 

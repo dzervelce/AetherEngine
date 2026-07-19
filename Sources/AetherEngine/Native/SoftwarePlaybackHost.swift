@@ -6,46 +6,38 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
-/// Software-decode playback host. Parallel to `NativeAVPlayerHost` but
-/// drives decode + render through the engine's own FFmpeg/dav1d
-/// pipeline instead of handing the source to AVPlayer. Used for codecs
-/// AVPlayer cannot decode on the active platform — primarily AV1 on
-/// Apple TV today, where Apple ships dav1d on iOS / macOS but not on
-/// tvOS, and no Apple TV chip has HW AV1.
-///
-/// The pipeline:
-///
-/// ```
-/// Demuxer ─┬─ video pkt ──► SoftwareVideoDecoder ──► SampleBufferRenderer ──► AVSampleBufferDisplayLayer
-///          │                                                                     │
-///          └─ audio pkt ──► AudioDecoder ──► CMSampleBuffer ──► AudioOutput ─────┘
-///                                                                  (AVSampleBufferRenderSynchronizer
-///                                                                   is the master clock; display layer
-///                                                                   is attached to it for A/V sync)
-/// ```
-///
-/// AV1 sources in the wild almost never carry Atmos or Dolby Vision
-/// (DV is HEVC-profile-driven; Atmos mastering runs in HEVC), so this
-/// host intentionally skips the EAC3+JOC fMP4 pipe + DV HDMI handshake
-/// that the native path provides. If those gaps ever bite an AV1+DV or
-/// AV1+Atmos source, route handling lives in `AetherEngine.load` and
-/// can be revisited there without changing this host.
+/// Software-decode playback host (FFmpeg/dav1d pipeline): AV1 on Apple TV (no HW AV1 on tvOS), VP9.
+/// AVSampleBufferRenderSynchronizer is the master clock; display layer attached for A/V sync.
+/// Intentionally skips EAC3+JOC and DV HDMI handshake (AV1 sources rarely carry Atmos or DV).
 @MainActor
 final class SoftwarePlaybackHost {
 
     // MARK: - Published state (mirrors NativeAVPlayerHost surface)
 
-    /// Frames successfully enqueued into the AVSampleBufferDisplayLayer.
-    /// Incremented each time `renderer.enqueue` is invoked. Read by the
-    /// engine's LiveTelemetrySampler at 1 Hz to compute observed FPS on
-    /// the software path. Atomic read via the existing class-internal
-    /// serialisation; the counter is single-writer (the decode pump) and
-    /// any reader sees a torn `Int` only on 32-bit platforms (tvOS is
-    /// 64-bit, so reads are atomic by ABI).
-    private(set) var framesEnqueued: Int = 0
+    /// Frames enqueued on the display layer; read by LiveTelemetrySampler at 1 Hz for observed FPS. Lock-guarded (demux thread writes, main-actor reads).
+    nonisolated var framesEnqueued: Int {
+        framesEnqueuedLock.lock()
+        defer { framesEnqueuedLock.unlock() }
+        return _framesEnqueued
+    }
+    nonisolated private func bumpFramesEnqueued() -> Int {
+        framesEnqueuedLock.lock()
+        defer { framesEnqueuedLock.unlock() }
+        let previous = _framesEnqueued
+        _framesEnqueued &+= 1
+        return previous
+    }
+    private let framesEnqueuedLock = NSLock()
+    nonisolated(unsafe) private var _framesEnqueued: Int = 0
 
     @Published private(set) var isReady: Bool = false
     @Published private(set) var currentTime: Double = 0
+    /// Raw synchronizer clock in the SOURCE axis (same axis as demuxed packet PTS and
+    /// subtitle cues). Equals `currentTime` for zero-based sources; diverges by the
+    /// session-zero offset on live and mid-stream-joined sources (#107). The engine
+    /// publishes this as `clock.sourceTime` so the subtitle overlay drainer scans the
+    /// packet store on the right axis.
+    @Published private(set) var sourceClockSeconds: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
     @Published private(set) var failureMessage: String?
@@ -55,6 +47,9 @@ final class SoftwarePlaybackHost {
     /// metadata appears on a decoded frame. Hooked by `AetherEngine` to
     /// upgrade the published `videoFormat` from `.hdr10` → `.hdr10Plus`.
     nonisolated(unsafe) var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
+
+    /// #131: forwarded from the video decoder; decoded-frame A53 cc_data triplets, presentation order.
+    nonisolated(unsafe) var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
 
     // MARK: - Output
 
@@ -67,23 +62,15 @@ final class SoftwarePlaybackHost {
     // MARK: - Internals
 
     private let renderer: SampleBufferRenderer
-    /// Video decoder. Swapped per codec at `load()` time:
-    /// `SoftwareVideoDecoder` for AV1 / VP9 (libavcodec / dav1d), and
-    /// `HardwareVideoDecoder` for HEVC (VTDecompressionSession HW).
-    /// The protocol is `VideoDecodingPipeline` so the demux loop
-    /// stays codec-agnostic.
+    /// Swapped per codec at load(): SoftwareVideoDecoder for AV1/VP9, HardwareVideoDecoder for HEVC. Protocol keeps the demux loop codec-agnostic.
     private var videoDecoder: any VideoDecodingPipeline
     private var audioDecoder: AudioDecoder?
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
 
-    /// Background queue the demux loop runs on. One queue per host so
-    /// hosts created across rapid load() calls don't fight over the
-    /// same execution context.
     private let demuxQueue = DispatchQueue(label: "engine.sw.demux", qos: .userInitiated)
 
-    /// Lock guarding the playing / stop flags. Read on the demux thread
-    /// every iteration, written on the main actor from play/pause/stop.
+    /// Guards isPlaying/stopRequested across demux thread reads and main-actor writes.
     private let flagsLock = NSLock()
     nonisolated(unsafe) private var _isPlaying: Bool = false
     nonisolated(unsafe) private var _stopRequested: Bool = false
@@ -95,75 +82,52 @@ final class SoftwarePlaybackHost {
     private var videoStreamIndex: Int32 = -1
     private var audioStreamIndex: Int32 = -1
 
-    /// Video stream time base (seconds per PTS unit) captured at load.
-    /// Used both to convert raw packet PTS to seconds for the DVR ring
-    /// and, on the replay path, to convert ring seconds back into the
-    /// time_base units the decoders expect on a reconstructed AVPacket.
     private var videoTimeBaseSeconds: Double = 0
-    /// Audio stream time base (seconds per PTS unit), same role as the
-    /// video one for replayed audio packets. 0 when there is no audio.
     private var audioTimeBaseSeconds: Double = 0
 
     // MARK: - Live / DVR
 
-    /// Disk-spooled packet ring backing the software-path DVR rewind
-    /// buffer. Non-nil only for a live session loaded with a DVR window
-    /// (`dvrWindowSeconds != nil`). Appended on the demux thread (the
-    /// ring is internally locked), read on the seek path. Closed + niled
-    /// in `stop()`.
+    /// Disk-spooled DVR rewind ring; non-nil for live sessions with dvrWindowSeconds set. Demux-thread appended (internally locked).
     nonisolated(unsafe) private var dvrRing: PacketRingBuffer?
 
     /// True for a live session. Gates ring fill, edge publishing, and the
     /// live-DVR seek branch so the non-live SW path is untouched.
     private var isLive: Bool = false
 
-    /// Session-start PTS in seconds (the first packet's PTS, video or
-    /// audio, whichever arrives first). The SW session timeline (and the
-    /// engine's `currentTime` on this path) is "seconds since first
-    /// frame", so the session-relative edge is `newestPts - sessionStartPts`.
-    /// `nan` until the first packet is seen.
+    /// First packet's PTS (seconds); SW timeline is "seconds since first frame" = newestPts - sessionStartPts. nan until first packet.
     nonisolated(unsafe) private var sessionStartPts: Double = .nan
 
-    /// Newest source PTS (seconds) demuxed so far, tracked on the demux
-    /// thread. The live edge in session time is `newestSourcePts - sessionStartPts`.
     nonisolated(unsafe) private var newestSourcePts: Double = .nan
 
     /// Guards `sessionStartPts` / `newestSourcePts` against the demux
     /// thread writing while the main-actor time tick reads them.
     private let liveEdgeLock = NSLock()
 
+    /// SW path's buffered frontier (AetherEngine#54): newest demuxed source PTS in session time. Published as clock.bufferedPosition.
+    nonisolated var bufferedSessionTime: Double {
+        liveEdgeLock.lock()
+        defer { liveEdgeLock.unlock() }
+        guard sessionStartPts.isFinite, newestSourcePts.isFinite else { return 0 }
+        return max(0, newestSourcePts - sessionStartPts)
+    }
+
     // MARK: - Live reader/feeder split (DVR sessions)
     //
-    // A live session WITH a DVR ring runs two loops instead of the
-    // combined demux loop:
-    //
-    //   reader (demuxQueue): source -> discontinuity reconcile -> edge
-    //     note -> ring append. Runs regardless of play/pause, so the
-    //     ring keeps filling during a pause (pause = timeshift) and the
-    //     source connection never backs up.
-    //   feeder (feedQueue): ring cursor -> decoders -> renderer, paced
-    //     by the renderer's back-pressure. Parks while paused; resumes
-    //     at the cursor, so pause/resume and DVR rewinds are the same
-    //     operation (move the cursor). This replaces the old
-    //     synchronous whole-tail replay in seekLiveDVR, which decoded
-    //     tens of thousands of packets in a tight loop on the main
-    //     actor without back-pressure (multi-second UI freeze, renderer
-    //     queue overflow, decoded-frame memory spike).
-    //
-    // Live-only sessions (no DVR window -> no ring) keep the combined
-    // loop: there is no buffer to time-shift into, so pause keeps its
-    // old park-the-loop behavior.
+    // DVR live sessions: reader (demuxQueue) fills ring regardless of play/pause; feeder (feedQueue) decodes from ring cursor with renderer back-pressure.
+    // Pause = timeshift (reader keeps filling); DVR rewind = cursor move. Replaces synchronous whole-tail replay (multi-second UI freeze, queue overflow).
+    // Live-only (no ring): combined loop; pause parks the loop.
 
     /// Background queue for the live feeder loop.
     private let feedQueue = DispatchQueue(label: "engine.sw.feed", qos: .userInitiated)
 
     /// Guards `_feedCursor` / `_sourceEnded`.
     private let feedLock = NSLock()
-    /// Ring sequence number of the NEXT packet the feeder will decode.
     nonisolated(unsafe) private var _feedCursor: Int = 0
-    /// Set when the reader hit EOF / a read error on the live source;
-    /// the feeder drains the ring and then reports the end.
     nonisolated(unsafe) private var _sourceEnded = false
+
+    /// Audio look-ahead pump cursor (#107 audio chopping): the feeder advances it ahead of
+    /// `_feedCursor`, seek paths reset it alongside `setFeedCursor`.
+    private let audioLookahead = AudioLookaheadState()
 
     nonisolated private func readFeedCursor() -> Int {
         feedLock.lock(); defer { feedLock.unlock() }
@@ -179,19 +143,16 @@ final class SoftwarePlaybackHost {
         feedLock.unlock()
     }
 
-    /// Reposition the cursor (DVR seek / fell-out-of-window clamp) and
-    /// wake the feeder.
     nonisolated private func setFeedCursor(_ value: Int) {
         feedLock.lock()
         _feedCursor = value
         feedLock.unlock()
+        audioLookahead.reset(to: value)
         demuxCondition.lock()
         demuxCondition.broadcast()
         demuxCondition.unlock()
     }
 
-    /// Clamp the cursor to `first` only if it still equals `old` (the
-    /// feeder detected it fell below the retained window).
     nonisolated private func clampFeedCursor(from old: Int, to first: Int) {
         feedLock.lock()
         if _feedCursor == old { _feedCursor = first }
@@ -203,33 +164,43 @@ final class SoftwarePlaybackHost {
         set { feedLock.lock(); _sourceEnded = newValue; feedLock.unlock() }
     }
 
-    /// Synchronous helper so the async `load()` can reset the feeder
-    /// state (NSLock is unavailable from async contexts).
     nonisolated private func resetFeederState() {
         feedLock.lock()
         _feedCursor = 0
         _sourceEnded = false
         _clockArmed = false
+        _clockSessionZero = 0
         feedLock.unlock()
+        audioLookahead.reset(to: 0)
     }
 
-    /// Whether the synchronizer master clock has been anchored for this
-    /// session (first decoded audio buffers, first video packet on
-    /// video-only, or an explicit seekClock from a seek path). Shared
-    /// between the feeder loop and the seek paths so a DVR seek issued
-    /// before the feeder's own arming doesn't get its clock position
-    /// overwritten by a late re-arm.
+    /// Whether the synchronizer clock has been anchored this session. Shared with seek paths so a DVR seek before feeder arming is not overwritten by a late re-arm.
     nonisolated(unsafe) private var _clockArmed = false
     nonisolated private var clockArmed: Bool {
         get { feedLock.lock(); defer { feedLock.unlock() }; return _clockArmed }
         set { feedLock.lock(); _clockArmed = newValue; feedLock.unlock() }
     }
 
-    /// Set when pause() stopped the synchronizer, so play() knows to
-    /// restore the rate. play() previously never resumed the
-    /// synchronizer at all (pause() set its rate to 0, play() only
-    /// flipped `isPlaying`), leaving the clock frozen after any
-    /// pause/resume on the SW path.
+    /// Session-zero offset for non-live sources whose first decoded sample deviated from
+    /// the load anchor (mid-stream-joined TS, #107): raw clock minus this is the published
+    /// position. 0 for zero-based sources and aligned resumes. Written once by the demux
+    /// thread at clock arming, read by the main-actor time tick.
+    nonisolated(unsafe) private var _clockSessionZero: Double = 0
+    nonisolated private var clockSessionZero: Double {
+        get { feedLock.lock(); defer { feedLock.unlock() }; return _clockSessionZero }
+        set { feedLock.lock(); _clockSessionZero = newValue; feedLock.unlock() }
+    }
+
+    /// Bumped at every seek; demux loop re-checks around blocking readPacket to discard stale pre-seek packets that would clear the skip threshold (visible fast-forward burst).
+    nonisolated(unsafe) private var _seekGeneration: UInt64 = 0
+    nonisolated private var seekGeneration: UInt64 {
+        feedLock.lock(); defer { feedLock.unlock() }; return _seekGeneration
+    }
+    nonisolated private func bumpSeekGeneration() {
+        feedLock.lock(); _seekGeneration &+= 1; feedLock.unlock()
+    }
+
+    /// Set when pause() stopped the synchronizer; play() restores the rate (previously play() only flipped isPlaying, leaving the clock frozen).
     private var pausedByHost = false
 
     /// Invoked on the main-actor time-update cadence with the current
@@ -246,24 +217,18 @@ final class SoftwarePlaybackHost {
         return max(0, newestSourcePts - sessionStartPts)
     }
 
-    /// Periodic mirror of `audioOutput.currentTimeSeconds` into the
-    /// published `currentTime`. 250 ms is the same cadence the pre-
-    /// collapse engine used; granular enough for transport-bar UX,
-    /// cheap enough to ignore.
     private var timeTimer: AnyCancellable?
 
-    /// Caching the chosen rate so resume() restores the right speed
-    /// after a pause without the host needing to know its history.
-    private var lastRate: Float = 1.0
+    /// Caching the chosen rate so resume() restores the right speed after a pause without the
+    /// host needing to know its history. Lock-guarded: the demux/feeder threads read it at clock
+    /// arming so a host rate change between load and arm is not lost (#107).
+    nonisolated(unsafe) private var _lastRate: Float = 1.0
+    nonisolated private var lastRate: Float {
+        get { flagsLock.lock(); defer { flagsLock.unlock() }; return _lastRate }
+        set { flagsLock.lock(); _lastRate = newValue; flagsLock.unlock() }
+    }
 
-    /// Source-position seconds the host opened at, captured so the
-    /// demux loop can align the synchronizer's master clock to the
-    /// first decoded sample's PTS. Cold-start at 0 is fine because
-    /// the source's first packet PTS is also ~0; resume / audio-switch
-    /// reload with a non-zero startPosition would otherwise leave the
-    /// clock at .zero while samples arrive with PTS=startPosition,
-    /// causing the synchronizer to wait `startPosition` seconds
-    /// before rendering — visible as "frozen frame, no audio".
+    /// Start position captured so the demux loop aligns the synchronizer clock to the first sample's PTS; non-zero resume without this would cause "frozen frame, no audio".
     private var initialClockTime: CMTime = .zero
 
     nonisolated var isPlaying: Bool {
@@ -280,6 +245,20 @@ final class SoftwarePlaybackHost {
         get { flagsLock.lock(); defer { flagsLock.unlock() }; return _stopRequested }
         set {
             flagsLock.lock(); _stopRequested = newValue; flagsLock.unlock()
+            demuxCondition.lock()
+            demuxCondition.broadcast()
+            demuxCondition.unlock()
+        }
+    }
+
+    /// Set by the engine on background-enter (iOS keepalive) and cleared on foreground. While true the
+    /// combined demux loop drops video packets and paces on the audio renderer, so audio keeps playing in
+    /// the background. The setter broadcasts the demux condition so a parked loop re-evaluates immediately.
+    nonisolated(unsafe) private var _backgroundAudioOnly = false
+    nonisolated var backgroundAudioOnly: Bool {
+        get { flagsLock.lock(); defer { flagsLock.unlock() }; return _backgroundAudioOnly }
+        set {
+            flagsLock.lock(); _backgroundAudioOnly = newValue; flagsLock.unlock()
             demuxCondition.lock()
             demuxCondition.broadcast()
             demuxCondition.unlock()
@@ -316,11 +295,7 @@ final class SoftwarePlaybackHost {
         let vtb = vStream.pointee.time_base
         self.videoTimeBaseSeconds = vtb.den > 0 ? Double(vtb.num) / Double(vtb.den) : 0
 
-        // Build the DVR rewind ring for a live session that opted into a
-        // window. Live-only (no window) keeps unbounded forward playback
-        // with no rewind buffer. Scratch dir mirrors SegmentCache's
-        // <tmpdir>/aether-segments/<uuid> convention so stale-dir cleanup
-        // and disk accounting stay uniform.
+        // DVR ring scratch dir mirrors SegmentCache's <tmpdir>/aether-segments/<uuid> convention.
         if isLive, let window = dvrWindowSeconds {
             let baseDir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
                 .appendingPathComponent("aether-segments", isDirectory: true)
@@ -335,10 +310,7 @@ final class SoftwarePlaybackHost {
             }
         }
 
-        // Release-visible session-start log so the diagnostic overlay
-        // shows the SW path was entered at all. Without this, a SW-path
-        // session that black-screens looks identical in logs to a session
-        // that never dispatched here (DrHurt #4 MPEG-4 "not much on log").
+        // Release-visible session-start log: SW-path black-screens were indistinguishable from "never dispatched" (DrHurt #4).
         let vCodecID = vStream.pointee.codecpar?.pointee.codec_id.rawValue ?? 0
         let aIdx = audioSourceStreamIndex ?? dem.audioStreamIndex
         let aCodecID: UInt32 = aIdx >= 0
@@ -351,13 +323,15 @@ final class SoftwarePlaybackHost {
             category: .swPlayback
         )
 
-        // Pick the right decoder for the source codec. HEVC routes
-        // to VTDecompressionSession (HW); AV1 / VP9 / anything else
-        // stays on libavcodec via SoftwareVideoDecoder. The current
-        // instance is replaced wholesale so the previous decoder's
-        // state cannot bleed into the new session.
+        // HEVC -> VTDecompressionSession (HW) when VideoToolbox can HW-decode this exact format; everything
+        // else -> libavcodec. Replace wholesale to prevent state bleed. #2: HardwareVideoDecoder requires a
+        // HW decoder and has no software fallback, so an HEVC Rext (4:2:2/4:4:4/12-bit) stream routed here on
+        // hardware without a HW decoder (Intel Macs / older Apple TV) would fail VT session creation and show a
+        // black screen. Route those to libavcodec instead, which decodes them. Apple Silicon HW-decodes them,
+        // so the probe keeps HardwareVideoDecoder there.
         if let codecpar = vStream.pointee.codecpar,
-           codecpar.pointee.codec_id == AV_CODEC_ID_HEVC {
+           codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
+           VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) {
             videoDecoder.close()
             videoDecoder = HardwareVideoDecoder()
             EngineLog.emit(
@@ -365,18 +339,16 @@ final class SoftwarePlaybackHost {
                 category: .swPlayback
             )
         } else if !(videoDecoder is SoftwareVideoDecoder) {
-            // Restoring the software default if a previous load left
-            // a HW decoder in place and this load isn't HEVC.
             videoDecoder.close()
             videoDecoder = SoftwareVideoDecoder()
+            EngineLog.emit(
+                "[SWHost] selected SoftwareVideoDecoder (libavcodec) for codec_id="
+                + "\(vStream.pointee.codecpar?.pointee.codec_id.rawValue ?? 0)",
+                category: .swPlayback
+            )
         }
 
-        // Detect HDR transfer characteristic from the source codecpar
-        // and flip the display layer into HDR mode before any frames
-        // arrive. Without this `displayLayer.preferredDynamicRange`
-        // stays at `.standard` and AVSampleBufferDisplayLayer renders
-        // PQ / HLG content desaturated. Matches what AVPlayer's
-        // internal pipeline does implicitly via AVAsset metadata.
+        // Flip display layer into HDR mode before frames arrive; without this preferredDynamicRange stays .standard and PQ/HLG renders desaturated.
         if let codecpar = vStream.pointee.codecpar {
             let trc = codecpar.pointee.color_trc
             let sourceIsHDR = trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67
@@ -389,18 +361,14 @@ final class SoftwarePlaybackHost {
             }
         }
 
+        // Applied here (not init) so it also covers a decoder replaced above.
+        (videoDecoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
+
         try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
-            // Decoder callback fires on the demux thread. SampleBufferRenderer
-            // is internally locked + safe to call off-main; the engine's
-            // public state stays untouched here, only the layer's frame queue.
+            // Decoder callback is off-main; SampleBufferRenderer is internally locked.
             self?.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
-            // Release-visible first-frame-enqueued log. After [SWDecoder]
-            // Opened and [SWHost] session start, this is the next milestone:
-            // proves the demux loop reached a video packet, the decoder
-            // produced a pixel buffer, and the renderer accepted the
-            // enqueue. If this never fires after several seconds, the
-            // failure is between decoder-open and first-frame.
-            if self?.framesEnqueued == 0 {
+            // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
+            if self?.bumpFramesEnqueued() == 0 {
                 let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
                 EngineLog.emit(
                     "[SWHost] first video frame enqueued: "
@@ -410,10 +378,12 @@ final class SoftwarePlaybackHost {
                     category: .swPlayback
                 )
             }
-            self?.framesEnqueued &+= 1
         }
         videoDecoder.onFirstHDR10PlusDetected = { [weak self] in
             self?.onFirstHDR10PlusDetected?()
+        }
+        videoDecoder.onA53Captions = { [weak self] triplets, pts in
+            self?.onA53Captions?(triplets, pts)
         }
 
         let resolvedAudioIdx: Int32 = audioSourceStreamIndex ?? dem.audioStreamIndex
@@ -430,18 +400,22 @@ final class SoftwarePlaybackHost {
                 self.audioStreamIndex = -1
             }
         }
-        // AudioOutput owns the AVSampleBufferRenderSynchronizer, which is
-        // the MASTER CLOCK for the whole session, video included. It is
-        // created unconditionally: a video-only source (no audio stream,
-        // or audio decoder open failure above) previously got no clock
-        // at all, rendering one frozen frame with currentTime stuck at 0.
-        // The demux/feeder loops arm the clock off the first VIDEO frame
-        // when there is no audio decoder. The display layer is NOT yet
-        // attached to the synchronizer here; that happens in play() after
-        // the engine has hung the layer in the bound view's CALayer
-        // hierarchy (attaching a free-floating layer fails with
-        // `FigVideoQueueRemote err=-12080` after the first enqueue on
-        // tvOS 26+).
+        // #112 rework: capture embedded subtitle stream indices + time bases for the demux
+        // loop's subtitle tap dispatch.
+        var subIndices: Set<Int32> = []
+        var subTimeBases: [Int32: AVRational] = [:]
+        for info in dem.subtitleTrackInfos() {
+            let idx = Int32(info.id)
+            subIndices.insert(idx)
+            subTimeBases[idx] = dem.stream(at: idx)?.pointee.time_base ?? AVRational(num: 1, den: 1000)
+        }
+        self.subtitleStreamIndices = subIndices
+        self.subtitleStreamTimeBases = subTimeBases
+        // #112: split-PES PGS streams (MPEG-TS) need display-set reassembly in the packet
+        // store; the tap sink consults this per packet.
+        self.splitDisplaySetSubtitleStreamIndices = dem.splitDisplaySetSubtitleStreamIndices()
+
+        // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
         self.audioOutput = AudioOutput()
 
         // Reset the live feeder state for the new session.
@@ -449,11 +423,7 @@ final class SoftwarePlaybackHost {
 
         if let start = startPosition, start > 0 {
             dem.seek(to: start)
-            // Mirror the same skip-PTS + clock-alignment dance the
-            // seek() path performs, so the demux loop drops pre-
-            // keyframe frames and the synchronizer starts ticking at
-            // the resume offset (not at .zero) once the first audio
-            // sample arrives.
+            // Mirror seek() skip-PTS + clock alignment so demux drops pre-keyframe frames and synchronizer starts at the resume offset.
             let startTime = CMTime(seconds: start, preferredTimescale: 90000)
             videoDecoder.skipUntilPTS = startTime
             renderer.setSkipThreshold(startTime)
@@ -465,19 +435,20 @@ final class SoftwarePlaybackHost {
 
         startTimeUpdates()
         isReady = true
-        // Demux loop only spins up once play() actually fires; no point
-        // pulling packets while the synchronizer hasn't claimed the
-        // layer yet.
     }
 
     // MARK: - Transport
 
     func play() {
-        // First play() since load(): claim the display layer for the
-        // synchronizer (now that the engine has hung it in the bound
-        // view's CALayer hierarchy via presentCurrentLayer) and kick
-        // off the demux loop. Idempotent across repeated play() calls;
-        // the layer-attach + loop-spin-up only fire on the first one.
+        // Resume after pause(): gate on clockArmed, not demuxLoopStarted. A rate change on the
+        // un-anchored synchronizer (no media at its clock time yet) wedges the delayed-rate-change
+        // machinery permanently frozen; the arming seekClock applies the current lastRate (#107).
+        if pausedByHost {
+            pausedByHost = false
+            if clockArmed {
+                audioOutput?.setRate(lastRate)
+            }
+        }
         if !demuxLoopStarted, let aOut = audioOutput {
             aOut.attachVideoLayer(renderer.displayLayer)
         }
@@ -485,67 +456,107 @@ final class SoftwarePlaybackHost {
             demuxLoopStarted = true
             startDemuxLoop()
         }
-
-        // Don't eager-start the audio synchronizer. The pre-collapse
-        // pattern was: start(at:) fires only on the first decoded audio
-        // sample, so the master clock's time-zero aligns with the
-        // sample's PTS. Eager-starting here with an empty renderer queue
-        // means the clock ticks forward through the demux loop's spin-up
-        // and the first sample lands "in the past" — dropped, with a
-        // visible initial flicker or audio gap. The demux loop calls
-        // `audioOutput.start(at: .zero)` itself on first enqueue;
-        // `start()` is idempotent so the duplicate call from `seek()`'s
-        // resume path is a no-op.
-        // Resume the synchronizer after a pause(). Guarded so a cold
-        // start stays lazy (the clock is armed off the first decoded
-        // sample, see the comment above); an unguarded setRate here
-        // would tick the clock forward through the spin-up and drop the
-        // first samples as "in the past".
-        if pausedByHost {
-            pausedByHost = false
-            audioOutput?.setRate(lastRate)
-        }
+        // Cold start: demux loop arms the clock on first decoded audio sample; don't eager-start.
         rate = lastRate
         isPlaying = true
     }
 
-    /// Latched once the first `play()` has wired the audio synchronizer
-    /// to the display layer and spun up the demux loop. Subsequent
-    /// `play()` calls only flip `isPlaying` without re-attaching.
     private var demuxLoopStarted: Bool = false
 
+    /// #95 audio tap: mirrors every decoded audio CMSampleBuffer to the tap (nil = tap off).
+    /// Set/cleared on the main actor by AetherEngine+AudioTap; read per packet on the demux and
+    /// feeder threads (same unsynchronized-flag pattern as `_isPlaying`; worst case one buffer
+    /// reaches a just-removed sink).
+    nonisolated(unsafe) var audioTapSink: (@Sendable (CMSampleBuffer) -> Void)?
+
+    /// #112 rework subtitle tap: the demux loop hands every embedded subtitle packet to this
+    /// sink (nil = tap off), which copies the payload into the session's SubtitlePacketStore.
+    /// Same unsynchronized-flag pattern as `audioTapSink`; the sink copies synchronously, so
+    /// the packet pointer never escapes the demux thread. The trailing Bool marks packets of
+    /// split-PES PGS streams (MPEG-TS) that need display-set reassembly in the store.
+    nonisolated(unsafe) var subtitleTapSink: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?
+
+    /// #112 rework: embedded subtitle stream indices + time bases, captured at load before the
+    /// demux loop starts (the SW host applies no stream discard, so these packets already flow).
+    private(set) var subtitleStreamIndices: Set<Int32> = []
+    private(set) var subtitleStreamTimeBases: [Int32: AVRational] = [:]
+    /// #112: streams whose PGS display sets arrive split across PES packets (MPEG-TS) and need
+    /// reassembly in the packet store. Captured at load, read by the tap sink per packet.
+    private(set) var splitDisplaySetSubtitleStreamIndices: Set<Int32> = []
+
+    /// Host's ASS markup preference for overlay decoders (mirrors the HLS session flag).
+    var preserveASSMarkupForSubtitleTap = false
+    var teletextPageForSubtitleTap: Int? = nil
+    var deinterlaceConfig = DeinterlaceConfig()
+
+    /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the
+    /// session's video dims like the HLS tap routes. The drainer owns the returned decoder.
+    func makeOverlayDecoder(streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
+        guard let dem = demuxer, let stream = dem.stream(at: streamIndex) else { return nil }
+        let vpar = dem.stream(at: videoStreamIndex)?.pointee.codecpar
+        let w = vpar?.pointee.width ?? 1920
+        let h = vpar?.pointee.height ?? 1080
+        return EmbeddedSubtitleDecoder(stream: stream,
+                                       sourceVideoWidth: w > 0 ? w : 1920,
+                                       sourceVideoHeight: h > 0 ? h : 1080,
+                                       preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                       teletextPage: teletextPageForSubtitleTap)
+    }
+
     func pause() {
-        audioOutput?.pause()
+        // Un-anchored clock: only latch the pause; the loops park on isPlaying (#107).
+        if clockArmed {
+            audioOutput?.pause()
+        }
         pausedByHost = true
         rate = 0
         isPlaying = false
     }
 
+    /// Background-enter (iOS keepalive): keep audio flowing, stop feeding video. The demux loop reads the flag.
+    func enterBackgroundAudioOnly() {
+        backgroundAudioOnly = true
+    }
+
+    /// Foreground return: resume video. Flush the video decoder + renderer (NOT audio) so video resyncs at the
+    /// next keyframe; the synchronizer is already at the audio time, so the keyframe presents promptly. Order
+    /// matters: while backgroundAudioOnly is still true the loop drops video and never touches videoDecoder /
+    /// renderer, so flushing here from the main actor cannot race the demux queue. Clear the flag last.
+    func exitBackgroundAudioOnly() {
+        guard backgroundAudioOnly else { return }
+        videoDecoder.flush()
+        renderer.flush()
+        backgroundAudioOnly = false
+    }
+
     func setRate(_ newRate: Float) {
         lastRate = newRate
-        audioOutput?.setRate(newRate)
         rate = newRate
+        // Same rule as play(): never rate-change the un-anchored synchronizer. A host setRate
+        // right after load(), before the demux/feeder loop armed the clock, wedged the
+        // delayed-rate-change machinery and froze live sessions on the first frame; the arming
+        // seekClock picks up lastRate instead (#107).
+        if clockArmed {
+            audioOutput?.setRate(newRate)
+        }
     }
 
     func seek(to seconds: Double) async {
         guard let dem = demuxer else { return }
-        // Pause the demux loop so we don't race the seek against
-        // in-flight packet reads.
+        // Stop loop + bump generation to invalidate in-flight packets.
+        bumpSeekGeneration()
         let wasPlaying = isPlaying
         isPlaying = false
 
         videoDecoder.flush()
         audioDecoder?.flush()
-        renderer.flush()
+        // Hold the last frame through the seek (don't blank the display) so the viewer sees the previous
+        // frame until the post-seek frame decodes, instead of a black flash (issue #90). Stop/teardown and
+        // background-return still clear via the default.
+        renderer.flush(removingDisplayedImage: false)
         audioOutput?.flush()
 
-        // Live + DVR rewind: a live source CANNOT be demuxer-seeked (it
-        // is a forward-only stream). Instead we reseed the decoder from
-        // the retained ring. The demux loop, once resumed, keeps reading
-        // NEW packets forward from where the live source already sits
-        // (its read position is untouched), so playback shows the
-        // buffered past from the seek target and then catches back up to
-        // live as the loop continues appending + decoding fresh packets.
+        // Live source is forward-only; DVR rewind reseeds decoders from the ring without touching the live demuxer's read position.
         if isLive, let ring = dvrRing {
             await seekLiveDVR(to: seconds, ring: ring, wasPlaying: wasPlaying)
             return
@@ -553,9 +564,6 @@ final class SoftwarePlaybackHost {
 
         dem.seek(to: seconds)
 
-        // Drop frames before the seek target until a keyframe lines up.
-        // SoftwareVideoDecoder honors `skipUntilPTS` internally per
-        // pre-collapse contract.
         let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
         videoDecoder.skipUntilPTS = targetTime
         renderer.setSkipThreshold(targetTime)
@@ -563,63 +571,45 @@ final class SoftwarePlaybackHost {
         currentTime = seconds
 
         if wasPlaying {
-            // Jump the synchronizer's master clock to the seek target so
-            // PTS-stamped samples decoded after the seek align with the
-            // clock. Calling `start(at: .zero)` here would wedge the
-            // queue: samples come back with PTS=seekTarget but the clock
-            // is at 0, so the synchronizer waits seekTarget seconds
-            // before rendering — visible as "frozen frame, no audio"
-            // until the wait elapses, plus the renderer's queue fills
-            // up and trips err=-12080 from FigVideoQueueRemote.
+            // Anchor clock at seek target: clock at .zero + PTS=seekTarget would stall rendering for seekTarget seconds (FigVideoQueueRemote -12080).
             audioOutput?.seekClock(to: targetTime, rate: lastRate)
             isPlaying = true
+        } else {
+            // Paused seek: anchor at target with rate 0 so play() resumes from the seek position (without this, scrubs freeze or drop all samples).
+            audioOutput?.seekClock(to: targetTime, rate: 0)
+            pausedByHost = true
         }
+        // Arm now so the demux loop doesn't re-arm at stale initialClockTime (a pre-first-audio seek snapped back to session start without this).
+        clockArmed = true
     }
 
-    /// Live DVR rewind: reseed the decoder pipeline from the retained
-    /// ring without touching the live demuxer's read position.
-    ///
-    /// `targetSession` is session-relative seconds (the engine clock).
-    /// The ring + audio synchronizer + sample PTS all live on the source
-    /// PTS axis, so we map via the captured `sessionStartPts`. After this
-    /// returns and the loop resumes, the demux loop keeps reading NEW
-    /// packets forward from the live source, so the buffered past plays
-    /// out from the target and then catches back up to live.
+    /// Live DVR rewind: reseeds decoder from the ring (source PTS axis; maps via sessionStartPts) without touching the live demuxer. After return, the loop reads new packets forward and plays back to live.
     private func seekLiveDVR(to targetSession: Double, ring: PacketRingBuffer, wasPlaying: Bool) async {
-        // Map session time to source PTS. sessionStartPts is set by the
-        // demux loop on the first packet; if it has not been seen yet
-        // (extremely early seek), treat session == source.
         let startPts: Double = {
             liveEdgeLock.lock(); defer { liveEdgeLock.unlock() }
             return sessionStartPts.isFinite ? sessionStartPts : 0
         }()
         let targetSource = startPts + targetSession
 
-        // Skip threshold (in source PTS) drops frames decoded from the
-        // anchor keyframe up to the requested target, so the playhead
-        // lands exactly at `targetSource` even though decoding resumes at
-        // the earlier keyframe. Set BEFORE moving the cursor so the
-        // decoder honors it on the first decoded frame.
         let targetTime = CMTime(seconds: targetSource, preferredTimescale: 90000)
         videoDecoder.skipUntilPTS = targetTime
         renderer.setSkipThreshold(targetTime)
 
-        // Anchor the master clock at the target so the post-skip samples
-        // (which carry source PTS >= targetSource) align with the clock.
+        // Anchor clock at target (paused scrubs: rate 0 so resume continues from seek position).
         if wasPlaying {
             audioOutput?.seekClock(to: targetTime, rate: lastRate)
-            // The clock is positioned; the feeder must not re-arm it at
-            // the (earlier) anchor keyframe's PTS.
-            clockArmed = true
+        } else {
+            audioOutput?.seekClock(to: targetTime, rate: 0)
+            pausedByHost = true
         }
+        clockArmed = true
 
-        // Reposition the feeder cursor onto the newest keyframe at or
-        // before the target (clamped to the oldest retained packet, which
-        // eviction keeps keyframe-aligned; on an empty ring the cursor
-        // parks at the next append). The feeder streams from there with
-        // renderer back-pressure; this replaces the old synchronous
-        // whole-tail replay (see the reader/feeder split docs).
-        let seq = ring.seq(forKeyframeAtOrBefore: targetSource) ?? ring.seqBounds.first
+        // Reposition cursor to the newest keyframe at or before target. If the target precedes every
+        // retained keyframe, fall to the EARLIEST keyframe, not seqBounds.first, which can be a mid-GOP
+        // leading entry before the ring's first eviction and would decode as garbage until the next keyframe.
+        let seq = ring.seq(forKeyframeAtOrBefore: targetSource)
+            ?? ring.firstKeyframeSeq()
+            ?? ring.seqBounds.first
         setFeedCursor(seq)
         EngineLog.emit(
             "[SWHost] DVR rewind: targetSession=\(String(format: "%.2f", targetSession)) "
@@ -633,15 +623,7 @@ final class SoftwarePlaybackHost {
         }
     }
 
-    /// Reconstruct an AVPacket from a ring packet and route it to the
-    /// same decode entry the demux/feeder loops use (video -> the video
-    /// decoder, audio -> the audio decoder + audio output). PTS is
-    /// converted from ring seconds back into the owning stream's
-    /// time_base units so the decoders recover the identical source PTS
-    /// on the replayed sample. The ring records `isVideo` per entry so
-    /// the route is unambiguous (a video non-keyframe and an audio packet
-    /// both carry `isKeyframe == false`). Returns true when audio sample
-    /// buffers were enqueued (used by the feeder's clock arming).
+    /// Reconstruct AVPacket from ring entry, convert PTS from seconds back to stream time_base, and route to decoders. Returns true when audio buffers were enqueued (used for feeder clock arming).
     @discardableResult
     nonisolated private static func feedRingPacket(
         _ pkt: PacketRingBuffer.Packet,
@@ -651,18 +633,16 @@ final class SoftwarePlaybackHost {
         videoStreamIndex: Int32,
         audioStreamIndex: Int32,
         videoTimeBaseSeconds: Double,
-        audioTimeBaseSeconds: Double
+        audioTimeBaseSeconds: Double,
+        audioTapSink: (@Sendable (CMSampleBuffer) -> Void)?
     ) -> Bool {
         let tbSec = pkt.isVideo ? videoTimeBaseSeconds : audioTimeBaseSeconds
         guard tbSec > 0, !pkt.bytes.isEmpty else { return false }
 
-        guard var avPkt: UnsafeMutablePointer<AVPacket>? = trackedPacketAlloc(),
-              let p = avPkt else { return false }
+        guard let p = trackedPacketAlloc() else { return false }
+        var avPkt: UnsafeMutablePointer<AVPacket>? = p
         defer { trackedPacketFree(&avPkt) }
 
-        // Allocate a ref-counted buffer and copy the stored bytes in, so
-        // the decoder owns a normal AVBufferRef-backed packet just like
-        // one from av_read_frame.
         if av_new_packet(p, Int32(pkt.bytes.count)) < 0 { return false }
         pkt.bytes.withUnsafeBytes { raw in
             if let base = raw.baseAddress, let dst = p.pointee.data {
@@ -680,6 +660,7 @@ final class SoftwarePlaybackHost {
         } else if let aDec = audioDecoder, let aOut = audioOutput {
             var enqueued = false
             for buf in aDec.decode(packet: p) {
+                audioTapSink?(buf)   // #95: mirror before enqueue
                 aOut.enqueue(sampleBuffer: buf)
                 enqueued = true
             }
@@ -723,18 +704,9 @@ final class SoftwarePlaybackHost {
 
     // MARK: - Demux loop
 
-    /// Captures the dependencies the demux loop needs as locals so the
-    /// loop runs fully off the main actor without re-entering it on
-    /// every packet. All captured types are `@unchecked Sendable` with
-    /// internal locks, so off-main use is safe.
+    /// Capture dependencies as locals so the demux loop runs off-main without re-entering the actor.
     private func startDemuxLoop() {
         guard let dem = demuxer else { return }
-        // `AVSampleBufferDisplayLayer` isn't Sendable in Apple's
-        // headers, but we only read `isReadyForMoreMediaData` off-main
-        // (which is documented as thread-safe by AVFoundation).
-        // Wrapping in `UncheckedSendable` quiets the closure-capture
-        // diagnostic without forcing the loop back to the main actor.
-        let layer = UncheckedSendable(renderer.displayLayer)
         let vDec = videoDecoder
         let vIdx = videoStreamIndex
         let aDec = audioDecoder
@@ -743,14 +715,13 @@ final class SoftwarePlaybackHost {
         let rndr = renderer
         let condition = demuxCondition
         let initialClock = initialClockTime
-        let initialRate = lastRate
+        // Read at arm time, not captured: a host setRate between load and arming must reach
+        // the anchor (the eager synchronizer call it replaced is gated on clockArmed, #107).
+        let currentRate: @Sendable () -> Float = { [weak self] in self?.lastRate ?? 1.0 }
         let ring = dvrRing
         let vTbSec = videoTimeBaseSeconds
         let aTbSec = audioTimeBaseSeconds
         let liveSession = isLive
-        // Demux-thread edge tracker. Records the session-start PTS once and
-        // the newest PTS continuously so the main-actor time tick can read
-        // the live edge. Captured weakly so it can't pin `self` past stop.
         let noteEdge: @Sendable (Double) -> Void = { [weak self] ptsSec in
             guard let self, ptsSec.isFinite else { return }
             self.liveEdgeLock.lock()
@@ -762,6 +733,17 @@ final class SoftwarePlaybackHost {
         }
         let getIsPlaying: @Sendable () -> Bool = { [weak self] in self?.isPlaying ?? false }
         let getStopRequested: @Sendable () -> Bool = { [weak self] in self?.stopRequested ?? true }
+        // #95: resolved per packet so a tap installed mid-session is picked up by running loops.
+        let getAudioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?) = { [weak self] in
+            self?.audioTapSink
+        }
+        // #112 rework: same late-install resolution for the subtitle tap.
+        let getSubtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { [weak self] in
+            self?.subtitleTapSink
+        }
+        let subIndices = subtitleStreamIndices
+        let subTimeBases = subtitleStreamTimeBases
+        let subSplitSetIndices = splitDisplaySetSubtitleStreamIndices
         let onError: @Sendable (String) -> Void = { [weak self] msg in
             Task { @MainActor [weak self] in self?.failureMessage = msg }
         }
@@ -772,11 +754,25 @@ final class SoftwarePlaybackHost {
             }
         }
 
-        // Live with a DVR ring: reader/feeder split (see the docs at the
-        // live section above). The reader fills the ring regardless of
-        // play/pause; the feeder decodes from its cursor with renderer
-        // back-pressure. Live-only (no ring) and VOD keep the combined
-        // loop below.
+        // Live + DVR ring: reader/feeder split; live-only and VOD use the combined loop below.
+        let getClockArmed: @Sendable () -> Bool = { [weak self] in
+            self?.clockArmed ?? true
+        }
+        let setClockArmed: @Sendable () -> Void = { [weak self] in
+            self?.clockArmed = true
+        }
+        let getSeekGeneration: @Sendable () -> UInt64 = { [weak self] in
+            self?.seekGeneration ?? 0
+        }
+        let getBackgroundAudioOnly: @Sendable () -> Bool = { [weak self] in
+            self?.backgroundAudioOnly ?? false
+        }
+        // #107: the demux loop reports the resolved session-zero offset when it re-anchors
+        // the clock at a deviating first-sample PTS (mid-stream-joined source).
+        let onClockAnchored: @Sendable (Double) -> Void = { [weak self] zero in
+            self?.clockSessionZero = zero
+        }
+
         if liveSession, let ring {
             let readCursor: @Sendable () -> Int = { [weak self] in
                 self?.readFeedCursor() ?? 0
@@ -793,12 +789,6 @@ final class SoftwarePlaybackHost {
             let getSourceEnded: @Sendable () -> Bool = { [weak self] in
                 self?.sourceEnded ?? true
             }
-            let getClockArmed: @Sendable () -> Bool = { [weak self] in
-                self?.clockArmed ?? true
-            }
-            let setClockArmed: @Sendable () -> Void = { [weak self] in
-                self?.clockArmed = true
-            }
             demuxQueue.async {
                 Self.runLiveReaderLoop(
                     demuxer: dem,
@@ -811,9 +801,14 @@ final class SoftwarePlaybackHost {
                     noteEdge: noteEdge,
                     stopRequested: getStopRequested,
                     onError: onError,
-                    onSourceEnded: setSourceEnded
+                    onSourceEnded: setSourceEnded,
+                    subtitleStreamIndices: subIndices,
+                    subtitleTimeBases: subTimeBases,
+                    splitDisplaySetSubtitleStreamIndices: subSplitSetIndices,
+                    subtitleTapSink: getSubtitleTapSink
                 )
             }
+            let lookahead = audioLookahead
             feedQueue.async {
                 Self.runLiveFeederLoop(
                     videoDecoder: vDec,
@@ -824,17 +819,20 @@ final class SoftwarePlaybackHost {
                     renderer: rndr,
                     condition: condition,
                     ring: ring,
+                    audioLookahead: lookahead,
                     videoTimeBaseSeconds: vTbSec,
                     audioTimeBaseSeconds: aTbSec,
                     readCursor: readCursor,
                     advanceCursor: advanceCursor,
                     clampCursor: clampCursor,
+                    currentRate: currentRate,
                     isPlaying: getIsPlaying,
                     stopRequested: getStopRequested,
                     sourceEnded: getSourceEnded,
                     clockArmed: getClockArmed,
                     markClockArmed: setClockArmed,
-                    onEnd: onEnd
+                    onEnd: onEnd,
+                    audioTapSink: getAudioTapSink
                 )
             }
             return
@@ -849,10 +847,9 @@ final class SoftwarePlaybackHost {
                 audioOutput: aOut,
                 audioStreamIndex: aIdx,
                 renderer: rndr,
-                displayLayer: layer.value,
                 condition: condition,
                 initialClockTime: initialClock,
-                initialRate: initialRate,
+                currentRate: currentRate,
                 ring: ring,
                 videoTimeBaseSeconds: vTbSec,
                 audioTimeBaseSeconds: aTbSec,
@@ -860,20 +857,25 @@ final class SoftwarePlaybackHost {
                 noteEdge: noteEdge,
                 isPlaying: getIsPlaying,
                 stopRequested: getStopRequested,
+                clockArmed: getClockArmed,
+                markClockArmed: setClockArmed,
+                onClockAnchored: onClockAnchored,
+                seekGeneration: getSeekGeneration,
+                backgroundAudioOnly: getBackgroundAudioOnly,
                 onError: onError,
-                onEnd: onEnd
+                onEnd: onEnd,
+                audioTapSink: getAudioTapSink,
+                subtitleStreamIndices: subIndices,
+                subtitleTimeBases: subTimeBases,
+                splitDisplaySetSubtitleStreamIndices: subSplitSetIndices,
+                subtitleTapSink: getSubtitleTapSink
             )
         }
     }
 
     // MARK: - Live reader loop (DVR sessions)
 
-    /// Source -> ring, unconditionally (play, pause, scrub). No decoding
-    /// here: the feeder owns the decoders. Discontinuity reconciliation
-    /// happens BEFORE the ring append, so the ring carries one
-    /// continuous timeline and the feeder (which is usually elsewhere on
-    /// the timeline) never sees the raw jump; unlike the combined loop
-    /// there is consequently no decoder flush at the seam.
+    /// Source -> ring (runs regardless of play/pause). Discontinuity reconciliation before ring append so the ring carries one continuous timeline.
     nonisolated private static func runLiveReaderLoop(
         demuxer: Demuxer,
         videoStreamIndex: Int32,
@@ -885,7 +887,11 @@ final class SoftwarePlaybackHost {
         noteEdge: @Sendable (Double) -> Void,
         stopRequested: @Sendable () -> Bool,
         onError: @Sendable (String) -> Void,
-        onSourceEnded: @Sendable () -> Void
+        onSourceEnded: @Sendable () -> Void,
+        subtitleStreamIndices: Set<Int32> = [],
+        subtitleTimeBases: [Int32: AVRational] = [:],
+        splitDisplaySetSubtitleStreamIndices: Set<Int32> = [],
+        subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil }
     ) {
         let discontinuityThresholdSeconds = 10.0
         var prevRawVideoPtsSec = Double.nan
@@ -895,8 +901,6 @@ final class SoftwarePlaybackHost {
         var lastSeenExtradata: Data? = nil
 
         defer {
-            // Whatever the exit path, wake the feeder so it can drain +
-            // report the end instead of sleeping out its wait timeout.
             condition.lock()
             condition.broadcast()
             condition.unlock()
@@ -944,8 +948,13 @@ final class SoftwarePlaybackHost {
                 }
             }
 
-            // Live PTS-discontinuity detection + reconciliation, same
-            // accrual as the combined loop (see its comment block).
+            // NOPTS repair: ring gates on valid PTS; MPEG-TS/H.264 field packets with NOPTS would starve the decoder. Synthesize PTS from DTS.
+            if streamIdx == videoStreamIndex || streamIdx == audioStreamIndex,
+               packet.pointee.pts == Int64.min, packet.pointee.dts != Int64.min {
+                packet.pointee.pts = packet.pointee.dts
+            }
+
+            // Live PTS-discontinuity: same accrual as combined loop.
             if streamIdx == videoStreamIndex, videoTimeBaseSeconds > 0,
                packet.pointee.pts != Int64.min {
                 let rawPtsSec = Double(packet.pointee.pts) * videoTimeBaseSeconds
@@ -1002,6 +1011,13 @@ final class SoftwarePlaybackHost {
                         condition.unlock()
                     }
                 }
+            } else if subtitleStreamIndices.contains(streamIdx), let sink = subtitleTapSink() {
+                // #107: the ring holds only A/V; subtitle packets tap into the session packet
+                // store here, mirroring the combined demux loop (the playhead-paced drainer
+                // decodes them on selection).
+                sink(streamIdx, packet,
+                     subtitleTimeBases[streamIdx] ?? AVRational(num: 1, den: 1000),
+                     splitDisplaySetSubtitleStreamIndices.contains(streamIdx))
             }
 
             av_packet_unref(packet)
@@ -1011,9 +1027,7 @@ final class SoftwarePlaybackHost {
 
     // MARK: - Live feeder loop (DVR sessions)
 
-    /// Ring cursor -> decoders -> renderer, paced by the renderer's
-    /// back-pressure. Parks while paused (the reader keeps filling the
-    /// ring, so pause IS timeshift); a DVR seek just moves the cursor.
+    /// Ring cursor -> decoders -> renderer with back-pressure. Pause = timeshift (reader keeps filling); DVR seek = cursor move.
     nonisolated private static func runLiveFeederLoop(
         videoDecoder: any VideoDecodingPipeline,
         audioDecoder: AudioDecoder?,
@@ -1023,18 +1037,125 @@ final class SoftwarePlaybackHost {
         renderer: SampleBufferRenderer,
         condition: NSCondition,
         ring: PacketRingBuffer,
+        audioLookahead: AudioLookaheadState,
         videoTimeBaseSeconds: Double,
         audioTimeBaseSeconds: Double,
         readCursor: @Sendable () -> Int,
         advanceCursor: @Sendable (Int) -> Void,
         clampCursor: @Sendable (Int, Int) -> Void,
+        currentRate: @Sendable () -> Float,
         isPlaying: @Sendable () -> Bool,
         stopRequested: @Sendable () -> Bool,
         sourceEnded: @Sendable () -> Bool,
         clockArmed: @Sendable () -> Bool,
         markClockArmed: @Sendable () -> Void,
-        onEnd: @Sendable () -> Void
+        onEnd: @Sendable () -> Void,
+        audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?)
     ) {
+        // Audio look-ahead pump (#107 audio chopping): feed audio packets ahead of the
+        // combined cursor so the audio renderer holds AudioLookaheadPolicy.targetLeadSeconds
+        // of decoded audio regardless of video decode pace. Without it audio lead is capped
+        // by the video renderer queue (<1 s) and any feeder stall is an audible dropout.
+        var preArmPacketsFed = 0
+        var hadLead = false
+        var rebuffering = false
+        var lastLowLeadLog = DispatchTime(uptimeNanoseconds: 0)
+        func pumpAudio() {
+            guard let aDec = audioDecoder, let aOut = audioOutput, audioStreamIndex >= 0 else { return }
+            var seq = audioLookahead.align(to: readCursor())
+            while !stopRequested() && isPlaying() {
+                let armed = clockArmed()
+                guard AudioLookaheadPolicy.decide(
+                    clockArmed: armed,
+                    preArmPacketsFed: preArmPacketsFed,
+                    lastFedAudioPTS: audioLookahead.lastFedAudioPTS,
+                    clockSeconds: aOut.currentTimeSeconds
+                ) == .feed else { break }
+                guard seq < ring.seqBounds.end else { break }  // live edge: nothing to pump yet
+                guard let pkt = ring.packet(atSeq: seq) else {
+                    // Evicted/unreadable under the pump: skip, same as the combined loop.
+                    guard audioLookahead.advance(from: seq, fedPTS: nil) else { break }
+                    seq += 1
+                    continue
+                }
+                if pkt.isVideo {
+                    guard audioLookahead.advance(from: seq, fedPTS: nil) else { break }
+                    seq += 1
+                    continue
+                }
+                let producedAudio = feedRingPacket(
+                    pkt,
+                    videoDecoder: videoDecoder,
+                    audioDecoder: aDec,
+                    audioOutput: aOut,
+                    videoStreamIndex: videoStreamIndex,
+                    audioStreamIndex: audioStreamIndex,
+                    videoTimeBaseSeconds: videoTimeBaseSeconds,
+                    audioTimeBaseSeconds: audioTimeBaseSeconds,
+                    audioTapSink: audioTapSink()
+                )
+                if !armed {
+                    preArmPacketsFed += 1
+                    if producedAudio {
+                        // First decoded buffers arm the clock at their packet PTS, exactly as
+                        // the combined loop did before the pump took over audio delivery.
+                        let armTime = CMTime(seconds: pkt.pts, preferredTimescale: 90000)
+                        aOut.seekClock(to: armTime, rate: currentRate())
+                        markClockArmed()
+                    }
+                }
+                guard audioLookahead.advance(from: seq, fedPTS: pkt.pts) else { break }
+                seq += 1
+            }
+            // Live-edge underrun handling (#107): a source delivering below real time would
+            // otherwise leave the free-running clock permanently ahead of the stream, and
+            // every later sample lands in the clock's past (continuous chopping that never
+            // recovers). Pause the clock, refill, resume; the native path gets the same
+            // behavior from AVPlayer's stall handling.
+            if clockArmed(), isPlaying() {
+                let lastPTS = audioLookahead.lastFedAudioPTS
+                let lead = lastPTS.isFinite ? lastPTS - aOut.currentTimeSeconds : 0
+                switch AudioLookaheadPolicy.clockAction(
+                    rebuffering: rebuffering,
+                    lastFedAudioPTS: lastPTS,
+                    clockSeconds: aOut.currentTimeSeconds,
+                    atRingEnd: audioLookahead.current >= ring.seqBounds.end,
+                    sourceEnded: sourceEnded()
+                ) {
+                case .pauseForRebuffer:
+                    rebuffering = true
+                    EngineLog.emit(
+                        "[SWHost] live source underrun: pausing clock to rebuffer "
+                        + "(lead=\(String(format: "%.2f", lead))s)",
+                        category: .swPlayback
+                    )
+                    aOut.pause()
+                case .resume:
+                    rebuffering = false
+                    EngineLog.emit(
+                        "[SWHost] rebuffered: resuming clock (lead=\(String(format: "%.2f", lead))s)",
+                        category: .swPlayback
+                    )
+                    aOut.setRate(currentRate())
+                case .none:
+                    // Decode-lag visibility for device logs: only after lead was once
+                    // healthy (startup fill must not trip it), rate-limited to one per 5 s.
+                    if lead >= 0.5 { hadLead = true }
+                    if hadLead, lead < 0.1, !rebuffering {
+                        let now = DispatchTime.now()
+                        if now.uptimeNanoseconds &- lastLowLeadLog.uptimeNanoseconds > 5_000_000_000 {
+                            lastLowLeadLog = now
+                            EngineLog.emit(
+                                "[SWHost] audio lead low: \(String(format: "%.2f", lead))s "
+                                + "(ring end=\(ring.seqBounds.end) audioSeq=\(audioLookahead.current))",
+                                category: .swPlayback
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         while !stopRequested() {
             if !isPlaying() {
                 condition.lock()
@@ -1044,6 +1165,9 @@ final class SoftwarePlaybackHost {
                 condition.unlock()
                 continue
             }
+
+            // Keep the audio renderer topped up before (possibly expensive) video work.
+            pumpAudio()
 
             let cursor = readCursor()
             let bounds = ring.seqBounds
@@ -1059,6 +1183,17 @@ final class SoftwarePlaybackHost {
                 continue
             }
             guard let pkt = ring.packet(atSeq: cursor) else {
+                // Resident entry whose file read failed (disk hiccup,
+                // pruned mid-read): skip it, or the feeder would spin on
+                // the same sequence number forever in a silent freeze.
+                if cursor < bounds.end {
+                    EngineLog.emit(
+                        "[SWHost] feeder: packet seq=\(cursor) unreadable; skipping",
+                        category: .swPlayback
+                    )
+                    advanceCursor(cursor)
+                    continue
+                }
                 // At the live edge (cursor == end): wait for the reader's
                 // next append, or finish when the source is gone and the
                 // ring is fully drained.
@@ -1076,14 +1211,20 @@ final class SoftwarePlaybackHost {
             }
 
             if pkt.isVideo {
-                // Back-pressure against the renderer's actual queue, same
-                // as the combined loop. Also bail to the pause-park when
-                // pause() lands mid-wait, WITHOUT consuming the packet.
+                // Back-pressure against renderer queue; also bail on pause without consuming.
+                // The wait can outlast the audio lead, so keep pumping audio while parked.
+                var waitTicks = 0
                 while !renderer.isReadyForMoreMediaData && !stopRequested() && isPlaying() {
                     Thread.sleep(forTimeInterval: 0.005)
+                    waitTicks += 1
+                    if waitTicks % 20 == 0 { pumpAudio() }
                 }
                 if stopRequested() { break }
                 if !isPlaying() { continue }
+            } else if cursor < audioLookahead.current {
+                // Audio the pump already delivered: consume the slot without re-decoding.
+                advanceCursor(cursor)
+                continue
             }
 
             let producedAudio = feedRingPacket(
@@ -1094,21 +1235,17 @@ final class SoftwarePlaybackHost {
                 videoStreamIndex: videoStreamIndex,
                 audioStreamIndex: audioStreamIndex,
                 videoTimeBaseSeconds: videoTimeBaseSeconds,
-                audioTimeBaseSeconds: audioTimeBaseSeconds
+                audioTimeBaseSeconds: audioTimeBaseSeconds,
+                audioTapSink: audioTapSink()
             )
 
-            // Arm the master clock once, at the first fed packet's PTS
-            // (samples carry source PTS; anchoring at the actual first
-            // PTS renders immediately instead of waiting out the gap
-            // from .zero). Audio sessions arm on the first decoded audio
-            // buffers; video-only sessions arm on the first video packet
-            // (previously NO clock was armed without audio: one frozen
-            // frame, currentTime stuck at 0).
+            // Arm clock once on first packet PTS (anchoring at .zero caused delay). Audio: first decoded buffers; video-only: first video packet (no clock without audio = frozen frame).
             if !clockArmed(), let aOut = audioOutput {
                 let shouldArm = (audioDecoder == nil) ? pkt.isVideo : producedAudio
                 if shouldArm {
                     let armTime = CMTime(seconds: pkt.pts, preferredTimescale: 90000)
-                    aOut.seekClock(to: armTime, rate: 1.0)
+                    // Latest host rate, read at arm time (a setRate before arming is deferred here, #107).
+                    aOut.seekClock(to: armTime, rate: currentRate())
                     markClockArmed()
                 }
             }
@@ -1117,13 +1254,32 @@ final class SoftwarePlaybackHost {
         }
     }
 
-    /// Hot-path demux loop modeled on the pre-collapse pattern. Reads
-    /// packets from the demuxer, dispatches by stream index, applies
-    /// inline back-pressure on the video display layer's
-    /// `isReadyForMoreMediaData` so the decoder doesn't outpace the
-    /// renderer. EOF flushes both decoders and the renderer's reorder
-    /// buffer, then flips the engine state via the published
-    /// `didReachEnd` mirror.
+    /// Apply a resolved clock anchor: seek the synchronizer, report a non-zero session
+    /// zero to the host, and log a re-anchor (release-visible; a mid-stream join is
+    /// otherwise indistinguishable from a frozen-frame wedge, #107).
+    nonisolated private static func armClock(
+        _ aOut: AudioOutput,
+        resolution: SWClockAnchorPolicy.Resolution,
+        initialClockTime: CMTime,
+        rate: Float,
+        onClockAnchored: @Sendable (Double) -> Void
+    ) {
+        let anchorTime = resolution.anchorSeconds == initialClockTime.seconds
+            ? initialClockTime
+            : CMTime(seconds: resolution.anchorSeconds, preferredTimescale: 90000)
+        aOut.seekClock(to: anchorTime, rate: rate)
+        if resolution.anchorSeconds != initialClockTime.seconds {
+            EngineLog.emit(
+                "[SWHost] clock re-anchored to first sample: anchor=\(String(format: "%.3f", resolution.anchorSeconds))s "
+                + "(load anchor \(String(format: "%.3f", initialClockTime.seconds))s, "
+                + "sessionZero=\(String(format: "%.3f", resolution.sessionZeroSeconds))s)",
+                category: .swPlayback
+            )
+            onClockAnchored(resolution.sessionZeroSeconds)
+        }
+    }
+
+    /// Demux loop: reads packets, dispatches by stream index, back-pressures against renderer's isReadyForMoreMediaData, flushes decoders at EOF.
     nonisolated private static func runDemuxLoop(
         demuxer: Demuxer,
         videoDecoder: any VideoDecodingPipeline,
@@ -1132,10 +1288,9 @@ final class SoftwarePlaybackHost {
         audioOutput: AudioOutput?,
         audioStreamIndex: Int32,
         renderer: SampleBufferRenderer,
-        displayLayer: AVSampleBufferDisplayLayer,
         condition: NSCondition,
         initialClockTime: CMTime,
-        initialRate: Float,
+        currentRate: @Sendable () -> Float,
         ring: PacketRingBuffer?,
         videoTimeBaseSeconds: Double,
         audioTimeBaseSeconds: Double,
@@ -1143,36 +1298,33 @@ final class SoftwarePlaybackHost {
         noteEdge: @Sendable (Double) -> Void,
         isPlaying: @Sendable () -> Bool,
         stopRequested: @Sendable () -> Bool,
+        clockArmed: @Sendable () -> Bool,
+        markClockArmed: @Sendable () -> Void,
+        onClockAnchored: @Sendable (Double) -> Void,
+        seekGeneration: @Sendable () -> UInt64,
+        backgroundAudioOnly: @Sendable () -> Bool,
         onError: @Sendable (String) -> Void,
-        onEnd: @Sendable () -> Void
+        onEnd: @Sendable () -> Void,
+        audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
+        subtitleStreamIndices: Set<Int32> = [],
+        subtitleTimeBases: [Int32: AVRational] = [:],
+        splitDisplaySetSubtitleStreamIndices: Set<Int32> = [],
+        subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil }
     ) {
-        // One-shot latch so the synchronizer clock is anchored exactly
-        // once per session, on the first decoded audio packet. seekClock
-        // is NOT idempotent (it always re-sets the synchronizer rate
-        // and time), so calling it on every packet would snap the clock
-        // back to `initialClockTime` 50× per second and freeze playback.
-        var clockArmed = false
+        // Clock arming: one-shot latch (seekClock is not idempotent -- re-calling snaps clock back to initialClockTime). Shared with host so a seek before first audio isn't overridden by a late re-arm.
 
-        // Live PTS-discontinuity reconciliation (SW path). A program
-        // boundary leaps the source PTS (forward or backward) far beyond
-        // normal frame spacing. Without compensation, the session edge
-        // (`newestPts - sessionStartPts`) would jump by the raw delta and the
-        // decoder clock would choke. We keep a running `discontinuityOffset`
-        // (in source-PTS seconds): on a detected jump we add
-        // `(jumpedPts - expectedContinuationPts)` to it, then subtract the
-        // offset from every subsequent packet's PTS BEFORE the live-edge note,
-        // the ring append, and the decoder stamping, so the whole pipeline
-        // sees one continuous timeline. The decoders are also flushed so they
-        // do not stall on the seam (same flush pattern the SW seek path uses).
-        //
-        // Threshold mirrors the native producer: 10 s, far above any frame
-        // interval or the look-behind inference, well below the synthetic
-        // +1000 s test jump. Live-only; non-live SW never enters this branch.
+        // Live PTS-discontinuity (SW): accrue (jumpedPts - expectedContinuation) into discontinuityOffset; subtract from all subsequent PTS so the whole pipeline sees one continuous timeline. Threshold 10s (mirrors native producer); flush decoders at the seam.
         let discontinuityThresholdSeconds = 10.0
         var prevRawVideoPtsSec = Double.nan
         var frameIntervalSec = 0.0
         var discontinuityOffsetSec = 0.0
         var loggedSWDiscontinuity = false
+
+        // Clock-arming fallback bookkeeping: a declared audio track whose
+        // decoder never produces buffers (corrupt stream) must not leave
+        // the session unarmed forever. See the video-branch arming below.
+        var audioPacketsSeen = 0
+        var audioBuffersProduced = false
 
         while !stopRequested() {
             if !isPlaying() {
@@ -1184,6 +1336,7 @@ final class SoftwarePlaybackHost {
                 continue
             }
 
+            let genBeforeRead = seekGeneration()
             let packet: UnsafeMutablePointer<AVPacket>?
             do {
                 packet = try demuxer.readPacket()
@@ -1201,32 +1354,26 @@ final class SoftwarePlaybackHost {
                 break
             }
 
+            // Stale packet from before seek flush: decoding would clear the skip threshold (visible fast-forward burst). Discard.
+            if seekGeneration() != genBeforeRead {
+                av_packet_unref(packet)
+                av_packet_free_safe(packet)
+                continue
+            }
+
             let streamIdx = packet.pointee.stream_index
 
-            // Live PTS-discontinuity detection + reconciliation. Runs before
-            // anything reads the packet's timestamps so the live-edge note,
-            // the ring append, and the decoder all see the reconciled
-            // (continuous) PTS. Detection keys on the VIDEO stream's raw pts;
-            // the resulting offset is applied to BOTH streams so audio stays
-            // aligned. Non-live SW skips this entirely.
+            // Discontinuity runs before any timestamp read; offset applied to both streams. Non-live SW skips.
             if isLive, streamIdx == videoStreamIndex, videoTimeBaseSeconds > 0,
                packet.pointee.pts != Int64.min {
                 let rawPtsSec = Double(packet.pointee.pts) * videoTimeBaseSeconds
                 if !prevRawVideoPtsSec.isNaN {
                     let deltaSec = rawPtsSec - prevRawVideoPtsSec
                     if abs(deltaSec) >= discontinuityThresholdSeconds {
-                        // Program boundary. The timeline should continue from
-                        // where it was: one frame past the previous packet.
-                        // Accrue (jumpedPts - expectedContinuationPts) into the
-                        // offset so post-jump PTS map back onto the prior
-                        // trajectory.
+                        // Accrue (jumpedPts - expectedContinuation) into offset; flush decoders at the seam.
                         let expectedContinuation = prevRawVideoPtsSec
                             + (frameIntervalSec > 0 ? frameIntervalSec : 0)
                         discontinuityOffsetSec += (rawPtsSec - expectedContinuation)
-                        // Flush the decoders / renderer so they do not choke
-                        // on the seam (codec params may also have changed; a
-                        // flush is sufficient for the synthetic test, a fuller
-                        // reinit is the device-verify follow-up).
                         videoDecoder.flush()
                         audioDecoder?.flush()
                         renderer.drainReorderBuffer()
@@ -1243,19 +1390,13 @@ final class SoftwarePlaybackHost {
                             )
                         }
                     } else if deltaSec > 0 {
-                        // Track the running frame interval from normal advance
-                        // so the expected-continuation estimate is accurate.
                         frameIntervalSec = deltaSec
                     }
                 }
                 prevRawVideoPtsSec = rawPtsSec
             }
 
-            // Apply the accrued discontinuity offset to the packet's
-            // timestamps in-place (live only, once a jump has been seen). The
-            // offset is in source-PTS seconds; convert to this stream's TB
-            // ticks. After this, every downstream consumer (edge note, ring,
-            // decoder) operates on the continuous timeline.
+            // Apply discontinuity offset to timestamps in-place (live only); converts seconds to stream TB ticks.
             if isLive, discontinuityOffsetSec != 0 {
                 let tbSec = (streamIdx == videoStreamIndex)
                     ? videoTimeBaseSeconds : audioTimeBaseSeconds
@@ -1266,12 +1407,7 @@ final class SoftwarePlaybackHost {
                 }
             }
 
-            // Live edge + DVR ring fill. Done BEFORE decode so the ring
-            // holds every packet handed to the pipeline. Both video and
-            // audio are appended (the reseed replays both so audio stays
-            // in sync); only video keyframes are tagged as keyframes so
-            // the ring's keyframe-aligned eviction + reseed anchor on a
-            // decodable access point.
+            // Fill ring before decode so the ring holds every packet. Audio appended for sync; only video keyframes tagged for eviction alignment.
             if isLive {
                 let isVideo = streamIdx == videoStreamIndex
                 let isAudio = streamIdx == audioStreamIndex
@@ -1298,41 +1434,103 @@ final class SoftwarePlaybackHost {
             }
 
             if streamIdx == videoStreamIndex {
-                // Back-pressure against the renderer's actual queue, not
-                // the display layer's deprecated property — see
-                // `SampleBufferRenderer.isReadyForMoreMediaData` doc.
-                while !renderer.isReadyForMoreMediaData && !stopRequested() {
-                    Thread.sleep(forTimeInterval: 0.005)
+                // Background audio-only: drop video, don't gate on the non-draining display layer.
+                if backgroundAudioOnly() {
+                    av_packet_unref(packet)
+                    av_packet_free_safe(packet)
+                    continue
+                }
+                // Back-pressure via SampleBufferRenderer.isReadyForMoreMediaData (not the deprecated layer property). Park on condition while paused to avoid 200 Hz CPU spin.
+                while !renderer.isReadyForMoreMediaData && !stopRequested() && !backgroundAudioOnly() {
+                    if !isPlaying() {
+                        condition.lock()
+                        while !isPlaying() && !stopRequested() {
+                            _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
+                        }
+                        condition.unlock()
+                    } else {
+                        Thread.sleep(forTimeInterval: 0.005)
+                    }
+                }
+                // Entered background while parked on back-pressure: drop this frame.
+                if backgroundAudioOnly() {
+                    av_packet_unref(packet)
+                    av_packet_free_safe(packet)
+                    continue
                 }
                 if stopRequested() {
                     av_packet_unref(packet)
                     av_packet_free_safe(packet)
                     break
                 }
+                // Re-check generation after the back-pressure wait (seek can land there; pre-seek packet would clear skip thresholds).
+                if seekGeneration() != genBeforeRead {
+                    av_packet_unref(packet)
+                    av_packet_free_safe(packet)
+                    continue
+                }
                 videoDecoder.decode(packet: packet)
-                // Video-only source (no audio stream, or the audio
-                // decoder failed open and load() continued video-only):
-                // nothing below would ever arm the master clock, so the
-                // session rendered one frozen frame with currentTime
-                // stuck at 0. Arm off the first video packet instead.
-                if !clockArmed, audioDecoder == nil, let aOut = audioOutput {
-                    aOut.seekClock(to: initialClockTime, rate: initialRate)
-                    clockArmed = true
+                // Video-only / undecodable audio fallback: arm clock off first video packet (50+ audio packets with zero buffers = decoder not recovering).
+                if !clockArmed(), let aOut = audioOutput,
+                   audioDecoder == nil || (audioPacketsSeen >= 50 && !audioBuffersProduced) {
+                    // #107: a mid-stream-joined source delivers first samples far past the load
+                    // anchor; anchor at the packet PTS so they ever present (see SWClockAnchorPolicy).
+                    let pktPtsSec = (packet.pointee.pts != Int64.min && videoTimeBaseSeconds > 0)
+                        ? Double(packet.pointee.pts) * videoTimeBaseSeconds : Double.nan
+                    let resolution = SWClockAnchorPolicy.resolve(
+                        initialSeconds: initialClockTime.seconds, firstSampleSeconds: pktPtsSec)
+                    armClock(aOut, resolution: resolution, initialClockTime: initialClockTime,
+                             rate: currentRate(), onClockAnchored: onClockAnchored)
+                    markClockArmed()
                 }
             } else if streamIdx == audioStreamIndex, let aDec = audioDecoder, let aOut = audioOutput {
+                // Background audio-only: the video gate is bypassed, so pace on the audio renderer to avoid
+                // buffering the rest of the file. Park on condition while paused (same shape as the video gate).
+                if backgroundAudioOnly() {
+                    while !aOut.isReadyForMoreMediaData && !stopRequested() && backgroundAudioOnly() {
+                        if !isPlaying() {
+                            condition.lock()
+                            while !isPlaying() && !stopRequested() {
+                                _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
+                            }
+                            condition.unlock()
+                        } else {
+                            Thread.sleep(forTimeInterval: 0.005)
+                        }
+                    }
+                    if stopRequested() {
+                        av_packet_unref(packet)
+                        av_packet_free_safe(packet)
+                        break
+                    }
+                }
+                audioPacketsSeen += 1
                 let buffers = aDec.decode(packet: packet)
+                if !buffers.isEmpty { audioBuffersProduced = true }
+                let tapSink = audioTapSink()
                 for buf in buffers {
+                    tapSink?(buf)   // #95: mirror before enqueue
                     aOut.enqueue(sampleBuffer: buf)
                 }
-                // Anchor the synchronizer clock to `initialClockTime`
-                // (.zero on cold-start, the resume offset on
-                // resume / audio-switch reload) the first time we've
-                // got real audio in the renderer. Latched so subsequent
-                // packets don't keep snapping the clock back.
-                if !clockArmed, !buffers.isEmpty {
-                    aOut.seekClock(to: initialClockTime, rate: initialRate)
-                    clockArmed = true
+                // Arm clock on first decoded audio buffer; latch so subsequent packets don't snap clock back.
+                if !clockArmed(), !buffers.isEmpty {
+                    // #107: anchor at the buffer PTS when it deviates from the load anchor
+                    // (mid-stream-joined source); aligned sources keep the anchor verbatim.
+                    let firstPts = CMSampleBufferGetPresentationTimeStamp(buffers[0])
+                    let resolution = SWClockAnchorPolicy.resolve(
+                        initialSeconds: initialClockTime.seconds,
+                        firstSampleSeconds: firstPts.isValid ? firstPts.seconds : Double.nan)
+                    armClock(aOut, resolution: resolution, initialClockTime: initialClockTime,
+                             rate: currentRate(), onClockAnchored: onClockAnchored)
+                    markClockArmed()
                 }
+            } else if subtitleStreamIndices.contains(streamIdx), let sink = subtitleTapSink() {
+                // #112 rework: hand embedded subtitle packets to the tap sink (copies the payload
+                // into the session's SubtitlePacketStore). The SW host applies no stream discard,
+                // so these packets were already being read and dropped here.
+                sink(streamIdx, packet,
+                     subtitleTimeBases[streamIdx] ?? AVRational(num: 1, den: 1000),
+                     splitDisplaySetSubtitleStreamIndices.contains(streamIdx))
             }
 
             av_packet_unref(packet)
@@ -1349,11 +1547,10 @@ final class SoftwarePlaybackHost {
                 guard let self, let aOut = self.audioOutput else { return }
                 let raw = aOut.currentTimeSeconds
                 if raw.isFinite, raw >= 0 {
-                    // The synchronizer clock runs on the source PTS axis
-                    // (samples carry source PTS). For a live session the
-                    // engine timeline is "seconds since first frame", so
-                    // subtract the session-start PTS. VOD / cold-start
-                    // (sessionStartPts unset) keeps the raw clock.
+                    // Raw clock = source/subtitle axis; published alongside the mapped position (#107).
+                    self.sourceClockSeconds = raw
+                    // Live: subtract sessionStartPts to convert to "seconds since first frame"; VOD
+                    // subtracts the anchor's session zero (0 for zero-based sources, #107).
                     if self.isLive {
                         let start: Double = {
                             self.liveEdgeLock.lock(); defer { self.liveEdgeLock.unlock() }
@@ -1361,13 +1558,11 @@ final class SoftwarePlaybackHost {
                         }()
                         self.currentTime = max(0, raw - start)
                     } else {
-                        self.currentTime = raw
+                        let zero = self.clockSessionZero
+                        self.currentTime = zero > 0 ? max(0, raw - zero) : raw
                     }
                 }
-                // Publish the live edge for DVR surfaces. currentTime (just
-                // set) is the playhead; the edge is the newest demuxed PTS
-                // in session time. publishLiveWindow (in the engine) reads
-                // currentTime for the playhead, so we only feed the edge.
+                // Feed the live edge; publishLiveWindow in the engine reads currentTime for the playhead.
                 if self.isLive, let edge = self.liveEdgeSessionTime {
                     self.onLiveEdge?(edge)
                 }
@@ -1389,23 +1584,8 @@ final class SoftwarePlaybackHost {
 
 // MARK: - AVPacket free helper
 
-/// Symmetric `av_packet_free` that handles the in/out double-pointer
-/// dance FFmpeg expects. Pre-collapse code had this as a top-level
-/// helper; restored here so the SW demux loop can call it cleanly.
+/// av_packet_free wrapper for the double-pointer FFmpeg API.
 func av_packet_free_safe(_ packet: UnsafeMutablePointer<AVPacket>) {
     var p: UnsafeMutablePointer<AVPacket>? = packet
     trackedPacketFree(&p)
-}
-
-// MARK: - Sendable wrapper
-
-/// Box for non-Sendable reference types that we only touch on a single
-/// background queue. Captures the value once at construction so the
-/// closure that owns it can be marked `@Sendable` without Swift 6
-/// strict concurrency rejecting the capture. Used for
-/// `AVSampleBufferDisplayLayer`, whose `isReadyForMoreMediaData`
-/// reads are documented as thread-safe.
-private struct UncheckedSendable<T>: @unchecked Sendable {
-    let value: T
-    init(_ value: T) { self.value = value }
 }

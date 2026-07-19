@@ -1,30 +1,21 @@
 import Foundation
 import CoreGraphics
 
-/// Size-bounded LRU cache of rendered frames, keyed by
-/// `(mode, position bucket)`. The hard per-mode count limit is the
-/// leak guard: the cache can never hold more than
-/// `thumbnailLimit + snapshotLimit` CGImages.
-///
-/// Bucketing rounds the requested position down to a grid so that
-/// neighbouring scrub requests resolve to the same entry. Thumbnails
-/// bucket coarsely (default 1 s); snapshots bucket finely (0.1 s) since
-/// they are frame-accurate.
-///
-/// Not thread-safe on its own. `FrameExtractor` owns the only instance
-/// and touches it solely from its actor-isolated context.
+/// Size-bounded LRU cache of rendered frames keyed by `(mode, position bucket)`.
+/// Per-mode count limit caps the cache at `thumbnailLimit + snapshotLimit` CGImages.
+/// Key omits target size: one extractor serves one fixed-size surface, so a repeat
+/// position at a different maxWidth/maxSize returns the first-rendered image.
+/// Not thread-safe; FrameExtractor owns the only instance and touches it actor-isolated.
 final class FrameCache {
     private let thumbnailLimit: Int
     private let snapshotLimit: Int
     private let thumbnailBucketSeconds: Double
-    // Fixed: snapshots are always frame-accurate, so a 0.1 s grid (~3
-    // frames at 30 fps) is fine-grained enough for any source.
+    // Snapshots are frame-accurate, so a 0.1 s grid (~3 frames at 30 fps) suffices.
     private static let snapshotBucketSeconds: Double = 0.1
 
     // Each FrameMode case needs a matching store + order pair below, plus
     // mirroring in get/set/clear. Add both when introducing a new case.
-    /// Insertion/use order per mode, front = most recently used. Holds
-    /// the bucket keys; `store` holds the payloads.
+    /// Use order per mode, front = MRU; holds bucket keys, `store` holds payloads.
     private var thumbnailOrder: [Int] = []
     private var snapshotOrder: [Int] = []
     private var thumbnailStore: [Int: CGImage] = [:]
@@ -40,9 +31,8 @@ final class FrameCache {
     private func bucket(_ seconds: Double, mode: FrameMode) -> Int {
         let grid = mode == .thumbnail ? thumbnailBucketSeconds : Self.snapshotBucketSeconds
         let scaled = max(0, seconds) / grid
-        // Thumbnails floor to the coarse grid boundary.
-        // Snapshots round to nearest so that values within half a bucket
-        // of a stored position still resolve to the same entry.
+        // Thumbnails floor to grid; snapshots round to nearest so a value within
+        // half a bucket of a stored position resolves to the same entry.
         let rounded = mode == .thumbnail ? scaled.rounded(.down) : scaled.rounded()
         return Int(rounded)
     }
@@ -82,7 +72,6 @@ final class FrameCache {
         snapshotStore.removeAll()
     }
 
-    /// Move `key` to the front of the recency list.
     private func touch(_ order: inout [Int], _ key: Int) {
         if let idx = order.firstIndex(of: key) {
             order.remove(at: idx)
@@ -90,7 +79,6 @@ final class FrameCache {
         order.insert(key, at: 0)
     }
 
-    /// Drop least-recently-used entries until `store.count <= limit`.
     private func evict(_ order: inout [Int], _ store: inout [Int: CGImage], limit: Int) {
         while store.count > limit, let lru = order.popLast() {
             store[lru] = nil

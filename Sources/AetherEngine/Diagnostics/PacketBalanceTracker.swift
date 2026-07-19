@@ -1,29 +1,10 @@
 import Foundation
 import Libavcodec
 
-/// Process-wide counters for `av_packet_alloc` / `av_packet_free` calls
-/// we initiate from Swift. Reads as `pktAlive = allocs - frees` in the
-/// engine memory probe.
-///
-/// Steady-state for a healthy pump is a low single digit:
-///   - 1 for the source packet currently inside the pump's defer block
-///   - 1 each for `pendingVideoPkt` / `pendingAudioPkt` look-behind
-///   - 0..N for FLAC packets the bridge has emitted but the pump hasn't
-///     yet handed to the muxer + freed
-///
-/// Linearly rising `pktAlive` across probe samples means we're leaking
-/// packets — every leaked AVPacket carries a refcounted data buffer
-/// that's typically 3-50 KB, so even a single leaked packet per video
-/// frame ≈ ~75 KB/s = 4.5 MB/min, in the right ballpark for the
-/// observed long-form memory leak.
-///
-/// All call-sites in the producer / bridge / demuxer / subtitle decoder
-/// go through `trackedPacketAlloc()` + `trackedPacketFree(_:)` wrappers
-/// so the counter is comprehensive across paths we control.
-/// Libavformat-internal allocations (mp4 muxer's interleave queue,
-/// matroska parser's side data, etc.) are not counted here — those
-/// flow through `av_packet_ref` / `av_packet_unref` against the same
-/// buffer ref, not separate `av_packet_alloc` calls.
+/// Tracks Swift-initiated av_packet_alloc/free calls; `alive = allocs - frees` in the engine memory probe.
+/// Healthy pump steady-state: low single digit (1 in-flight source packet, 1 each for pendingVideoPkt/pendingAudioPkt, 0..N FLAC bridge packets).
+/// Linearly rising alive = packet leak (~75 KB/s = 4.5 MB/min per leaked frame-rate packet).
+/// Does NOT count libavformat-internal av_packet_ref/unref (mp4 muxer interleave, matroska side data).
 enum PacketBalanceTracker {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var _allocs: Int = 0
@@ -54,10 +35,7 @@ enum PacketBalanceTracker {
     }
 }
 
-/// Wrapper around `av_packet_alloc()` that increments the
-/// PacketBalanceTracker on success. Use this in place of
-/// `av_packet_alloc()` everywhere in producer / bridge / demuxer
-/// pipelines.
+/// Drop-in for av_packet_alloc() that records the alloc in PacketBalanceTracker.
 @inline(__always)
 func trackedPacketAlloc() -> UnsafeMutablePointer<AVPacket>? {
     let p = av_packet_alloc()
@@ -67,10 +45,8 @@ func trackedPacketAlloc() -> UnsafeMutablePointer<AVPacket>? {
     return p
 }
 
-/// Wrapper around `av_packet_free(_:)` that increments the
-/// PacketBalanceTracker before delegating. A nil input still records
-/// a free for symmetry with `trackedPacketAlloc` patterns that may
-/// pass a nil pointer through the defer chain.
+/// Drop-in for av_packet_free() that records the free in PacketBalanceTracker.
+/// A nil input records nothing: defer chains pass already-nil'd pointers here; counting them would drift alive negative.
 @inline(__always)
 func trackedPacketFree(_ pkt: inout UnsafeMutablePointer<AVPacket>?) {
     if pkt != nil {

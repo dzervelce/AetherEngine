@@ -1,19 +1,10 @@
 // Tests/AetherEngineTests/LiveDiscontinuityTests.swift
-//
-// Verifies the live PTS-discontinuity plumbing on the native HLS path:
-// a segment flagged discontinuous makes `buildMediaPlaylistText` prefix
-// EXACTLY that segment's #EXTINF with #EXT-X-DISCONTINUITY, and no other
-// segment is tagged. This deterministically exercises items 1-2 of the
-// discontinuity feature (producer flag -> provider segment list ->
-// playlist builder) without depending on libavformat's mpegts streaming
-// demuxer, which normalizes a synthetic PTS jump before the producer can
-// observe it (see the feature's device-verify note).
+// Pins the producer-flag -> provider -> playlist-builder path for #EXT-X-DISCONTINUITY placement.
+// Does not use the mpegts demuxer (it normalizes PTS jumps before the producer sees them).
 import XCTest
 @testable import AetherEngine
 
-/// Minimal live provider exposing a hand-built segment list with a
-/// discontinuity at a known index. Only the members the media-playlist
-/// builder reads are meaningful; the rest take protocol defaults.
+/// Hand-built segment list with a discontinuity at a known index; only playlist-builder-relevant members are meaningful.
 private final class MockLiveProvider: HLSSegmentProvider, @unchecked Sendable {
     let count: Int
     let discontinuousIndex: Int
@@ -29,8 +20,7 @@ private final class MockLiveProvider: HLSSegmentProvider, @unchecked Sendable {
     func segmentDuration(at index: Int) -> Double { 5.0 }
     func segmentIsDiscontinuous(at index: Int) -> Bool { index == discontinuousIndex }
     var playlistType: HLSPlaylistType { .live }
-    // A live playlist with no sliding (firstVisible stays 0) so every
-    // segment is listed and the tag position is unambiguous.
+    // No window sliding (firstVisible=0): every segment listed, tag position unambiguous.
     func notePlaylistBuild() -> (visibleCount: Int, refreshCounter: Int, endlistAdded: Bool) {
         (visibleCount: count, refreshCounter: 1, endlistAdded: false)
     }
@@ -58,27 +48,22 @@ final class LiveDiscontinuityTests: XCTestCase {
         XCTAssertEqual(lines[tagIdx + 2], "seg2.mp4",
                        "the tagged segment must be seg2 (the discontinuous index)")
 
-        // No other segment carries the tag: seg0/seg1/seg3/seg4 EXTINFs are
-        // not preceded by a discontinuity line.
+        // Verify no other segment carries the tag (seg0/1/3/4).
         for i in [0, 1, 3, 4] {
             guard let uriIdx = lines.firstIndex(of: "seg\(i).mp4") else {
                 return XCTFail("seg\(i).mp4 missing from playlist")
             }
-            // uri is preceded by its EXTINF, which is preceded by either MAP
-            // (seg0) or the prior segment's URI -- never a discontinuity.
+            // URI is preceded by #EXTINF, which is preceded by MAP (seg0) or prior URI, never a discontinuity tag.
             XCTAssertNotEqual(lines[uriIdx - 2], "#EXT-X-DISCONTINUITY",
                               "seg\(i) must not be flagged discontinuous")
         }
     }
 
     func testNoTagWhenNoDiscontinuity() {
-        // discontinuousIndex out of range -> no segment is ever flagged.
+        // discontinuousIndex out of range: no segment flagged.
         let provider = MockLiveProvider(count: 4, discontinuousIndex: -1)
         let playlist = HLSLocalServer.buildMediaPlaylistText(provider: provider)
-        // Exact-line match: live playlists ALWAYS carry the
-        // #EXT-X-DISCONTINUITY-SEQUENCE header (RFC 8216 6.2.2 bookkeeping
-        // for tagged segments that slid out of the window), which a
-        // substring check would falsely match as the per-segment tag.
+        // Use exact-line match: #EXT-X-DISCONTINUITY-SEQUENCE header (RFC 8216 6.2.2) would fool a substring check.
         let lines = playlist.split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
         XCTAssertFalse(lines.contains("#EXT-X-DISCONTINUITY"),
@@ -88,8 +73,7 @@ final class LiveDiscontinuityTests: XCTestCase {
     }
 
     func testFirstSegmentDiscontinuityIsEmittedAfterMap() {
-        // A discontinuity on seg0 is legal (a boundary at the very first
-        // visible segment) and must still emit the tag, after #EXT-X-MAP.
+        // seg0 discontinuity is legal; tag must still appear after #EXT-X-MAP.
         let provider = MockLiveProvider(count: 3, discontinuousIndex: 0)
         let playlist = HLSLocalServer.buildMediaPlaylistText(provider: provider)
         let lines = playlist.split(separator: "\n", omittingEmptySubsequences: false)

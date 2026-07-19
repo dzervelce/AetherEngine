@@ -1,77 +1,72 @@
 import Foundation
 import Libavutil
 
-/// Installs a process-wide `av_log_set_callback` that funnels FFmpeg's
-/// internal diagnostic output into `EngineLog` under the `.ffmpeg`
-/// category, so muxer / demuxer / decoder warnings surface alongside
-/// the engine's own log lines in Console.app and in any host-supplied
-/// `EngineLog.handler` (in-app overlay, `aetherctl` stdout).
-///
-/// Without this bridge, FFmpeg writes to stderr via its default
-/// callback, which is invisible to App Store builds, in-app overlays,
-/// and `aetherctl`'s timestamped stdout. After install, every
-/// `av_log(...)` call at or above the configured level is formatted
-/// with `av_log_format_line2` (same prefix/format as ffmpeg's default
-/// stderr output) and emitted under `.ffmpeg`.
-///
-/// The callback fires from whichever thread inside libav* did the
-/// logging — demuxer workers, decoder threads, the muxer's interleave
-/// queue. Safe because `EngineLog.emit` is itself thread-safe (OSLog
-/// is, and any host handler is required to be by `EngineLog`'s
-/// contract).
+/// Funnels FFmpeg's av_log output into EngineLog under .ffmpeg via av_log_set_callback.
+/// Without this bridge FFmpeg writes to stderr (invisible in App Store builds and in-app overlays).
+/// av_log_format_line2 preserves FFmpeg's own [mp4@...]/[h264@...] prefixes.
+/// Callback fires from arbitrary libav* threads; safe because EngineLog.emit is thread-safe.
 enum FFmpegLogBridge {
 
-    /// Installs the callback and sets the global FFmpeg log level +
-    /// flags. Idempotent: re-calling overwrites the callback with
-    /// the same function pointer, so `AetherEngine.init` can invoke
-    /// it unconditionally without a once-guard.
-    ///
-    /// `level` defaults to `AV_LOG_WARNING` — surfaces real problems
-    /// (corrupt headers, missing PTS, decoder errors) without the
-    /// per-segment `[mp4 @ ...] track ...` chatter that `AV_LOG_INFO`
-    /// emits during normal fMP4 muxing. Hosts that want verbose
-    /// diagnostics can re-call `install(level: AV_LOG_VERBOSE)` (or
-    /// `AV_LOG_DEBUG`) after engine init.
-    ///
-    /// Flags set:
-    ///   - `AV_LOG_PRINT_LEVEL` so each forwarded line carries its
-    ///     severity (`[warning]`, `[error]`); `EngineLog` itself has
-    ///     no per-line severity channel, so this is how the level
-    ///     survives into Console.app.
-    ///   - `AV_LOG_SKIP_REPEATED` so a decoder spamming the same
-    ///     warning collapses into a single line plus a
-    ///     `Last message repeated N times` follow-up, instead of
-    ///     swamping the log ring.
+    /// Install the callback and set the global FFmpeg log level + flags. Idempotent; call unconditionally from AetherEngine.init.
+    /// Defaults to AV_LOG_WARNING (skips per-segment fMP4 muxing chatter from AV_LOG_INFO).
+    /// AV_LOG_PRINT_LEVEL prepends severity to each line (EngineLog has no per-line severity channel).
+    /// AV_LOG_SKIP_REPEATED is a no-op with a custom callback; collapse is implemented here via lastLine+counter.
     static func install(level: Int32 = AV_LOG_WARNING) {
         av_log_set_level(level)
         av_log_set_flags(AV_LOG_PRINT_LEVEL | AV_LOG_SKIP_REPEATED)
         av_log_set_callback { avcl, level, fmt, vl in
-            // `av_log_set_callback` bypasses the level check the
-            // default callback applies, so re-gate here. Cheap, and
-            // means a host bumping the level after install still
-            // sees the filter take effect.
-            guard level <= av_log_get_level() else { return }
-            guard let fmt = fmt, let vl = vl else { return }
-
-            // 1024 matches ffmpeg's own default callback buffer.
-            // Truncation is acceptable for diagnostic lines; no
-            // re-alloc loop on overflow.
-            let bufSize: Int32 = 1024
-            var buf = [CChar](repeating: 0, count: Int(bufSize))
-            var printPrefix: Int32 = 1
-            _ = buf.withUnsafeMutableBufferPointer { bp in
-                av_log_format_line2(avcl, level, fmt, vl,
-                                    bp.baseAddress, bufSize,
-                                    &printPrefix)
-            }
-
-            var line = String(cString: buf)
-            // av_log_format_line2 always terminates with `\n`; strip
-            // it so OSLog doesn't render a trailing blank line.
-            if line.hasSuffix("\n") { line.removeLast() }
-            if line.isEmpty { return }
-
-            EngineLog.emit(line, category: .ffmpeg)
+            FFmpegLogBridge.handleLogLine(avcl: avcl, level: level, fmt: fmt, vl: vl)
         }
     }
+
+    private static func handleLogLine(
+        avcl: UnsafeMutableRawPointer?, level: Int32,
+        fmt: UnsafePointer<CChar>?, vl: CVaListPointer?
+    ) {
+        // av_log_set_callback bypasses the level check; re-gate so host bumps to the level still filter correctly.
+        guard level <= av_log_get_level() else { return }
+        guard let fmt = fmt, let vl = vl else { return }
+
+        // 1024 matches ffmpeg's own default callback buffer; truncation is acceptable for diagnostic lines.
+        let bufSize: Int32 = 1024
+        var buf = [CChar](repeating: 0, count: Int(bufSize))
+        _ = buf.withUnsafeMutableBufferPointer { bp -> Int32 in
+            // printPrefixState must persist across calls: libav* emits multi-part lines without trailing \n.
+            repeatLock.lock()
+            defer { repeatLock.unlock() }
+            return av_log_format_line2(avcl, level, fmt, vl,
+                                       bp.baseAddress, bufSize,
+                                       &printPrefixState)
+        }
+
+        // buf is a NUL-terminated CChar buffer from av_log_format_line2; decode up to the NUL as
+        // UTF-8 (String(cString:) is deprecated).
+        var line = String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        if line.hasSuffix("\n") { line.removeLast() }  // av_log_format_line2 always appends \n
+        if line.isEmpty { return }
+
+        // Collapse repeated lines (AV_LOG_SKIP_REPEATED no-op with custom callback; implemented here).
+        repeatLock.lock()
+        if line == lastLine {
+            repeatCount &+= 1
+            repeatLock.unlock()
+            return
+        }
+        let suppressed = repeatCount
+        let previous = lastLine
+        lastLine = line
+        repeatCount = 0
+        repeatLock.unlock()
+        if suppressed > 0, let previous {
+            EngineLog.emit("Last message repeated \(suppressed) times: \(previous)", category: .ffmpeg)
+        }
+
+        EngineLog.emit(line, category: .ffmpeg)
+    }
+
+    /// Guards repeat-suppression state and format-line prefix state (callback fires from arbitrary libav* threads).
+    private static let repeatLock = NSLock()
+    nonisolated(unsafe) private static var lastLine: String?
+    nonisolated(unsafe) private static var repeatCount: Int = 0
+    nonisolated(unsafe) private static var printPrefixState: Int32 = 1
 }

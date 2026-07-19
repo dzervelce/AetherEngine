@@ -2,8 +2,8 @@
 
 Two complementary samples covering different audiences:
 
-- **MinimalPlayer** — source-only SwiftUI drop-in for **developers** integrating AetherEngine into their own apps. Read the file, paste it into your Xcode project, change the URL.
-- **DemoPlayerMac** — standalone macOS SwiftPM app for **testers** wanting to exercise the engine against their own media without writing host code. `swift run` opens a window; drop a file on it to play.
+- **MinimalPlayer**: source-only SwiftUI drop-in for **developers** integrating AetherEngine into their own apps. Read the file, paste it into your Xcode project, change the URL.
+- **DemoPlayerMac**: standalone macOS SwiftPM app for **testers** wanting to exercise the engine against their own media without writing host code. `swift run` opens a window; drop a file on it to play.
 
 ## MinimalPlayer
 
@@ -33,7 +33,7 @@ Two complementary samples covering different audiences:
 
 To stay readable the sample omits things real apps care about:
 
-- **Subtitles.** `engine.subtitleTracks` lists them; `engine.selectSubtitleTrack(index:)` activates one. `engine.$subtitleCues` publishes the cues — text or `CGImage` — that the host paints over the surface.
+- **Subtitles.** `engine.subtitleTracks` lists them; `engine.selectSubtitleTrack(index:)` activates one. `engine.$subtitleCues` publishes the cues (text or `CGImage`) that the host paints over the surface.
 - **Audio track switching.** `engine.audioTracks` + `engine.selectAudioTrack(index:)`.
 - **Resume position.** `engine.load(url:, startPosition: 347.5)`.
 - **HTTP headers** for authenticated sources. Pass them in `LoadOptions(httpHeaders: [...])`.
@@ -53,6 +53,6 @@ swift run
 
 A *AetherEngine Demo* window opens. Drag a video file onto it; playback starts. Click or press space to toggle play / pause; escape to stop. A corner badge shows `native` or `sw` so bug reporters can attribute the source to the right backend in repro posts.
 
-No transport bar, no subtitle picker, no settings — by design. The demonstrator's job is to prove playback; anything past that belongs in a real host app like [Sodalite](https://github.com/superuser404notfound/Sodalite).
+No transport bar, no subtitle picker, no settings, by design. The demonstrator's job is to prove playback; anything past that belongs in a real host app like [Sodalite](https://github.com/superuser404notfound/Sodalite).
 
-For shipping a notarized `.dmg` end users can download (the long-form goal of [issue #18](https://github.com/superuser404notfound/AetherEngine/issues/18)), see [`DemoPlayerMac/Scripts/build-dmg.sh`](DemoPlayerMac/Scripts/build-dmg.sh) — universal binary, Hardened Runtime, Gatekeeper-accepted. Requires a Developer ID Application certificate; setup steps are in the script's docstring.
+For shipping a notarized `.dmg` end users can download (the long-form goal of [issue #18](https://github.com/superuser404notfound/AetherEngine/issues/18)), see [`DemoPlayerMac/Scripts/build-dmg.sh`](DemoPlayerMac/Scripts/build-dmg.sh): universal binary, Hardened Runtime, Gatekeeper-accepted. Requires a Developer ID Application certificate; setup steps are in the script's docstring.

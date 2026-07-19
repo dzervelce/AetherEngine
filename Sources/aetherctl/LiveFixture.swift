@@ -69,22 +69,13 @@ final class LiveFixture: @unchecked Sendable {
 
     private static let tsPacketSize = 188
     private static let syncByte: UInt8 = 0x47
-    /// 90 kHz ticks. The 33-bit PTS / DTS clock and the PCR base run on
-    /// this; the PCR extension runs at 27 MHz (base * 300 + ext).
+    /// 90 kHz tick modulus for PCR base; extension runs at 27 MHz (base * 300 + ext).
     private static let pcrExtModulus: Int64 = 300
 
     // MARK: - Seed
 
-    /// The seed TS payload, split into 188-byte packets once at init.
     private let seedPackets: [Data]
-    /// Per-loop timestamp increment in 90 kHz ticks (PTS / DTS / PCR base).
-    private let loopPeriodTicks: Int64
-    /// The lowest PTS / DTS / PCR-base value found in the seed, used so
-    /// the served stream can start near zero rather than at the seed's
-    /// intrinsic start offset (not strictly required, kept at 0 here, the
-    /// per-loop offset is what matters for monotonicity).
-    private let seedBasePTS: Int64
-
+    private let loopPeriodTicks: Int64 // per-loop PTS/DTS/PCR-base increment in 90 kHz ticks
     // MARK: - Socket state
 
     private var listenFd: Int32 = -1
@@ -93,70 +84,32 @@ final class LiveFixture: @unchecked Sendable {
     private let stateLock = NSLock()
     private(set) var port: UInt16 = 0
 
-    /// When non-nil, the fixture will close the FIRST accepted client socket
-    /// after this many seconds of serving (simulating a single recoverable
-    /// mid-stream drop). Subsequent connections (the reconnect and any later
-    /// clients) are served normally without further forced drops.
+    /// Close the first accepted connection after N seconds to simulate a recoverable mid-stream drop. Subsequent connections are served normally.
     var dropAfterSeconds: Double? = nil
-    /// Latched to true after the first drop has fired, so only one drop
-    /// is injected regardless of how many reconnects follow.
-    private var didFireDrop = false
+    private var didFireDrop = false // latched after the one-shot drop fires
 
-    /// When non-nil, after this many seconds of serving the rewritten
-    /// PTS / DTS / PCR stream jumps FORWARD by `discontinuityJumpTicks`
-    /// ONCE, then continues monotonically from the jumped value. This
-    /// simulates a real broadcast program boundary where the source clock
-    /// leaps. The engine must survive it: native via #EXT-X-DISCONTINUITY,
-    /// SW via a running PTS offset that keeps the session timeline
-    /// continuous. Per-connection wall-clock relative to that connection's
-    /// first served packet.
+    /// One-shot PTS/DTS/PCR forward jump after N seconds of serving, simulating a broadcast program boundary. Engine must survive it.
     var discontinuityAfterSeconds: Double? = nil
-    /// Size of the one-shot forward jump, in 90 kHz ticks. +1000 s default
-    /// (1000 * 90000), well beyond the discontinuity-detection threshold.
-    var discontinuityJumpTicks: Int64 = 1000 * 90_000
+    var discontinuityJumpTicks: Int64 = 1000 * 90_000 // +1000s default, well beyond discontinuity-detection threshold
 
-    /// When true, the serve loop releases bytes at roughly the source's
-    /// natural rate (~1 wall-clock second of media per wall-clock second)
-    /// instead of as fast as the socket drains. This matches a genuine 1x
-    /// live broadcast: the producer / AVPlayer cannot race ahead of real
-    /// time, so the live-edge / behind-live dynamics reflect a real feed.
-    ///
-    /// Pacing is coarse by design: the serve loop tracks how many media
-    /// seconds it has emitted (derived from `loopPeriodTicks`, the 90 kHz
-    /// span the seed covers per loop, plus an intra-loop fraction by packet
-    /// index) and sleeps whenever the emitted media-time gets more than
-    /// `pacingLeadSeconds` ahead of the wall clock. It holds the long-run
-    /// average rate at 1x; it does not attempt per-packet PCR precision.
-    /// Default false: non-paced behaviour is unchanged.
+    /// Pace output at ~1x wall-clock so the producer/AVPlayer cannot race ahead of real time. Default false (as-fast-as-socket-drains).
     var paced = false
-    /// How far ahead of the wall clock the emitter is allowed to run before
-    /// it sleeps. A small lead keeps a startup burst (so the engine can fill
-    /// its initial buffer) without letting the producer race minutes ahead.
-    var pacingLeadSeconds: Double = 2.0
-    /// Media seconds served as fast as the socket drains BEFORE the 1x gate
-    /// engages. A real client joining a live channel already has a DVR
-    /// back-buffer and several published segments to start from; without a
-    /// preroll the producer cannot finalize its first segment before
-    /// AVPlayer's initial-buffering stall timer (1.5 * EXT-X-TARGETDURATION)
-    /// fires, and playback dies with CoreMedia -12888 at the very first
-    /// frame. The preroll lets the producer establish a normal live window,
-    /// after which pacing clamps the feed to 1x so the behind-live / edge
-    /// dynamics reflect a genuine real-time broadcast. 30 s comfortably
-    /// covers a 60 s DVR window's worth of startup plus AVPlayer warm-up.
+    var pacingLeadSeconds: Double = 2.0 // max emitter lead before sleeping
+    /// Preroll served at full speed before the 1x gate engages, so the producer can finalize its first segment before AVPlayer's initial-buffering stall timer (CoreMedia -12888).
     var pacingPrerollSeconds: Double = 30.0
-    /// Latched true (by a timer scheduled at connection start) once the
-    /// discontinuity window has elapsed, so the serve loop starts adding
-    /// `discontinuityJumpTicks` to every subsequent packet. A timer-driven
-    /// flag (rather than an in-loop wall-clock check) so the jump fires on
-    /// schedule even while the serve loop is blocked on a back-pressured
-    /// `send`. Guarded by `stateLock`. Single-shot across the session.
-    private var discontinuityArmed = false
+    private var discontinuityArmed = false // timer-driven so the jump fires even while serve loop is blocked in send()
     private var didFireDiscontinuity = false
 
     private let acceptQueue = DispatchQueue(
         label: "com.aetherengine.livefixture.accept",
         qos: .userInitiated
     )
+    /// Global wall-clock zero; reconnecting clients derive a loop index from "now" so they see the clock having advanced (like a real broadcast).
+    private let fixtureStart = Date()
+
+    /// Highest loopIndex emitted across all connections. Reconnects must start above this: wall-clock derivation alone undershoots an unpaced connection that raced far ahead.
+    private var highWaterLoopIndex: Int64 = -1
+
     private let workQueue = DispatchQueue(
         label: "com.aetherengine.livefixture.work",
         qos: .userInitiated,
@@ -165,8 +118,7 @@ final class LiveFixture: @unchecked Sendable {
 
     // MARK: - Init
 
-    /// Build the fixture from a seed `.ts` file. Throws if the seed is
-    /// missing or not a whole number of 188-byte TS packets.
+    /// Build the fixture from a seed `.ts` file (must be a whole-packet MPEG-TS).
     init(seedPath: String) throws {
         guard FileManager.default.fileExists(atPath: seedPath) else {
             throw LiveFixtureError.seedMissing(path: seedPath)
@@ -188,21 +140,16 @@ final class LiveFixture: @unchecked Sendable {
         }
         self.seedPackets = packets
 
-        // Scan the seed for the PTS span so the per-loop offset lands the
-        // next loop exactly one frame after the previous loop's last.
+        // loopPeriod = PTS span + one frame interval so next loop starts exactly one frame after the previous loop's last.
         let span = LiveFixture.measureTimestampSpan(packets: packets)
-        self.seedBasePTS = span.minPTS
-        // loopPeriod = span + one frame interval. Falls back to a 5 s
-        // period (450000 ticks) when the seed has no parseable PTS deltas.
-        let frameInterval = span.frameInterval > 0 ? span.frameInterval : 3750
+        let frameInterval = span.frameInterval > 0 ? span.frameInterval : 3750 // fallback ~30fps
         let rawPeriod = (span.maxPTS - span.minPTS) + frameInterval
-        self.loopPeriodTicks = rawPeriod > 0 ? rawPeriod : 450_000
+        self.loopPeriodTicks = rawPeriod > 0 ? rawPeriod : 450_000 // 5s fallback when no parseable PTS
     }
 
     // MARK: - Lifecycle
 
-    /// Bind + listen, spawn the accept/serve loop on a background thread,
-    /// return the live URL once the kernel has assigned a port.
+    /// Bind + listen, spawn the accept/serve loop, and return the live URL.
     func start() throws -> URL {
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { throw LiveFixtureError.socketCreate(errno: errno) }
@@ -210,15 +157,14 @@ final class LiveFixture: @unchecked Sendable {
         var on: Int32 = 1
         _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on,
                        socklen_t(MemoryLayout<Int32>.size))
-        // No SIGPIPE when the client disconnects mid-stream; send() returns
-        // EPIPE and the serve loop exits cleanly.
+        // SO_NOSIGPIPE: send() returns EPIPE instead of raising SIGPIPE on disconnect.
         _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on,
                        socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0 // kernel picks ephemeral
+        addr.sin_port = 0
         addr.sin_addr.s_addr = inet_addr("127.0.0.1")
 
         let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
@@ -260,8 +206,7 @@ final class LiveFixture: @unchecked Sendable {
         }
 
         guard let url = URL(string: "http://127.0.0.1:\(assignedPort)/live.ts") else {
-            // Unreachable: the string is always a valid URL.
-            throw LiveFixtureError.getsockname(errno: 0)
+            throw LiveFixtureError.getsockname(errno: 0) // unreachable
         }
         return url
     }
@@ -301,6 +246,8 @@ final class LiveFixture: @unchecked Sendable {
                 let err = errno
                 if err == EBADF || err == EINVAL { return }
                 if err == EINTR || err == EAGAIN { continue }
+                // Unexpected errno (e.g. EMFILE): print so it is not silently confused with an engine-side connect failure.
+                print("[LiveFixture] accept failed: errno=\(err); accept loop exiting")
                 return
             }
 
@@ -320,32 +267,19 @@ final class LiveFixture: @unchecked Sendable {
 
     // MARK: - Per-connection serve
 
-    /// Read (and discard) the HTTP request line, send a chunked-free
-    /// streaming 200 response with no Content-Length, then push rewritten
-    /// TS packets forever until the peer disconnects or `stop()` runs.
-    ///
-    /// If `dropAfterSeconds` is set and no drop has fired yet, closes this
-    /// connection after the configured number of seconds ONCE mid-stream
-    /// (simulating a single recoverable drop). The next accepted connection
-    /// (the reconnect) is served normally.
+    /// Stream rewritten TS packets until peer disconnects or stop() runs. Optionally injects one mid-stream drop.
     private func serve(_ fd: Int32) {
-        // Track whether we own the close of this fd. The drop timer may
-        // close it first (to force RST); in that case the defer below
-        // must not double-close.
-        var fdClosedByDropTimer = false
-
+        // Close ownership: whichever of the drop timer, stop(), or this defer removes fd from clientFds (under stateLock) owns the close. This prevents double-close on recycled fd numbers.
         defer {
             stateLock.lock()
-            clientFds.remove(fd)
+            let owned = clientFds.remove(fd) != nil
             stateLock.unlock()
-            if !fdClosedByDropTimer {
+            if owned {
                 close(fd)
             }
         }
 
-        // Drain the request headers (we only ever serve /live.ts, so the
-        // exact request line does not change behaviour). Bail on EOF.
-        guard readRequest(fd) else { return }
+        guard readRequest(fd) else { return } // drain request headers
 
         let header =
             "HTTP/1.1 200 OK\r\n" +
@@ -355,12 +289,7 @@ final class LiveFixture: @unchecked Sendable {
             "\r\n"
         guard writeAll(fd: fd, bytes: Array(header.utf8)) else { return }
 
-        // If this is the first streaming connection and a drop is configured,
-        // schedule an async RST of this fd after `dropAfterSeconds`. Using
-        // SO_LINGER=0 + close() sends RST immediately, causing the client
-        // URLSession to receive a network error rather than a clean EOF, which
-        // exercises the persistent reader's error-driven reconnect path. The
-        // blocked send() in the write loop returns EBADF/EPIPE, serve() exits.
+        // Schedule an RST (SO_LINGER=0) after dropAfterSeconds on the first connection: URLSession gets a network error, exercising the reader's reconnect path.
         stateLock.lock()
         let shouldScheduleDrop = (dropAfterSeconds != nil && !didFireDrop)
         let dropDelay = dropAfterSeconds ?? 0
@@ -370,10 +299,11 @@ final class LiveFixture: @unchecked Sendable {
             let item = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 self.stateLock.lock()
-                let alreadyFired = self.didFireDrop
-                if !alreadyFired { self.didFireDrop = true }
+                // Claim fd by removing from clientFds; if the connection already ended the fd may be recycled, so skip close and re-arm the drop.
+                let owned = !self.didFireDrop && self.clientFds.remove(fd) != nil
+                if owned { self.didFireDrop = true }
                 self.stateLock.unlock()
-                if !alreadyFired {
+                if owned {
                     print("[LiveFixture] Injecting mid-stream drop after ~\(Int(dropDelay))s (fd=\(fd))")
                     // SO_LINGER l_linger=0 causes close() to send RST.
                     var ling = Darwin.linger()
@@ -382,28 +312,22 @@ final class LiveFixture: @unchecked Sendable {
                     _ = setsockopt(fd, SOL_SOCKET, SO_LINGER,
                                    &ling, socklen_t(MemoryLayout<Darwin.linger>.size))
                     Darwin.close(fd)
-                    fdClosedByDropTimer = true
                 }
             }
             workQueue.asyncAfter(deadline: .now() + dropDelay, execute: item)
         }
 
-        // Per-PID continuity counter, carried across loop boundaries so the
-        // seam never produces a continuity_counter discontinuity.
-        var ccByPID: [Int: UInt8] = [:]
-        var loopIndex: Int64 = 0
+        var ccByPID: [Int: UInt8] = [:] // per-PID continuity counter, carried across loop seams
+        // Derive the starting loop index from wall-clock elapsed since fixture start; clamp above the high-water mark so reconnects don't jump backward.
+        let wallDerived: Int64 = loopPeriodTicks > 0
+            ? Int64((Date().timeIntervalSince(fixtureStart) * 90_000.0) / Double(loopPeriodTicks))
+            : 0
+        stateLock.lock()
+        let startLoopIndex = max(wallDerived, highWaterLoopIndex + 1)
+        stateLock.unlock()
+        var loopIndex: Int64 = startLoopIndex
 
-        // One-shot program-boundary discontinuity. After `discontinuityAfter`
-        // seconds of serving, every subsequent packet's PTS / DTS / PCR gets
-        // an EXTRA forward jump of `discontinuityJumpTicks` added ON TOP of
-        // the normal per-loop offset. The jump is applied once and then held
-        // constant, so the stream continues monotonically from the jumped
-        // value (a real broadcast program switch). The continuity_counter is
-        // untouched, so the only anomaly the demuxer sees is the timestamp
-        // leap, which is exactly the case the engine must survive.
-        //
-        // Armed by a timer (like the drop path) so it fires on schedule even
-        // when the serve loop is parked in a back-pressured `send`.
+        // One-shot discontinuity: armed by a timer so it fires on schedule even while serve() is blocked in send().
         stateLock.lock()
         let discontinuityAfter = discontinuityAfterSeconds
         let discontinuityJump = discontinuityJumpTicks
@@ -424,23 +348,11 @@ final class LiveFixture: @unchecked Sendable {
         }
         var discontinuityOffset: Int64 = 0
 
-        // Reusable per-packet scratch buffer (188 bytes), rewritten in place
-        // each iteration, so the serve loop allocates nothing steady-state.
-        var scratch = [UInt8](repeating: 0, count: LiveFixture.tsPacketSize)
+        var scratch = [UInt8](repeating: 0, count: LiveFixture.tsPacketSize) // reused per-packet; no steady-state alloc
 
-        // Real-time pacing state. `loopPeriodSeconds` is the media duration the
-        // seed covers per loop pass (the 90 kHz span / 90000). `serveStart` is
-        // this connection's wall-clock zero. Each packet, we estimate how many
-        // media seconds have been emitted (whole loops + intra-loop fraction by
-        // packet index) and, if paced, sleep until the wall clock catches up to
-        // within `pacingLeadSeconds`.
         let loopPeriodSeconds = Double(loopPeriodTicks) / 90_000.0
         let packetsPerLoop = max(1, seedPackets.count)
-        // Wall-clock zero for the 1x gate. Set when the preroll window has been
-        // fully emitted (the preroll itself is served as fast as the socket
-        // drains), so pacing measures media-beyond-preroll against wall-time-
-        // since-preroll rather than against the burst.
-        var pacingClockStart: Date? = nil
+        var pacingClockStart: Date? = nil // wall-clock zero for the 1x gate (set after preroll)
 
         while true {
             stateLock.lock()
@@ -456,12 +368,8 @@ final class LiveFixture: @unchecked Sendable {
                 // lead is exceeded, which keeps overhead negligible while still
                 // holding the long-run rate.
                 if paced {
-                    let emittedMedia = Double(loopIndex) * loopPeriodSeconds
+                    let emittedMedia = Double(loopIndex - startLoopIndex) * loopPeriodSeconds
                         + (Double(packetIndex) / Double(packetsPerLoop)) * loopPeriodSeconds
-                    // Serve the preroll window unpaced so the producer can
-                    // establish a live window before the 1x clamp engages. Once
-                    // past it, gate media-beyond-preroll against wall-time-since-
-                    // preroll, holding the long-run rate at ~1x.
                     if emittedMedia > pacingPrerollSeconds {
                         if pacingClockStart == nil { pacingClockStart = Date() }
                         let mediaPastPreroll = emittedMedia - pacingPrerollSeconds
@@ -473,18 +381,12 @@ final class LiveFixture: @unchecked Sendable {
                             let wall = Date().timeIntervalSince(pacingClockStart!)
                             let lead = mediaPastPreroll - wall
                             if lead <= pacingLeadSeconds { break }
-                            // Nap off the excess lead (cap each nap so stop() is
-                            // honoured promptly), then re-evaluate.
-                            let nap = min(lead - pacingLeadSeconds, 0.25)
+                            let nap = min(lead - pacingLeadSeconds, 0.25) // cap each nap so stop() is honoured promptly
                             usleep(useconds_t(max(0.005, nap) * 1_000_000))
                         }
                     }
                 }
-                // Poll the armed flag per packet (not just per seed-loop pass):
-                // the serve loop spends most of its time parked in a back-
-                // pressured `send` mid-pass, so an outer-loop-only check would
-                // not see the timer's arm until the next full pass, which can
-                // be many seconds late on a bursty reader.
+                // Poll armed flag per packet: the loop can be parked in a back-pressured send() for many seconds.
                 if discontinuityOffset == 0 {
                     stateLock.lock()
                     let armed = discontinuityArmed
@@ -504,12 +406,13 @@ final class LiveFixture: @unchecked Sendable {
             }
 
             loopIndex &+= 1
+            stateLock.lock()
+            if loopIndex > highWaterLoopIndex { highWaterLoopIndex = loopIndex }
+            stateLock.unlock()
         }
     }
 
-    /// Read until the end of the HTTP request headers (`\r\n\r\n`) or EOF.
-    /// Returns true if a request line was read, false on immediate EOF /
-    /// error.
+    /// Read until `\r\n\r\n` (end of HTTP headers) or EOF.
     private func readRequest(_ fd: Int32) -> Bool {
         var buffer = [UInt8]()
         var chunk = [UInt8](repeating: 0, count: 2048)
@@ -524,28 +427,26 @@ final class LiveFixture: @unchecked Sendable {
                 return false
             }
             buffer.append(contentsOf: chunk[0..<n])
-            if let end = headersTerminator(buffer) {
-                _ = end
+            if headersComplete(buffer) {
                 return true
             }
             if buffer.count > 8192 { return false }
         }
     }
 
-    private func headersTerminator(_ buf: [UInt8]) -> Int? {
-        guard buf.count >= 4 else { return nil }
+    private func headersComplete(_ buf: [UInt8]) -> Bool {
+        guard buf.count >= 4 else { return false }
         var i = 0
         while i <= buf.count - 4 {
             if buf[i] == 0x0D && buf[i + 1] == 0x0A
                 && buf[i + 2] == 0x0D && buf[i + 3] == 0x0A {
-                return i
+                return true
             }
             i += 1
         }
-        return nil
+        return false
     }
 
-    /// Blocking send loop. Returns false on broken pipe / error.
     private func writeAll(fd: Int32, bytes: [UInt8]) -> Bool {
         var written = 0
         let total = bytes.count
@@ -568,9 +469,7 @@ final class LiveFixture: @unchecked Sendable {
 
     // MARK: - TS packet rewrite
 
-    /// Rewrite one 188-byte TS packet in place: add `tsOffset` (90 kHz
-    /// ticks) to PCR / PTS / DTS, and rewrite the continuity_counter so it
-    /// keeps incrementing per-PID across loop boundaries.
+    /// Add `tsOffset` (90 kHz ticks) to PCR/PTS/DTS in place and rewrite the continuity_counter per-PID across loop boundaries.
     private func rewritePacket(_ p: inout [UInt8], tsOffset: Int64, ccByPID: inout [Int: UInt8]) {
         guard p[0] == LiveFixture.syncByte else { return }
 
@@ -580,12 +479,7 @@ final class LiveFixture: @unchecked Sendable {
         let hasPayload = (afc & 0x1) != 0
         let pusi = (p[1] >> 6) & 0x1           // payload_unit_start_indicator
 
-        // --- continuity_counter ---
-        // Per H.222: the CC increments only on packets that carry a payload
-        // (afc 0x1 or 0x3). Packets with adaptation-only (afc 0x2) repeat
-        // the previous CC. PID 0x1FFF (null) is exempt; we have none here.
-        // We drive a per-PID counter so the value is continuous across the
-        // loop seam regardless of what the seed's last CC was.
+        // Per H.222: CC increments only on payload-carrying packets (afc 0x1 or 0x3); adaptation-only packets repeat the previous CC.
         if pid != 0x1FFF {
             if hasPayload {
                 let next = (ccByPID[pid].map { ($0 &+ 1) & 0x0F }) ?? (p[3] & 0x0F)
@@ -599,7 +493,7 @@ final class LiveFixture: @unchecked Sendable {
             }
         }
 
-        if tsOffset == 0 { return } // loop 0: no timestamp shift needed.
+        if tsOffset == 0 { return } // loop 0: timestamps unchanged
 
         // --- adaptation field: PCR ---
         var payloadOffset = 4
@@ -609,8 +503,7 @@ final class LiveFixture: @unchecked Sendable {
                 let flags = p[5]
                 let pcrFlag = (flags >> 4) & 0x1
                 if pcrFlag != 0 {
-                    // PCR occupies p[6..<12]: 33-bit base, 6 reserved bits,
-                    // 9-bit extension. value = base * 300 + ext.
+                    // PCR: p[6..<12] = 33-bit base, 6 reserved bits, 9-bit ext. value = base * 300 + ext.
                     let b0 = Int64(p[6]), b1 = Int64(p[7]), b2 = Int64(p[8])
                     let b3 = Int64(p[9]), b4 = Int64(p[10]), b5 = Int64(p[11])
                     let base = (b0 << 25) | (b1 << 17) | (b2 << 9) | (b3 << 1) | (b4 >> 7)
@@ -623,9 +516,7 @@ final class LiveFixture: @unchecked Sendable {
                     p[7] = UInt8((newBase >> 17) & 0xFF)
                     p[8] = UInt8((newBase >> 9) & 0xFF)
                     p[9] = UInt8((newBase >> 1) & 0xFF)
-                    // bit0 of p[10] is PCR base LSB; bits 7..1 are reserved
-                    // (all 1s per spec); bit0..? Actually p[10] = (baseLSB<<7)
-                    // | (0x3F<<1) | extHigh. Reconstruct preserving reserved.
+                    // p[10] = (baseLSB<<7) | (0x3F<<1) | extHigh; reconstruct preserving reserved bits.
                     let baseLSB: Int64 = (newBase & 0x1) << 7
                     let reserved: Int64 = 0x3F << 1
                     let extHigh: Int64 = (newExt >> 8) & 0x1
@@ -636,27 +527,22 @@ final class LiveFixture: @unchecked Sendable {
             payloadOffset = 5 + afLen
         }
 
-        // --- PES header: PTS / DTS ---
         guard hasPayload, pusi != 0, payloadOffset <= 184 else { return }
         let pl = payloadOffset
-        // PES start code 00 00 01, then stream_id.
         guard pl + 9 <= LiveFixture.tsPacketSize,
               p[pl] == 0x00, p[pl + 1] == 0x00, p[pl + 2] == 0x01 else { return }
         let ptsDtsFlags = (p[pl + 7] >> 6) & 0x3
         guard ptsDtsFlags & 0x2 != 0 else { return }
 
-        // PTS at p[pl+9 ..< pl+14].
-        if pl + 14 <= LiveFixture.tsPacketSize {
+        if pl + 14 <= LiveFixture.tsPacketSize { // PTS at p[pl+9..<pl+14]
             rewriteTimestampField(&p, at: pl + 9, offset: tsOffset, marker: ptsDtsFlags == 0x3 ? 0x3 : 0x2)
         }
-        // DTS at p[pl+14 ..< pl+19] when both flags set.
-        if ptsDtsFlags == 0x3, pl + 19 <= LiveFixture.tsPacketSize {
+        if ptsDtsFlags == 0x3, pl + 19 <= LiveFixture.tsPacketSize { // DTS at p[pl+14..<pl+19]
             rewriteTimestampField(&p, at: pl + 14, offset: tsOffset, marker: 0x1)
         }
     }
 
-    /// Decode a 5-byte PTS / DTS field, add `offset` (mod 2^33), re-encode
-    /// preserving the 4-bit prefix marker and the three marker bits.
+    /// Decode a 5-byte PTS/DTS field, add `offset` mod 2^33, re-encode preserving the 4-bit prefix marker and marker bits.
     private func rewriteTimestampField(_ p: inout [UInt8], at i: Int, offset: Int64, marker: UInt8) {
         let b0 = Int64(p[i]), b1 = Int64(p[i + 1]), b2 = Int64(p[i + 2])
         let b3 = Int64(p[i + 3]), b4 = Int64(p[i + 4])
@@ -667,9 +553,7 @@ final class LiveFixture: @unchecked Sendable {
             (b3 << 7) |
             (b4 >> 1)
         let nv = (value &+ offset) & 0x1_FFFF_FFFF // wrap at 33 bits
-
-        // Re-encode. Prefix nibble = marker (0010 PTS-only / 0011 PTS-with-DTS
-        // / 0001 DTS). Each of the three sub-fields ends in a marker_bit = 1.
+        // Re-encode: prefix nibble = marker (0010 PTS-only / 0011 PTS-with-DTS / 0001 DTS); each sub-field ends with marker_bit = 1.
         p[i] = UInt8((marker << 4) | UInt8(((nv >> 30) & 0x7) << 1) | 0x1)
         p[i + 1] = UInt8((nv >> 22) & 0xFF)
         p[i + 2] = UInt8(UInt8(((nv >> 15) & 0x7F) << 1) | 0x1)
@@ -685,8 +569,7 @@ final class LiveFixture: @unchecked Sendable {
         var frameInterval: Int64
     }
 
-    /// Scan all packets once to find the min / max PES PTS and the most
-    /// common adjacent-PTS delta (the frame interval). Pure read, no mutation.
+    /// Scan all packets for min/max PES PTS and the most common adjacent-PTS delta (frame interval).
     private static func measureTimestampSpan(packets: [Data]) -> TimestampSpan {
         var ptsValues: [Int64] = []
         for packet in packets {

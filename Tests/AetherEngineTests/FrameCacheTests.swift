@@ -73,11 +73,9 @@ struct FrameCacheTests {
         let cache = FrameCache(thumbnailLimit: 2, snapshotLimit: 2, thumbnailBucketSeconds: 1.0)
         let snap = dummyImage()
         cache.set(snap, mode: .snapshot, seconds: 5.0)
-        // Insert 3 distinct thumbnail buckets, forcing thumbnail eviction.
         cache.set(dummyImage(), mode: .thumbnail, seconds: 10.0)
         cache.set(dummyImage(), mode: .thumbnail, seconds: 20.0)
         cache.set(dummyImage(), mode: .thumbnail, seconds: 30.0)
-        // Snapshot store must be untouched by thumbnail eviction.
         #expect(cache.get(mode: .snapshot, seconds: 5.0) === snap)
     }
 }
