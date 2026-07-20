@@ -1169,6 +1169,16 @@ extension AetherEngine {
         let sidecarToResume: URL? = isSubtitleActive && activeEmbeddedSubtitleStreamIndex < 0
             ? loadedSidecarURL
             : nil
+        // #<H>: a registered external track (addExternalSubtitleTrack / load-declared) carries its
+        // own id, language, and http headers in externalSubtitleRegistry; re-arming by URL alone
+        // (selectSidecarSubtitle below) re-decodes the file with the MEDIA's headers instead of the
+        // track's own AND leaves activeSubtitleTrackIndex nil, breaking host track-list highlighting
+        // after every audio-switch / reloadAtCurrentPosition. Snapshot the registered id when there
+        // is one (selectSubtitleTrack(index:startAt:) looks the rest up from the registry);
+        // unregistered one-shot sidecars fall back to the existing URL-only re-arm.
+        let registeredTrackIDToResume: Int? = sidecarToResume
+            .flatMap { _ in activeSubtitleTrackIndex }
+            .flatMap { id in externalSubtitleRegistry[id] != nil ? id : nil }
         // #112 full umbau: an audio-track switch does not move the playhead, so the PGS line already on screen is
         // still valid. Snapshot the visible bitmap cues before stopInternal wipes them; they are restored after the
         // subtitle re-arm so the line stays up while the re-armed reader re-primes forward (old path reconstructed
@@ -1190,6 +1200,10 @@ extension AetherEngine {
         let secondarySidecarToResume: URL? = isSecondarySubtitleActive && activeSecondaryEmbeddedSubtitleStreamIndex < 0
             ? loadedSecondarySidecarURL
             : nil
+        // #<H>: same registered-identity snapshot as the primary channel above.
+        let secondaryRegisteredTrackIDToResume: Int? = secondarySidecarToResume
+            .flatMap { _ in activeSecondaryExternalSubtitleTrackID }
+            .flatMap { id in externalSubtitleRegistry[id] != nil ? id : nil }
         EngineLog.emit(
             "[AetherEngine] reload begin: audioStream=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s embeddedSub=\(embeddedStreamToResume) sidecar=\(sidecarToResume?.lastPathComponent ?? "nil")",
             category: .engine
@@ -1407,7 +1421,12 @@ extension AetherEngine {
         }
 
         // Re-arm subtitle: sidecar branch wins because loadedSidecarURL is set only for sidecar sources.
-        if let sidecar = sidecarToResume {
+        // #<H>: a registered external track re-arms through selectSubtitleTrack (id + startAt), which
+        // preserves the track's own headers/language and republishes activeSubtitleTrackIndex; only an
+        // UNREGISTERED one-shot sidecar (registeredTrackIDToResume nil) falls back to the URL-only path.
+        if let registeredID = registeredTrackIDToResume {
+            selectSubtitleTrack(index: registeredID, startAt: preSwitchSourceTime)
+        } else if let sidecar = sidecarToResume {
             selectSidecarSubtitle(url: sidecar)
         } else if embeddedStreamToResume >= 0 {
             // #112 (audio-switch reanchor): pass the pre-stopInternal source PTS explicitly; the parameterless form
@@ -1421,7 +1440,9 @@ extension AetherEngine {
                 subtitleCues = preservedActiveImageCues
             }
         }
-        if let secondarySidecar = secondarySidecarToResume {
+        if let secondaryRegisteredID = secondaryRegisteredTrackIDToResume {
+            selectSecondarySubtitleTrack(index: secondaryRegisteredID, startAt: preSwitchSourceTime)
+        } else if let secondarySidecar = secondarySidecarToResume {
             selectSecondarySidecarSubtitle(url: secondarySidecar)
         } else if secondaryEmbeddedToResume >= 0 {
             // #112 (audio-switch reanchor): same collapsed-sourceTime slip on the secondary channel.

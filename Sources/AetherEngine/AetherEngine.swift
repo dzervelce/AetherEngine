@@ -410,6 +410,16 @@ public final class AetherEngine: ObservableObject {
     nonisolated static let subtitleDrainJumpThresholdSeconds: Double = 2.5
     nonisolated static let subtitleDrainTickNanoseconds: UInt64 = 500_000_000
     nonisolated static let subtitleForwardPrefetchParkPollNanoseconds: UInt64 = 500_000_000
+    /// A PGS backscan reaches for the nearest stored Acquisition Point / Epoch Start behind the
+    /// playhead (the disc's own random-access anchor); when none is found this bounds how far back
+    /// the flat fallback still reaches, so a sparsely-authored stream cannot walk arbitrarily far.
+    nonisolated static let subtitlePGSBackscanFallbackSeconds: Double = 90
+    /// Hard cap on packets decoded in one `subtitleDrainTick()` pass. A `.resetAndDecode` window
+    /// (backscan through playhead+lead) can hold dozens of PGS compositions; decoding all of them
+    /// synchronously on MainActor in one tick can visibly hitch the UI. The cursor's
+    /// `lastDecodedSequence` resumes past whatever a prior tick applied, so truncating here just
+    /// spreads a large backlog across more 500 ms ticks instead of dropping any of it.
+    nonisolated static let subtitleDrainMaxEntriesPerTick: Int = 20
 
     @Published public internal(set) var isLoadingSubtitles: Bool = false
     @Published public internal(set) var isSubtitleActive: Bool = false
@@ -423,6 +433,12 @@ public final class AetherEngine: ObservableObject {
     /// raw event lines. Hosts pair both to drive a whole-script renderer via ASSScriptBuilder (AetherEngine#48).
     /// Nil for SRT/VTT and when markup preservation is off.
     @Published public internal(set) var sidecarASSHeader: String? = nil
+
+    /// Outcome of the most recent sidecar decode (primary or secondary channel, one-shot or
+    /// registered-track), so a host can surface a failure instead of a silently empty overlay. Set
+    /// on every completion (success or failure); a completed decode with zero cues is `success ==
+    /// false`. See `SidecarLoadResult`.
+    @Published public internal(set) var sidecarLoadResult: SidecarLoadResult? = nil
 
     /// Cues for the secondary subtitle track (#47). Text-only (bitmap rejected); independent of primary.
     @Published public internal(set) var secondarySubtitleCues: [SubtitleCue] = []

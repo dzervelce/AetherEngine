@@ -7,6 +7,11 @@ import Libavutil
 /// Written on the pump thread, read by the MainActor overlay drainer; all state is
 /// lock-guarded (same pattern as NativeSubtitleCueStore).
 struct StoredSubtitlePacket: Sendable {
+    /// Store-assigned, monotonically increasing across the whole store (not per-stream). Two
+    /// packets can legitimately share `ptsSeconds` (distinct simultaneous PGS objects, or a
+    /// producer restart's re-harvest landing next to genuinely new content); `sequence` is the
+    /// only way to order/identify them unambiguously once PTS collides.
+    let sequence: UInt64
     let ptsSeconds: Double
     let durationSeconds: Double
     /// AVPacket.flags at harvest time; EmbeddedSubtitleDecoder forwards flags into its
@@ -25,6 +30,15 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// case (#125). Forward exposure from the pump is bounded by the producer's forward park (#102);
     /// on VOD sessions the forward prefetcher (#151) extends it to the drainer's lead window.
     static let perStreamByteCap: Int = 32 * 1024 * 1024
+
+    /// Session-wide ceiling across every retained stream, independent of `perStreamByteCap`. Every
+    /// embedded subtitle stream is tapped from init (only one is ever actively drained at a time),
+    /// so a file with several bitmap tracks could otherwise retain hundreds of MB for tracks nobody
+    /// is watching. Checked after every append; eviction targets the largest INACTIVE bitmap
+    /// stream's oldest packets first (the pump keeps re-harvesting once that stream is selected, so
+    /// its backlog is cheaply replaceable) — never a text stream (tiny) or a stream currently in
+    /// `activeStreamIndices`.
+    static let sessionByteCap: Int = 64 * 1024 * 1024
 
     /// Ceiling for one in-assembly PGS display set (a 4K set stays far below this); a pending
     /// buffer past it is malformed or mis-parsed and gets dropped rather than grown unbounded.
@@ -55,6 +69,29 @@ final class SubtitlePacketStore: @unchecked Sendable {
     private var entriesByStream: [Int32: [StoredSubtitlePacket]] = [:]
     private var bytesByStream: [Int32: Int] = [:]
     private var pendingSetByStream: [PendingKey: PendingDisplaySet] = [:]
+    private var sequenceCounter: UInt64 = 0
+    private var bitmapStreamIndices: Set<Int32> = []
+    private var activeStreamIndices: Set<Int32> = []
+
+    /// Classify which streams are bitmap-coded (PGS/DVB/DVD/XSUB); drives session-budget eviction
+    /// priority (below) and the drainer's PGS-anchor backscan. Set once when the tap arms
+    /// (idempotent - safe to call again on every producer restart). Unclassified streams are
+    /// treated as text: never session-evicted, never anchor-backscanned.
+    func markBitmapStreams(_ indices: Set<Int32>) {
+        lock.lock(); bitmapStreamIndices = indices; lock.unlock()
+    }
+
+    /// True when `streamIndex` was marked bitmap via `markBitmapStreams`.
+    func isBitmapStream(_ streamIndex: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return bitmapStreamIndices.contains(streamIndex)
+    }
+
+    /// Streams the drainer is currently decoding (primary + secondary channel targets); protected
+    /// from session-wide eviction even while over budget. Updated by the engine every drain tick.
+    func setActiveStreams(_ indices: Set<Int32>) {
+        lock.lock(); activeStreamIndices = indices; lock.unlock()
+    }
 
     func append(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
                 flags: Int32 = 0, payload: Data) {
@@ -63,27 +100,69 @@ final class SubtitlePacketStore: @unchecked Sendable {
                      durationSeconds: durationSeconds, flags: flags, payload: payload)
     }
 
+    /// Same-PTS packets are DISTINCT subtitle events in general (multiple simultaneous PGS objects
+    /// in one display set, or two independent text lines), not necessarily a producer-restart
+    /// replay - only an EXACT duplicate (identical pts + duration + flags + payload) is the replay
+    /// case and gets deduped; everything else is inserted as its own entry, ordered after any
+    /// existing same-pts run so arrival order matches `sequence` order.
     private func appendLocked(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
                               flags: Int32, payload: Data) {
         var entries = entriesByStream[streamIndex] ?? []
         var bytes = bytesByStream[streamIndex] ?? 0
-        let entry = StoredSubtitlePacket(ptsSeconds: ptsSeconds,
+
+        let upperBound = entries.firstIndex { $0.ptsSeconds > ptsSeconds } ?? entries.count
+        var lowerBound = upperBound
+        while lowerBound > 0, entries[lowerBound - 1].ptsSeconds == ptsSeconds {
+            lowerBound -= 1
+        }
+        if entries[lowerBound..<upperBound].contains(where: {
+            $0.durationSeconds == durationSeconds && $0.flags == flags && $0.payload == payload
+        }) {
+            return
+        }
+
+        sequenceCounter += 1
+        let entry = StoredSubtitlePacket(sequence: sequenceCounter,
+                                         ptsSeconds: ptsSeconds,
                                          durationSeconds: durationSeconds,
                                          flags: flags,
                                          payload: payload)
-        let insertAt = entries.firstIndex { $0.ptsSeconds >= ptsSeconds } ?? entries.count
-        if insertAt < entries.count, entries[insertAt].ptsSeconds == ptsSeconds {
-            bytes -= entries[insertAt].payload.count
-            entries[insertAt] = entry
-        } else {
-            entries.insert(entry, at: insertAt)
-        }
+        entries.insert(entry, at: upperBound)
         bytes += payload.count
         while bytes > Self.perStreamByteCap, entries.count > 1 {
             bytes -= entries.removeFirst().payload.count
         }
         entriesByStream[streamIndex] = entries
         bytesByStream[streamIndex] = bytes
+        enforceSessionBudgetLocked()
+    }
+
+    /// Session-wide eviction (called under `lock`, after every append). Evicts the oldest packet
+    /// from the largest INACTIVE bitmap stream's backlog, repeating until the session total is
+    /// back under budget or no eligible candidate remains; text streams and `activeStreamIndices`
+    /// are never touched here, so this can leave the session over budget when the active stream(s)
+    /// alone exceed it - by design, the drainer needs that data.
+    private func enforceSessionBudgetLocked() {
+        var total = bytesByStream.values.reduce(0, +)
+        guard total > Self.sessionByteCap else { return }
+        var candidates = bitmapStreamIndices.subtracting(activeStreamIndices)
+        while total > Self.sessionByteCap, !candidates.isEmpty {
+            guard let idx = candidates.max(by: { (bytesByStream[$0] ?? 0) < (bytesByStream[$1] ?? 0) }),
+                  (bytesByStream[idx] ?? 0) > 0 else { break }
+            guard var entries = entriesByStream[idx], !entries.isEmpty else {
+                candidates.remove(idx)
+                continue
+            }
+            let removed = entries.removeFirst()
+            bytes(idx, delta: -removed.payload.count)
+            entriesByStream[idx] = entries
+            total -= removed.payload.count
+            if entries.isEmpty { candidates.remove(idx) }
+        }
+    }
+
+    private func bytes(_ streamIndex: Int32, delta: Int) {
+        bytesByStream[streamIndex] = (bytesByStream[streamIndex] ?? 0) + delta
     }
 
     /// Shared pump-side harvest for both hosts: convert a raw AVPacket into a stored entry on
@@ -208,6 +287,36 @@ final class SubtitlePacketStore: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let entries = entriesByStream[streamIndex] else { return [] }
         return entries.filter { $0.ptsSeconds >= from && $0.ptsSeconds <= through }
+    }
+
+    /// Nearest stored packet at or before `pts`, unbounded. Backs the drainer's TEXT backscan: a
+    /// long-duration cue can start further back than the normal backscan window, and text decode is
+    /// cheap enough to always include it regardless of distance. nil when the stream holds nothing
+    /// at or before `pts`.
+    func nearestEntryPts(streamIndex: Int32, atOrBefore pts: Double) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        return entriesByStream[streamIndex]?.last(where: { $0.ptsSeconds <= pts })?.ptsSeconds
+    }
+
+    /// Nearest stored PGS Acquisition Point / Epoch Start (a self-contained composition - see
+    /// `EmbeddedSubtitleDecoder.PGSCompositionState`) at or before `pts`, bounded by
+    /// `fallbackWindow` so a stream with no anchor in range does not walk arbitrarily far back.
+    /// Returns nil when none is found within the window (caller falls back to a flat backscan).
+    func nearestPGSAnchorPts(streamIndex: Int32, atOrBefore pts: Double, fallbackWindow: Double) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        guard let entries = entriesByStream[streamIndex] else { return nil }
+        let floor = pts - fallbackWindow
+        let candidates = entries.reversed()
+            .drop(while: { $0.ptsSeconds > pts })
+            .prefix(while: { $0.ptsSeconds >= floor })
+        return candidates.first(where: { Self.isPGSAnchor($0.payload) })?.ptsSeconds
+    }
+
+    private static func isPGSAnchor(_ payload: Data) -> Bool {
+        payload.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            return EmbeddedSubtitleDecoder.pgsCompositionState(base, count: raw.count)?.isSelfContained ?? false
+        }
     }
 
     func frontier(streamIndex: Int32) -> Double? {

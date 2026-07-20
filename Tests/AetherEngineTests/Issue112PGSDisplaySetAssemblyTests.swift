@@ -166,8 +166,11 @@ struct Issue112PGSDisplaySetAssemblyTests {
         #expect(stored(store).first?.flags == 0x5)
     }
 
-    @Test("un-armed streams keep the per-packet path: NOPTS drops, same-pts replaces")
+    @Test("un-armed streams keep the per-packet path: NOPTS drops, distinct same-pts both survive")
     func unarmedKeepsLegacyBehavior() {
+        // #<C>: same-PTS packets are distinct subtitle events in general (simultaneous PGS objects,
+        // or two independent lines), not necessarily a producer-restart replay - the store no longer
+        // collapses a same-pts, DIFFERENT-payload pair down to the newest one.
         let store = SubtitlePacketStore()
         store.harvestChunk(streamIndex: 3, ptsSeconds: nil, durationSeconds: 0,
                            flags: 0, payload: pcs, assembleSplitDisplaySets: false)
@@ -176,8 +179,20 @@ struct Issue112PGSDisplaySetAssemblyTests {
         store.harvestChunk(streamIndex: 3, ptsSeconds: 10, durationSeconds: 0,
                            flags: 0, payload: Data([2, 2]), assembleSplitDisplaySets: false)
         let got = store.entries(streamIndex: 3, from: 0, through: 100)
+        #expect(got.count == 2)
+        #expect(got.map(\.payload) == [Data([1]), Data([2, 2])])
+        #expect(Set(got.map(\.sequence)).count == 2)
+    }
+
+    @Test("an EXACT same-pts duplicate (restart re-harvest of identical content) still dedupes")
+    func exactDuplicateStillDedupes() {
+        let store = SubtitlePacketStore()
+        store.harvestChunk(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2,
+                           flags: 0, payload: Data([9, 9]), assembleSplitDisplaySets: false)
+        store.harvestChunk(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2,
+                           flags: 0, payload: Data([9, 9]), assembleSplitDisplaySets: false)
+        let got = store.entries(streamIndex: 3, from: 0, through: 100)
         #expect(got.count == 1)
-        #expect(got.first?.payload == Data([2, 2]))
     }
 
     @Test("clear resets pending assembly state")

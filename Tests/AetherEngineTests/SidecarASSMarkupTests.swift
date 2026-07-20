@@ -65,6 +65,8 @@ final class SidecarASSMarkupTests: XCTestCase {
         guard case let .text(first) = result.cues[0].body else {
             return XCTFail("expected text body")
         }
-        XCTAssertEqual(first, "Hello world")
+        // Inline italic/bold/underline survive as tags (fork feature, 2026-07-19) — the "plain"
+        // default path strips every OTHER override but keeps style tags for the host overlay.
+        XCTAssertEqual(first, "<i>Hello</i> world")
     }
 }

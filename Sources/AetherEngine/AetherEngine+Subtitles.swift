@@ -135,7 +135,8 @@ extension AetherEngine {
             clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
             activeSecondaryEmbeddedSubtitleStreamIndex = -1
             activeSecondaryExternalSubtitleTrackID = index
-            startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders)
+            startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders,
+                                        language: external.language)
             return
         }
         guard index < Self.externalSubtitleTrackIDBase else { return }
@@ -177,6 +178,17 @@ extension AetherEngine {
         cues.filter { cue in
             guard case .image = cue.body else { return false }
             return cue.startTime <= playhead && playhead < cue.endTime
+        }
+    }
+
+    /// Shift a batch of file-relative (0-based) sidecar cue times onto the session's source-PTS
+    /// axis. Identity when `origin == 0` (the normal case: plain files, live, non-disc VOD). Mirrors
+    /// `PresentationAxis.source(displayTime:origin:)`, applied over a cue list instead of a scalar
+    /// seek target.
+    nonisolated static func shiftCues(_ cues: [SubtitleCue], bySourceOrigin origin: Double) -> [SubtitleCue] {
+        guard origin != 0 else { return cues }
+        return cues.map { cue in
+            SubtitleCue(id: cue.id, startTime: cue.startTime + origin, endTime: cue.endTime + origin, body: cue.body)
         }
     }
 
@@ -229,24 +241,57 @@ extension AetherEngine {
         guard !subtitleDrainTargets.isEmpty, let store = activeSubtitlePacketStore else { return }
         let playhead = sourceTime
         var prefetchNeedsReanchor = false
+        // #<D>: the session-wide packet budget protects whichever stream(s) are actually being
+        // drained; refreshed every tick so a selection change takes effect on the very next scan.
+        store.setActiveStreams(Set(subtitleDrainTargets.values))
         for (channel, streamIndex) in subtitleDrainTargets {
             let hadCursor = subtitleDrainCursors[channel] != nil
+            // #<G>: the flat 15 s backscan can miss a still-active long cue. Text decode is cheap,
+            // so reach back to the nearest stored packet regardless of distance; PGS reaches for the
+            // nearest self-contained Acquisition Point / Epoch Start (the disc's own random-access
+            // anchor) within a bounded fallback window - decoding forward from an arbitrary mid-epoch
+            // delta packet cannot reconstruct the composition.
+            let backscan: Double
+            if store.isBitmapStream(streamIndex) {
+                if let anchor = store.nearestPGSAnchorPts(
+                    streamIndex: streamIndex, atOrBefore: playhead,
+                    fallbackWindow: Self.subtitlePGSBackscanFallbackSeconds) {
+                    backscan = max(0, playhead - anchor)
+                } else {
+                    backscan = Self.subtitlePGSBackscanFallbackSeconds
+                }
+            } else if let nearest = store.nearestEntryPts(streamIndex: streamIndex, atOrBefore: playhead) {
+                backscan = max(Self.subtitleDrainBackscanSeconds, playhead - nearest)
+            } else {
+                backscan = Self.subtitleDrainBackscanSeconds
+            }
             let plan = SubtitleOverlayDrainer.drainPlan(
                 cursor: subtitleDrainCursors[channel],
                 playhead: playhead,
                 lead: Self.subtitleDrainLeadSeconds,
-                backscan: Self.subtitleDrainBackscanSeconds,
+                backscan: backscan,
                 jumpThreshold: Self.subtitleDrainJumpThresholdSeconds)
             if Self.subtitleForwardPrefetchNeedsReanchor(plan: plan, hadCursor: hadCursor) {
                 prefetchNeedsReanchor = true
             }
             let window: (from: Double, through: Double)
+            let queryFrom: Double
+            var lastDecoded: Double?
+            var lastSequence: UInt64?
             switch plan {
             case .idle:
                 subtitleDrainCursors[channel]?.lastPlayhead = playhead
                 continue
             case .decode(let from, let through):
                 window = (from, through)
+                let cursor = subtitleDrainCursors[channel]
+                // #<C>: query from the cursor's own last-decoded pts (not drainPlan's
+                // `.nextUp`-advanced `from`), so a same-PTS sibling a prior tick's entry cap left
+                // undecoded is re-fetched; the sequence floor below filters out whatever that tick
+                // already applied, so re-including this tiny pts overlap is safe.
+                queryFrom = cursor?.lastDecodedPts ?? from
+                lastDecoded = cursor?.lastDecodedPts
+                lastSequence = cursor?.lastDecodedSequence
             case .resetAndDecode(let from, let through):
                 subtitleDrainDecoders[channel] = nil
                 // Fresh selection or seek: the backscan decodes compositions BEHIND the
@@ -257,16 +302,23 @@ extension AetherEngine {
                 // shows nothing until the next line).
                 pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()].reconstructing = true
                 window = (from, through)
+                queryFrom = from
+                // #<C>: a stale sequence from before the jump must not filter out relevant entries
+                // at the new position - a backward seek can land on packets harvested (and
+                // store-sequenced) BEFORE the pre-jump cursor's sequence.
+                lastDecoded = nil
+                lastSequence = nil
             }
             if subtitleDrainDecoders[channel] == nil {
                 subtitleDrainDecoders[channel] = makeSubtitleDrainDecoder(streamIndex: streamIndex)
             }
             guard let decoder = subtitleDrainDecoders[channel] else { continue }
-            let entries = store.entries(streamIndex: streamIndex,
-                                        from: window.from, through: window.through)
-            // The cursor only advances to an actually-decoded packet's PTS: a window that is
-            // empty because the producer has not reached it yet must be rescanned next tick.
-            var lastDecoded = subtitleDrainCursors[channel]?.lastDecodedPts
+            let candidates = store.entries(streamIndex: streamIndex, from: queryFrom, through: window.through)
+            // #<E>: cap decoded entries per tick so a large backscan/lead window full of PGS
+            // compositions cannot decode synchronously on MainActor in one pass; the sequence floor
+            // means an uncapped remainder is simply picked up on the next 500 ms tick, not skipped.
+            let entries = SubtitleOverlayDrainer.selectEntriesToDecode(
+                candidates, sequenceFloor: lastSequence, maxPerTick: Self.subtitleDrainMaxEntriesPerTick)
             for entry in entries {
                 // A cue-less event still matters: a PGS clear composition carries only
                 // pgsTrimAt and is what removes the line during silence.
@@ -275,6 +327,7 @@ extension AetherEngine {
                     applySubtitleEvent(event, channel: channel)
                 }
                 lastDecoded = entry.ptsSeconds
+                lastSequence = entry.sequence
             }
             if case .resetAndDecode = plan, entries.isEmpty {
                 // Fresh window with nothing stored yet: anchor just behind the window start so
@@ -283,7 +336,8 @@ extension AetherEngine {
             }
             subtitleDrainCursors[channel] = SubtitleDrainCursor(
                 lastDecodedPts: lastDecoded ?? window.from,
-                lastPlayhead: playhead)
+                lastPlayhead: playhead,
+                lastDecodedSequence: lastSequence)
         }
         // #151: a jump (seek / producer re-anchor) moves the drain window out from under the
         // prefetcher's read position; restart it at the new playhead. Once per tick, not per
@@ -704,7 +758,8 @@ extension AetherEngine {
             EngineLog.emit("[AetherEngine] external subtitle backfilled from finished store: id=\(id) cues=\(subtitleCues.count)", category: .engine)
             return
         }
-        startSidecarDecode(url: track.url, httpHeaders: track.httpHeaders, externalTrackID: id)
+        startSidecarDecode(url: track.url, httpHeaders: track.httpHeaders, externalTrackID: id,
+                          language: track.language)
     }
 
     /// Store lookup for the external backfill: test-hook override first, else the live session's stores.
@@ -723,20 +778,22 @@ extension AetherEngine {
     func startExternalNativeStoreFill(session: HLSVideoEngine) {
         externalNativeStoreFillTask?.cancel()
         externalNativeStoreFillTask = nil
-        var jobs: [(url: URL, headers: [String: String], store: NativeSubtitleCueStore)] = []
+        var jobs: [(url: URL, headers: [String: String], language: String?, store: NativeSubtitleCueStore)] = []
         for (ordinal, entry) in nativeSubtitleTrackTable.enumerated() {
             guard let extID = entry.externalID,
                   let track = externalSubtitleRegistry[extID],
                   ordinal < session.nativeSubtitleCueStoresForSession.count else { continue }
             jobs.append((track.url,
                          track.httpHeaders ?? loadedOptions.httpHeaders,
+                         track.language,
                          session.nativeSubtitleCueStoresForSession[ordinal]))
         }
         guard !jobs.isEmpty else { return }
         externalNativeStoreFillTask = Task.detached(priority: .utility) { [jobs] in
             for job in jobs {
                 if Task.isCancelled { return }
-                if let result = try? await SubtitleDecoder.decodeFile(url: job.url, httpHeaders: job.headers) {
+                if let result = try? await SubtitleDecoder.decodeFile(
+                    url: job.url, httpHeaders: job.headers, language: job.language) {
                     job.store.appendCues(result.cues)
                     job.store.markFinished()
                 } else {
@@ -755,17 +812,18 @@ extension AetherEngine {
         if activeSecondaryExternalSubtitleTrackID == id { clearSecondarySubtitle() }
     }
 
-    /// Fetch and decode a sidecar subtitle file (.srt / .ass / .vtt / .ssa) via `SubtitleDecoder.decodeFile`, replacing `subtitleCues` atomically. `httpHeaders` nil forwards `LoadOptions.httpHeaders` (same auth as the media, #32). Prefer registering via `addExternalSubtitleTrack` + `selectSubtitleTrack` (#88), which keeps the track listed and `activeSubtitleTrackIndex` populated; this API stays for compatibility and one-shot use.
-    public func selectSidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
+    /// Fetch and decode a sidecar subtitle file (.srt / .ass / .vtt / .ssa) via `SubtitleDecoder.decodeFile`, replacing `subtitleCues` atomically. `httpHeaders` nil forwards `LoadOptions.httpHeaders` (same auth as the media, #32). `language` (BCP-47/ISO 639) is the last-resort charset disambiguator when the file declares none of its own (`SidecarCharsetResolver`). Prefer registering via `addExternalSubtitleTrack` + `selectSubtitleTrack` (#88), which keeps the track listed and `activeSubtitleTrackIndex` populated; this API stays for compatibility and one-shot use.
+    public func selectSidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil, language: String? = nil) {
         hostExplicitSubtitleAction = true
-        startSidecarDecode(url: url, httpHeaders: httpHeaders, externalTrackID: nil)
+        startSidecarDecode(url: url, httpHeaders: httpHeaders, externalTrackID: nil, language: language)
     }
 
     /// Shared sidecar-decode start: the pre-#88 selectSidecarSubtitle body, parameterized on which
     /// track id (if any) to publish as active. Also clears the pump-tap overlay stream so a prior
     /// tap-fed selection stops forwarding into the sidecar's cues (latent pre-#88 bug: the tap
     /// forward-guard matched the stale index and kept appending).
-    func startSidecarDecode(url: URL, httpHeaders: [String: String]?, externalTrackID: Int?) {
+    func startSidecarDecode(url: URL, httpHeaders: [String: String]?, externalTrackID: Int?,
+                            language: String? = nil) {
         cancelSidecarTask()
         // Sidecar replaces any active embedded stream.
         clearSubtitleDrainTarget(channel: .primary)   // #112 rework
@@ -774,9 +832,9 @@ extension AetherEngine {
 
         loadedSidecarURL = url
         isSubtitleActive = true
-        subtitleCues = []
+        // A previous track's cues (if any) stay on screen until THIS decode succeeds; clearing here
+        // eagerly blanked the overlay for the whole fetch+decode duration on every track switch.
         pgsStaleArrivalGates[.primary]?.reset()   // #100
-        sidecarASSHeader = nil
         isLoadingSubtitles = true
 
         let effectiveHeaders = httpHeaders ?? loadedOptions.httpHeaders
@@ -787,7 +845,7 @@ extension AetherEngine {
             do {
                 result = try await SubtitleDecoder.decodeFile(
                     url: url, httpHeaders: effectiveHeaders,
-                    preserveASSMarkup: preserveASS
+                    preserveASSMarkup: preserveASS, language: language
                 )
             } catch {
                 EngineLog.emit("[AetherEngine] sidecar decode failed: \(error)", category: .engine)
@@ -795,6 +853,8 @@ extension AetherEngine {
                     // Stale-task guard: A->B switch; isSubtitleActive alone doesn't catch it (true again for B by the time A's error lands).
                     guard !Task.isCancelled, let self = self else { return }
                     if self.isSubtitleActive { self.isLoadingSubtitles = false }
+                    self.sidecarLoadResult = SidecarLoadResult(
+                        url: url, success: false, cueCount: 0, message: "\(error)")
                 }
                 return
             }
@@ -803,30 +863,40 @@ extension AetherEngine {
                 // Stale-task guard: superseded load A must not overwrite B's cues (isSubtitleActive is true again for B).
                 guard !Task.isCancelled, let self = self else { return }
                 guard self.isSubtitleActive else { return }
-                // Sidecar cues are in source PTS; host renders against engine.sourceTime (which folds playlistShiftSeconds).
-                self.subtitleCues = result.cues
+                // Sidecar cues decode on the FILE's own zero-based clock; shift onto the session's
+                // source-PTS axis (identity for the common origin==0 case) before publishing, so a
+                // non-zero-origin source (a disc title's clip-0 base) does not read every cue with a
+                // constant offset against engine.sourceTime.
+                let shifted = Self.shiftCues(result.cues, bySourceOrigin: self.sourcePresentationOrigin)
+                self.subtitleCues = shifted
                 self.sidecarASSHeader = result.assHeader
                 self.isLoadingSubtitles = false
+                // A completed decode with zero cues is a failure the host should be able to surface
+                // (a broken/empty file is otherwise indistinguishable from "subtitles just off").
+                self.sidecarLoadResult = SidecarLoadResult(
+                    url: url, success: !shifted.isEmpty, cueCount: shifted.count)
                 // Native mov_text moov is declared at load; runtime sidecars drive only the host overlay (#55).
             }
         }
     }
 
     /// Decode a sidecar as the secondary companion track (issue #47), independent of the primary.
-    public func selectSecondarySidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
+    public func selectSecondarySidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil,
+                                               language: String? = nil) {
         hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
         clearSubtitleDrainTarget(channel: .secondary)   // #112 rework
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
         activeSecondaryExternalSubtitleTrackID = nil
-        startSecondarySidecarDecode(url: url, httpHeaders: httpHeaders)
+        startSecondarySidecarDecode(url: url, httpHeaders: httpHeaders, language: language)
     }
 
     /// Shared secondary sidecar-decode start (#88): the pre-#88 selectSecondarySidecarSubtitle body.
-    func startSecondarySidecarDecode(url: URL, httpHeaders: [String: String]?) {
+    func startSecondarySidecarDecode(url: URL, httpHeaders: [String: String]?, language: String? = nil) {
         loadedSecondarySidecarURL = url
         isSecondarySubtitleActive = true
-        secondarySubtitleCues = []
+        // See the primary path's identical note: the previous track's cues stay up until this
+        // decode succeeds rather than blanking the overlay for the fetch+decode duration.
         pgsStaleArrivalGates[.secondary]?.reset()   // #100
         isLoadingSecondarySubtitles = true
 
@@ -835,20 +905,26 @@ extension AetherEngine {
             let result: SidecarDecodeResult
             do {
                 // Secondary is plain text only (never drives libass, mirroring embedded secondary #47).
-                result = try await SubtitleDecoder.decodeFile(url: url, httpHeaders: effectiveHeaders)
+                result = try await SubtitleDecoder.decodeFile(url: url, httpHeaders: effectiveHeaders,
+                                                              language: language)
             } catch {
                 EngineLog.emit("[AetherEngine] secondary sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
                     guard !Task.isCancelled, let self = self else { return }
                     if self.isSecondarySubtitleActive { self.isLoadingSecondarySubtitles = false }
+                    self.sidecarLoadResult = SidecarLoadResult(
+                        url: url, success: false, cueCount: 0, message: "\(error)")
                 }
                 return
             }
             await MainActor.run {
                 guard !Task.isCancelled, let self = self else { return }
                 guard self.isSecondarySubtitleActive else { return }
-                self.secondarySubtitleCues = result.cues
+                let shifted = Self.shiftCues(result.cues, bySourceOrigin: self.sourcePresentationOrigin)
+                self.secondarySubtitleCues = shifted
                 self.isLoadingSecondarySubtitles = false
+                self.sidecarLoadResult = SidecarLoadResult(
+                    url: url, success: !shifted.isEmpty, cueCount: shifted.count)
             }
         }
     }

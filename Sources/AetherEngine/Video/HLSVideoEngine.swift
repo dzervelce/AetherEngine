@@ -293,6 +293,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
             subtitlePacketStore.harvest(streamIndex: idx, packet: pkt, timeBase: tb,
                                         assembleSplitDisplaySets: assemblyIndices.contains(idx))
         }
+        // Classifies which of the tapped streams are bitmap-coded, so the store's session-wide
+        // budget can evict an inactive bitmap track's backlog first (every stream is tapped from
+        // init; only one is ever actively drained) and the drainer can reach for a PGS anchor
+        // instead of a flat backscan. Recomputed on every arm call (initial + restart) - cheap and
+        // idempotent, since the demuxer's stream set does not change across a restart.
+        let bitmapIndices = Set((demuxer?.subtitleTrackInfos() ?? [])
+            .filter { AetherEngine.isBitmapSubtitleCodec($0.codec) }
+            .map { Int32($0.id) })
+        subtitlePacketStore.markBitmapStreams(bitmapIndices)
     }
 
     /// Pump-thread callback: decode the tapped packet into its ordinal's cue store. Text subtitle decode

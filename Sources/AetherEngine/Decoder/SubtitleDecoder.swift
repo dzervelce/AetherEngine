@@ -8,6 +8,13 @@ enum SubtitleDecoderError: Error {
     case noSubtitleStream
     case noDecoder
     case codecOpenFailed(code: Int32)
+    /// The body exceeded `SubtitleDecoder.maxSidecarBodyBytes` while fetching (HTTP) or reading
+    /// (local) the sidecar file.
+    case oversizeBody(limit: Int)
+    /// The resolved charset could not decode the bytes, or the normalized text could not
+    /// re-encode as UTF-8 (both effectively impossible for `SidecarCharsetResolver`'s own
+    /// candidates, kept as a defensive terminal case).
+    case charsetDecodeFailed
 }
 
 /// Result of a sidecar decode: cue list plus, when preserveASSMarkup is set on an ASS/SSA file,
@@ -24,19 +31,23 @@ enum SubtitleDecoder {
     /// Decode every cue from the subtitle file at `url`, cancellable via Task.cancel().
     /// When preserveASSMarkup is true, ASS/SSA cues carry the raw libavcodec event line
     /// (ReadOrder,Layer,Style,...,Text) so ASSScriptBuilder can restyle them; no effect on SRT/VTT.
+    /// `language` (BCP-47/ISO 639, same convention as `ExternalSubtitleTrack.language`) is the
+    /// last-resort disambiguator when the file declares no charset of its own; see
+    /// `SidecarCharsetResolver`.
     static func decodeFile(
         url: URL,
         httpHeaders: [String: String] = [:],
-        preserveASSMarkup: Bool = false
+        preserveASSMarkup: Bool = false,
+        language: String? = nil
     ) async throws -> SidecarDecodeResult {
         // Task.cancel() does NOT propagate into detached tasks (isCancelled inside always false).
-        // Bridge cancellation explicitly via CancelFlag so the decode loop + AVIO reader abort promptly.
+        // Bridge cancellation explicitly via CancelFlag so the fetch/decode loop abort promptly.
         let token = CancelFlag()
         return try await withTaskCancellationHandler {
             try await Task.detached(priority: .userInitiated) {
                 try decodeFileSync(
                     url: url, httpHeaders: httpHeaders,
-                    preserveASSMarkup: preserveASSMarkup, cancel: token
+                    preserveASSMarkup: preserveASSMarkup, cancel: token, language: language
                 )
             }.value
         } onCancel: {
@@ -44,81 +55,134 @@ enum SubtitleDecoder {
         }
     }
 
-    /// Thread-safe cancellation token for the detached decode task; also aborts any registered AVIO reader.
+    /// Ceiling on a sidecar's fetched/read body. Subtitle files are text and tiny; a server (or a
+    /// mis-pointed external-subtitle URL) serving something far larger is misbehaving and must not
+    /// be buffered toward jetsam (mirrors AVIOReader's ChunkFetchDelegate cap for media fetches).
+    static let maxSidecarBodyBytes: Int = 8 * 1024 * 1024
+
+    /// Thread-safe cancellation token for the detached decode task. Holds the abort action for
+    /// whichever phase is currently running - the capped network fetch, then the in-memory demux -
+    /// so `cancel()` aborts either promptly; `registerAbort` fires immediately if already cancelled
+    /// (mirrors the old register-before-open ordering: a cancel landing mid-fetch or mid-open must
+    /// not wait for a network timeout, #32).
     private final class CancelFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var cancelled = false
-        private var reader: AVIOReader?
+        private var abortHandler: (() -> Void)?
 
         func cancel() {
             lock.lock()
             cancelled = true
-            let r = reader
+            let handler = abortHandler
             lock.unlock()
-            r?.markClosed()
+            handler?()
         }
 
         var isCancelled: Bool {
             lock.lock(); defer { lock.unlock() }; return cancelled
         }
 
-        func register(_ r: AVIOReader) {
+        func registerAbort(_ handler: @escaping () -> Void) {
             lock.lock()
             let wasCancelled = cancelled
-            reader = r
+            abortHandler = handler
             lock.unlock()
-            if wasCancelled { r.markClosed() }
+            if wasCancelled { handler() }
         }
+    }
+
+    /// Extensions carrying text subtitle formats. Only these route through `SidecarCharsetResolver`;
+    /// see the corruption note at the `isTextSidecarFormat` call site.
+    private static let textSidecarExtensions: Set<String> = ["srt", "subrip", "ass", "ssa", "vtt", "webvtt"]
+
+    private static func isTextSidecarFormat(url: URL) -> Bool {
+        textSidecarExtensions.contains(url.pathExtension.lowercased())
     }
 
     // MARK: - Synchronous core
 
     private static func decodeFileSync(
         url: URL, httpHeaders: [String: String],
-        preserveASSMarkup: Bool, cancel: CancelFlag
+        preserveASSMarkup: Bool, cancel: CancelFlag, language: String?
     ) throws -> SidecarDecodeResult {
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
-        var formatContext: UnsafeMutablePointer<AVFormatContext>?
-        var avioReader: AVIOReader?
-
+        // #<A>: fetch the whole (capped) body first and resolve its charset before handing
+        // anything to libavformat, which has no charset detection of its own - the prior code fed
+        // raw HTTP/legacy bytes straight to the demuxer and silently mojibaked anything outside
+        // ASCII. Local files go through the identical resolve+transcode path so a legacy-encoded
+        // bundled sidecar is not a second, unfixed instance of the same defect.
+        let rawBody: Data
+        var contentType: String?
         if isHTTP {
-            let reader = AVIOReader(url: url, extraHeaders: httpHeaders)
-            // Register BEFORE open(): open does a synchronous network probe (up to ~60 s on stalled origins);
-            // cancellation during the probe must abort via markClosed rather than waiting for timeout (#32).
-            cancel.register(reader)
-            try reader.open()
-            avioReader = reader
-            guard let ctx = avformat_alloc_context() else {
-                reader.close()
+            let fetched = try fetchSidecarBody(url: url, headers: httpHeaders, cancel: cancel)
+            rawBody = fetched.body
+            contentType = fetched.contentType
+        } else {
+            let path = url.isFileURL ? url.path : url.absoluteString
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                  let size = (attrs[.size] as? NSNumber)?.intValue else {
                 throw SubtitleDecoderError.openFailed(code: -1)
             }
-            ctx.pointee.pb = reader.context
-            // Assign formatContext only after a successful open: avformat_open_input frees the
-            // supplied context and NULLs its pointer on failure, so an early assignment would
-            // leave a dangling pointer for the defer to double-close (mirrors Demuxer.swift).
-            var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = ctx
-            let ret = avformat_open_input(&ctxPtr, nil, nil, nil)
-            guard ret == 0 else {
-                reader.close()
-                throw SubtitleDecoderError.openFailed(code: ret)
+            guard size <= maxSidecarBodyBytes else {
+                throw SubtitleDecoderError.oversizeBody(limit: maxSidecarBodyBytes)
             }
-            formatContext = ctxPtr
-        } else {
-            var ctx: UnsafeMutablePointer<AVFormatContext>?
-            let urlString = url.isFileURL ? url.path : url.absoluteString
-            let ret = avformat_open_input(&ctx, urlString, nil, nil)
-            guard ret == 0, ctx != nil else {
-                throw SubtitleDecoderError.openFailed(code: ret)
+            guard let data = FileManager.default.contents(atPath: path) else {
+                throw SubtitleDecoderError.openFailed(code: -1)
             }
-            formatContext = ctx
+            rawBody = data
         }
+        guard !cancel.isCancelled else { throw CancellationError() }
+
+        // Charset resolution only applies to TEXT sidecar formats (SRT/ASS/SSA/VTT); a bitmap
+        // sidecar (PGS `.sup`) or anything unrecognized is binary or unknown and must reach the
+        // demuxer byte-for-byte - decoding it under a guessed text encoding and re-encoding to UTF-8
+        // would corrupt it (control bytes reinterpreted as CR/LF, high bytes remapped by the guessed
+        // code page, etc).
+        let demuxBody: Data
+        if isTextSidecarFormat(url: url) {
+            let encoding = SidecarCharsetResolver.resolve(
+                contentType: contentType, bytes: rawBody, language: language)
+            guard let decodedText = SidecarCharsetResolver.decode(rawBody, as: encoding) else {
+                throw SubtitleDecoderError.charsetDecodeFailed
+            }
+            let normalized = SidecarCharsetResolver.normalizeLineEndings(decodedText)
+            guard let utf8Body = normalized.data(using: .utf8) else {
+                throw SubtitleDecoderError.charsetDecodeFailed
+            }
+            demuxBody = utf8Body
+        } else {
+            demuxBody = rawBody
+        }
+
+        // Demux the in-memory body through the same custom-AVIO seam a live custom source uses,
+        // rather than re-opening the original URL: the fetch above already paid the network/disk
+        // cost, and libavformat needs a byte source it can probe, not a decoded String.
+        var formatContext: UnsafeMutablePointer<AVFormatContext>?
+        let bridge = CustomIOReaderBridge(reader: DataIOReader(data: demuxBody))
+        cancel.registerAbort { bridge.markClosed() }
+        try bridge.open()
+        guard let allocated = avformat_alloc_context() else {
+            bridge.close()
+            throw SubtitleDecoderError.openFailed(code: -1)
+        }
+        allocated.pointee.pb = bridge.context
+        // Assign formatContext only after a successful open: avformat_open_input frees the
+        // supplied context and NULLs its pointer on failure, so an early assignment would
+        // leave a dangling pointer for the defer to double-close (mirrors Demuxer.swift).
+        var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = allocated
+        let ret = avformat_open_input(&ctxPtr, nil, nil, nil)
+        guard ret == 0 else {
+            bridge.close()
+            throw SubtitleDecoderError.openFailed(code: ret)
+        }
+        formatContext = ctxPtr
 
         defer {
             if formatContext != nil {
                 avformat_close_input(&formatContext)
             }
-            avioReader?.close()
+            bridge.close()
         }
 
         guard let fmt = formatContext else {
@@ -341,4 +405,105 @@ enum SubtitleDecoder {
         )
     }
 
+    // MARK: - Capped HTTP fetch
+
+    /// One-shot capped GET for a sidecar subtitle file: the whole body up to `maxSidecarBodyBytes`,
+    /// plus the response `Content-Type` for charset resolution. Blocks the calling (detached) thread
+    /// via semaphore, matching this file's otherwise-synchronous decode core. Redirects replay the
+    /// caller's headers through the same policy media fetches use (`RedirectHeaderPolicy`), so an
+    /// addon's auth header is not silently dropped on a CDN hop.
+    private static func fetchSidecarBody(
+        url: URL, headers: [String: String], cancel: CancelFlag
+    ) throws -> (body: Data, contentType: String?) {
+        let delegate = SidecarFetchDelegate(maxBytes: maxSidecarBodyBytes)
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        var request = URLRequest(url: url)
+        for (key, value) in headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        let task = session.dataTask(with: request)
+        let semaphore = DispatchSemaphore(value: 0)
+        delegate.onCompletion = { semaphore.signal() }
+        cancel.registerAbort { task.cancel() }
+        task.resume()
+        semaphore.wait()
+        session.finishTasksAndInvalidate()
+        if let error = delegate.error {
+            throw error
+        }
+        return (delegate.body, delegate.contentType)
+    }
+}
+
+/// Delegate backing `SubtitleDecoder.fetchSidecarBody`: buffers the response body up to a hard cap
+/// (a server ignoring an implicit whole-file GET, or ignoring Content-Length, must not drive
+/// unbounded allocation - same defensive contract as AVIOReader's ChunkFetchDelegate) and captures
+/// the declared Content-Type for charset resolution. All mutable state is only ever touched from
+/// URLSession's delegate queue, so no additional locking is needed beyond `@unchecked Sendable`.
+private final class SidecarFetchDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    let maxBytes: Int
+    var body = Data()
+    var contentType: String?
+    var error: Error?
+    var onCompletion: (() -> Void)?
+
+    init(maxBytes: Int) {
+        self.maxBytes = maxBytes
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        let replayHeaders = (task.originalRequest?.allHTTPHeaderFields).map { headers in
+            RedirectHeaderPolicy.headersToReplay(
+                extraHeaders: headers,
+                originalURL: task.originalRequest?.url,
+                redirectURL: request.url)
+        } ?? [:]
+        var updated = request
+        for (name, value) in replayHeaders {
+            updated.setValue(value, forHTTPHeaderField: name)
+        }
+        completionHandler(updated)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse else {
+            completionHandler(.allow)
+            return
+        }
+        contentType = http.value(forHTTPHeaderField: "Content-Type")
+        let len = Int(http.expectedContentLength)
+        if len > 0 { body.reserveCapacity(min(len, maxBytes)) }
+        guard http.statusCode == 200 || http.statusCode == 206 else {
+            error = SubtitleDecoderError.openFailed(code: Int32(http.statusCode))
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard body.count + data.count <= maxBytes else {
+            if error == nil { error = SubtitleDecoderError.oversizeBody(limit: maxBytes) }
+            dataTask.cancel()
+            return
+        }
+        body.append(data)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // Keep a deliberate cap/status error - the cancellation it triggers must not overwrite it.
+        if self.error == nil { self.error = error }
+        onCompletion?()
+    }
 }

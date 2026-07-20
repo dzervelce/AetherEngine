@@ -11,6 +11,10 @@ struct SubtitleDrainCursor: Sendable {
     /// Playhead at the previous tick; a jump beyond the threshold means the user
     /// seeked (or the producer re-anchored) and the decoder must be rebuilt.
     var lastPlayhead: Double
+    /// Store-assigned sequence of the last packet handed to the decoder. nil until the first packet
+    /// decodes this pass. Same-PTS siblings share `lastDecodedPts`, so PTS alone cannot distinguish
+    /// an already-applied packet from an unapplied one at that instant; sequence can.
+    var lastDecodedSequence: UInt64? = nil
 }
 
 enum SubtitleDrainPlan: Equatable, Sendable {
@@ -42,5 +46,19 @@ enum SubtitleOverlayDrainer {
             return .idle
         }
         return .decode(from: cursor.lastDecodedPts.nextUp, through: through)
+    }
+
+    /// Which of the store's PTS-windowed candidates a drain tick should actually decode: filtered to
+    /// those not yet applied (by sequence, so same-PTS siblings can't be skipped or re-decoded across
+    /// tick boundaries) and capped to `maxPerTick` (a `.resetAndDecode` window can hold dozens of PGS
+    /// compositions; decoding all of them synchronously on MainActor in one tick can visibly hitch the
+    /// UI - the cursor's `lastDecodedSequence` naturally resumes past whatever a prior tick applied,
+    /// since the caller re-queries `sequenceFloor` from it every tick). `sequenceFloor` nil means
+    /// nothing has been decoded yet this pass (fresh reset): every candidate is eligible.
+    static func selectEntriesToDecode(
+        _ candidates: [StoredSubtitlePacket], sequenceFloor: UInt64?, maxPerTick: Int
+    ) -> [StoredSubtitlePacket] {
+        let unseen = sequenceFloor.map { floor in candidates.filter { $0.sequence > floor } } ?? candidates
+        return Array(unseen.prefix(maxPerTick))
     }
 }

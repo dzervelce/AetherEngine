@@ -18,14 +18,25 @@ struct SubtitlePacketStoreTests {
         #expect(got == [10, 20])
     }
 
-    @Test("same-pts append replaces instead of duplicating (producer restart overlap)")
+    @Test("an EXACT same-pts duplicate append dedupes (producer restart overlap)")
     func dedupOnRestartOverlap() {
         let store = SubtitlePacketStore()
-        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: Data([1]))
+        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: Data([2, 2]))
         store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: Data([2, 2]))
         let got = store.entries(streamIndex: 3, from: 0, through: 100)
         #expect(got.count == 1)
         #expect(got[0].payload == Data([2, 2]))
+    }
+
+    @Test("distinct same-pts packets both survive (#4: not a restart-overlap replay)")
+    func distinctSamePtsBothSurvive() {
+        let store = SubtitlePacketStore()
+        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: Data([1]))
+        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: Data([2, 2]))
+        let got = store.entries(streamIndex: 3, from: 0, through: 100)
+        #expect(got.count == 2)
+        #expect(got.map(\.payload) == [Data([1]), Data([2, 2])])
+        #expect(Set(got.map(\.sequence)).count == 2)
     }
 
     @Test("prune drops entries strictly before the cutoff")
@@ -68,5 +79,70 @@ struct SubtitlePacketStoreTests {
         store.append(streamIndex: 0, ptsSeconds: pts, durationSeconds: dur, payload: data)
         store.clear()
         #expect(store.entries(streamIndex: 0, from: 0, through: 100).isEmpty)
+    }
+
+    // MARK: - Session-wide budget (#6)
+
+    @Test("session budget evicts an inactive bitmap stream first, protects the active + text streams")
+    func sessionBudgetEvictsInactiveBitmapFirst() {
+        let store = SubtitlePacketStore()
+        store.markBitmapStreams([10, 11, 13])   // 11 stays ACTIVE below; 12 is unmarked (text)
+        store.setActiveStreams([11])
+        // Four streams, one packet each, well under the PER-STREAM cap individually but 4x
+        // over the SESSION cap combined, isolating session-level eviction from per-stream eviction.
+        let chunk = Data(repeating: 0, count: SubtitlePacketStore.sessionByteCap / 4 + 1024)
+        store.append(streamIndex: 10, ptsSeconds: 1, durationSeconds: 1, payload: chunk)   // bitmap, inactive
+        store.append(streamIndex: 11, ptsSeconds: 1, durationSeconds: 1, payload: chunk)   // bitmap, ACTIVE
+        store.append(streamIndex: 12, ptsSeconds: 1, durationSeconds: 1, payload: chunk)   // unmarked (text)
+        store.append(streamIndex: 13, ptsSeconds: 1, durationSeconds: 1, payload: chunk)   // bitmap, inactive
+
+        let inactiveCounts = [10, 13].map { store.entries(streamIndex: $0, from: 0, through: 100).count }
+        #expect(inactiveCounts.filter { $0 == 0 }.count == 1, "exactly one inactive bitmap stream should be evicted")
+        #expect(store.entries(streamIndex: 11, from: 0, through: 100).count == 1, "active stream must keep its data")
+        #expect(store.entries(streamIndex: 12, from: 0, through: 100).count == 1, "text stream must never be session-evicted")
+    }
+
+    @Test("isBitmapStream reflects markBitmapStreams")
+    func bitmapClassification() {
+        let store = SubtitlePacketStore()
+        store.markBitmapStreams([2, 4])
+        #expect(store.isBitmapStream(2))
+        #expect(store.isBitmapStream(4))
+        #expect(!store.isBitmapStream(3))
+    }
+
+    // MARK: - Backscan anchors (#9)
+
+    @Test("nearestEntryPts finds the closest preceding packet regardless of distance")
+    func nearestEntryPtsUnbounded() {
+        let store = SubtitlePacketStore()
+        store.append(streamIndex: 4, ptsSeconds: 10, durationSeconds: 2, payload: Data([1]))
+        store.append(streamIndex: 4, ptsSeconds: 500, durationSeconds: 2, payload: Data([2]))
+        #expect(store.nearestEntryPts(streamIndex: 4, atOrBefore: 600) == 500)
+        #expect(store.nearestEntryPts(streamIndex: 4, atOrBefore: 50) == 10)
+        #expect(store.nearestEntryPts(streamIndex: 4, atOrBefore: 5) == nil)
+    }
+
+    private func pcsPayload(compositionState: UInt8) -> Data {
+        var body = [UInt8](repeating: 0, count: 11)
+        body[7] = compositionState   // offset 7 of the PCS body: 0x00 Normal, 0x40 Acquisition Point, 0x80 Epoch Start
+        var d = Data([0x16, 0x00, 0x0B])   // type=PCS, length=11
+        d.append(contentsOf: body)
+        return d
+    }
+
+    @Test("nearestPGSAnchorPts finds the nearest self-contained composition within the fallback window")
+    func nearestPGSAnchor() {
+        let store = SubtitlePacketStore()
+        store.append(streamIndex: 5, ptsSeconds: 10, durationSeconds: 1,
+                     payload: pcsPayload(compositionState: 0x40))   // acquisition point
+        store.append(streamIndex: 5, ptsSeconds: 40, durationSeconds: 1,
+                     payload: pcsPayload(compositionState: 0x00))   // normal delta
+        store.append(streamIndex: 5, ptsSeconds: 70, durationSeconds: 1,
+                     payload: pcsPayload(compositionState: 0x00))   // normal delta
+        // The deltas at 40/70 are not self-contained; the acquisition point at 10 is the nearest anchor.
+        #expect(store.nearestPGSAnchorPts(streamIndex: 5, atOrBefore: 75, fallbackWindow: 90) == 10)
+        // Outside the fallback window from a far-future playhead, no anchor is found.
+        #expect(store.nearestPGSAnchorPts(streamIndex: 5, atOrBefore: 200, fallbackWindow: 90) == nil)
     }
 }
