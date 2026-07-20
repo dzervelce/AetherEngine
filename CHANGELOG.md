@@ -10,6 +10,126 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [5.14.1] - 2026-07-20
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.14.1))
+
+### Fixed
+
+- **External PGS subtitle files (raw .sup sidecars, e.g. Jellyfin serving external PGS tracks) now load and render.** Two gaps compounded into a silent no-show on every path: FFmpegBuild lacked the `sup` demuxer (fixed in 2.1.3, now pinned), so `avformat_open_input` rejected the file with `AVERROR_INVALIDDATA`; and the sidecar decode loop extracted only text rects, dropping bitmap rects. The loop now routes bitmap rects through the embedded path's `imageForSubtitleRect` into `.image` cues with PGS end semantics (an open composition ends at the next composition event's PTS instead of a flat 5 s fallback). Also fixes the frame compositor's bitmap placement: `SubtitleImage.position` is normalized against its canvas, and the compositor treated it as absolute pixels. Covered by `SidecarPGSDecodeTests` (real .sup fixture, local-only) and the updated `SubtitleFrameCompositorTests`.
+
+## [5.14.0] - 2026-07-20
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.14.0))
+
+### Added
+
+- **Subtitles render inside sample-buffer PiP windows: the software path composites active cues into decoded frames while `pictureInPictureActive`.** The system PiP window renders only the display layer, so host-drawn overlays never reach it; a new `SubtitleFrameCompositor` caches one overlay per cue-set change (text cues in a readable default look via CoreText, bitmap cues width-aligned center-anchored per their PGS/DVB canvas) and GPU-composites it into a pooled buffer of the source pixel format inside the renderer's flush path. Outside PiP nothing changes (fullscreen subtitle drawing stays with the host); any compositing failure passes the original frame through. Covered by `SubtitleFrameCompositorTests` including a synthetic-buffer integration test.
+
+## [5.13.0] - 2026-07-20
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.13.0))
+
+### Added
+
+- **`SoftwarePiPSource`: a published sample-buffer PiP bridge for the software path.** Hosts building system PiP for SW-routed codecs (dav1d AV1/VP9 and friends) need the display layer plus transport answers on the enqueued frames' PTS axis (source axis); both are engine knowledge, so the engine now publishes `softwarePiPSource` (the `currentAVPlayer` analog) carrying the `AVSampleBufferDisplayLayer`, `timeRange()`, `isPaused`, `setPlaying(_:)`, and `skip(by:)`, with AVKit staying host-side. The background policy keeps SW video decoding alive while `pictureInPictureActive` (the window needs frames) instead of dropping to audio-only; without PiP, background behavior is unchanged. Covered by `SoftwarePiPSourceTests` and the extended `BackgroundKeepaliveTests`.
+
+## [5.12.0] - 2026-07-20
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.12.0))
+
+### Added
+
+- **A native->native load while a PiP window is active now hands the AVPlayerItem over in place, so system PiP survives next-episode transitions.** The load teardown dropped the running item to nil for the whole load gap (probe, demuxer, fresh loopback session), and the system closes a PiP window whose source layer's player loses its item; the #93 in-PiP recovery reload had already established the same failure mode and the `inPlaceSwap` fix for it. `load()` now computes `shouldHandOverItemInPlace(pipActive:priorBackendWasNative:)`, `stopInternal` defers the item detach (`keepCurrentItem`), and the loopback host.load callsite consumes the armed handover as `inPlaceSwap`: the old item keeps playing until `replaceCurrentItem` swaps in the ready master, transport intent latched. Audio-switch and recovery reloads keep their existing contracts (consume-and-reset). Covered by `PiPItemHandoverTests`. Host adoption: Sodalite re-enables next-episode auto-advance inside the tvOS PiP window. (#158)
+
+## [5.11.0] - 2026-07-20
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.11.0))
+
+### Added
+
+- **tvOS: an active PiP window now keeps the video pipeline and loopback server alive across backgrounding.** tvOS previously ran an unconditional video teardown on `didEnterBackground` (wedge-safe: a live decode session crossing a multi-hour suspension wedged mediaserverd system-wide), which killed a system PiP window the moment the user left the app. The background handler now consults the new `shouldKeepVideoAliveTV(enabled:pipActive:)` policy: only `pictureInPictureActive` (set by the host from its PiP delegate, now cross-platform) defers the teardown, and the flag's `didSet` runs the wedge-safe teardown immediately when the PiP window closes while still backgrounded, so nothing crosses an idle suspension. Without active PiP, tvOS background behavior is byte-identical to before; there is no grace window and no background-audio case on tvOS. Covered by `BackgroundKeepaliveTests`.
+
+## [5.10.0] - 2026-07-19
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.10.0))
+
+### Added
+
+- **A non-live remote HLS playlist handed to the default (loopback) path now plays, and its external WebVTT subtitle renditions surface as `subtitleTracks`.** The bundled FFmpeg is built with `--disable-network`, so its hls demuxer could never engage behind the custom I/O context (no extension / MIME hint reaches the probe) let alone fetch a variant; a remote VOD m3u8 died with a bare `AVERROR_INVALIDDATA`. The AVIOReader now classifies the `#EXTM3U` body on the non-live path too (typed `hlsPlaylistOnVODPath`, the #140 sibling) and `load()` reroutes the URL onto the `nativeRemoteHLS` bypass, where AVPlayer plays remote HLS natively; a VOD `startPosition` rides into the bypass as a resume seek (live callers keep the no-initial-seek contract). On the bypass the engine maps the item's legible `AVMediaSelectionGroup` onto `subtitleTracks` (synthetic ids, forced / SDH dispositions carried), `selectSubtitleTrack(index:)` / `clearSubtitle()` drive AVPlayer's media selection with the manual-criteria pin, AVPlayer renders the cues itself, and an AVKit / caption-preference auto-select is mirrored into `activeSubtitleTrackIndex` after readiness. Verified end-to-end against the reported WWDC CMAF stream (7 renditions surfaced, explicit select lands). Covered by `RemoteHLSMediaSelectionTests`. Reported by jihongboo (#154).
+
+## [5.9.7] - 2026-07-19
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.9.7))
+
+### Fixed
+
+- **`subtitleCues` now holds embedded cues up to the drainer's full 60 s lead window ahead of the playhead on VOD sessions, so a host-applied ADVANCE sync offset finds them, text and bitmap alike.** The #112 pump tap harvests subtitle packets only as far as the segment producer's forward park (#102), which on direct play sits a few seconds past AVPlayer's fetch position; the drainer's 60 s lead was an empty promise beyond that, a delay offset worked (300 s trailing retention) but an advance showed nothing or flashed cues in late. A VOD-only subtitle forward prefetcher (a subtitle-only side reader, all other streams discarded per #104) now fills the session `SubtitlePacketStore` to `playhead + 60 s` independent of the producer: parked on the subtitle PTS axis, re-anchored on seeks via the drain tick's jump detection, open deferred while a producer restart is in flight (#93), positioned under the shared bounded-seek + byte-estimate rules (#112 round 10). Split-PES PGS display sets assemble under a per-writer key so the pump's in-flight set is never corrupted; overlapping completed packets dedupe by PTS. Live sessions skip it (content past the edge does not exist), and it is best-effort: on open failure or wedge, behavior is exactly the tap-fed status quo. Covered by `Issue151SubtitleForwardPrefetchTests`. Reported by rrgomes (#151).
+
+## [5.9.6] - 2026-07-19
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.9.6))
+
+### Fixed
+
+- **Interlaced live H.264 whose demuxer field-order probe stays UNKNOWN now routes to the software deinterlace path instead of staying on native VideoToolbox decode with a persistent colour cast.** The #107 rule (interlaced H.264 goes software so bwdif can deinterlace; tvOS AVPlayer does not) keyed only off the demuxer's `field_order` probe, so a channel that is unambiguously interlaced at the bitstream level (SPS `frame_mbs_only_flag=0`) but probes `AV_FIELD_UNKNOWN` silently defeated the routing and rendered with a sustained green cast from the first frame. When the probe is inconclusive, the routing decision now parses the SPS from codecpar extradata (both Annex-B/MPEG-TS and avcC/MP4/MKV layouts) and treats `frame_mbs_only_flag=0` as interlaced. A concrete PROGRESSIVE probe (which analyzed actual frames) still wins over the SPS capability flag, and a false positive only pays an unnecessary software decode: the software decoder engages bwdif per frame from `AV_FRAME_FLAG_INTERLACED`, so progressive frames pass through untouched. The fallback logs `fieldOrder=UNKNOWN but SPS frame_mbs_only_flag=0; treating as interlaced for routing (#150)` when it fires. Covered by `VideoRoutingPolicyTests` and `H264SPSTests`. Reported by digilearn-dev (#150).
+
+## [5.9.5] - 2026-07-19
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.9.5))
+
+### Fixed
+
+- **A PGS display set carrying multiple composition objects at one start PTS (a forced sign plus dialogue, a common real-disc shape) now renders ALL its objects instead of collapsing to the last one; each object's forced flag is surfaced per cue.** The decoder already fanned N objects into N same-start image cues, but the retained store's same-start image replacement (#112) assumed "a PGS composition has a unique start PTS", true per composition, false per composition object, so each sibling replaced the previous before publish and only the last object survived (deterministic, no error; the only host-visible fingerprint was a gap in the session-monotonic cue ids). The replacement key now includes object geometry (normalized position + pixel size, deterministic across re-decodes via the alpha-bounding-box crop): a re-decode still replaces its placeholder twin, sibling objects are all kept, mirroring the text path's distinct-simultaneous-speakers rule. Same collapse one level up: the #112 reconstruction pass held a single candidate cue, so a multi-object landing set lost all but one object at seek time; the candidate is now the whole same-start group, with the #143 clear-trim applied per member.
+
+### Added
+
+- **Per-cue forced flag.** `AVSubtitleRect`'s `AV_SUBTITLE_FLAG_FORCED` (set by pgssubdec/dvdsubdec for forced captions) was never read; hosts could not distinguish a forced sign from dialogue. It now lands in `SubtitleImage.isForced` and surfaces per cue as `SubtitleCue.isForced` (source-compatible additions; track-level forcedness stays on `TrackInfo.isForced`). Covered by `Issue146PGSMultiObjectTests`. Reported by cmcpherson274 (#146).
+
+## [5.9.4] - 2026-07-19
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.9.4))
+
+### Fixed
+
+- **An MKV track carrying `TrackTimestampScale != 1` now demuxes on the coherent, unscaled segment axis (cluster + rel) instead of a silently wrong hybrid axis (cluster + rel x scale).** Inherited FFmpeg behavior (present in n8.1.2 and current master): `matroskadec` bakes the track's TrackTimestampScale into the stream time base but divides only the cluster component of each block timestamp by it. On the reporter's TTS=2.0 fixture, cue starts shifted by `relTs x (TTS - 1)` per cluster (12->14 s, 24.5->29 s), packets arrived non-monotonic in storage order (the 29 s cue before the 25 s clear), a stale fade outlived its authored clear, and packet durations ran at twice their authored length, all without any warning. Fixed at the FFmpeg layer: FFmpegBuild 2.1.2 (`patch_ffmpeg_matroska_tts`) clamps any non-1.0 scale to 1.0 with a warning carrying the ignored value, extending upstream's own `< 0.01` clamp. The element is deprecated (RFC 9559 caps it at Matroska v3) and most readers ignore it; full spec scaling would desync the track from its siblings, so the clamp keeps every track on the storage axis, in sync and monotonic, and a strict no-op for the TTS=1.0 world. Covered by `Issue145MatroskaTrackTimestampScaleTests` demuxing a synthetic in-memory Matroska through the engine. Reported by cmcpherson274 (#145).
+
+## [5.9.3] - 2026-07-19
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.9.3))
+
+### Fixed
+
+- **A seek landing mid-cue (or exactly on a display-set start boundary) on a PGS stream without acquisition points now re-shows the landing line, forced cues included, instead of leaving the overlay dark until the next authored composition.** The #112 reconstruction pass seeded its active-line candidate only from a self-contained composition (Acquisition Point / Epoch Start); on AP-less/sparse-authored streams every lead-in composition is Normal, so no candidate was ever seeded and the landing-span line was silently discarded, while successor cues re-emitted normally (on sparse dialogue the blackout ran tens of seconds). The candidate is now seeded from any successfully decoded composition behind the playhead; the drain decoder is rebuilt fresh at the backscan start, so a set with missing references fails decode and never reaches the gate, and the steady-state path already publishes Normal compositions unconditionally. Companion fix: `pgsTrimAt` (broadcast by every composition and clear) now also closes the reconstruction candidate's open placeholder window, so a line the author cleared before the playhead can no longer resurrect as the active line at pass end (a hole latent since #112 for acquisition-point content too). Covered by `Issue143PGSLandingLineTests`. Reported by cmcpherson274 (#143).
+
+## [5.9.2] - 2026-07-19
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.9.2))
+
+### Fixed
+
+- **A bare PGS Epoch-Continue display set (PCS+WDS+END, palette and objects referenced from retained decoder state, no PDS/ODS retransmit) now renders instead of being dropped whole with "Invalid palette id 0"; the predecessor cue no longer overstays.** Inherited FFmpeg behavior (present in n8.1.2 and current master): `pgssubdec` releases retained palettes/objects for ANY `composition_state != Normal`, including `0xC0` Epoch Continue, although Epoch Continue by definition continues the previous epoch across a connection point and a bare set legitimately references that state. The failed palette lookup discarded the set, and since PGS end times are closed by the successor cue, the prior cue's clear was delayed to the next cue (reporter's 90 s cue ran to the 100 s clear instead of the authored 95 s). Fixed at the FFmpeg layer: FFmpegBuild 2.1.1 (`patch_ffmpeg_pgssub`) skips the flush for Epoch Continue only; Acquisition Point and Epoch Start, self-contained restatements by spec, keep flushing. Covered by `Issue142PGSEpochContinueTests` driving the shipped decoder with synthetic display sets. Reported by cmcpherson274 (#142).
+
+## [5.9.1] - 2026-07-19
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.9.1))
+
+### Fixed
+
+- **A far-forward VOD seek above a retained scrub band no longer parks in 30 s serve timeouts into item death; the producer re-anchors at the target immediately.** Reported geometry: a scripted 600 s scrub left its segment band resident under the retention budget, the producer was later re-anchored at ~302 s, and a fourth seek targeted 640 s, just above the dead band's top. Two layers misread that. The segment server's forward-wait branch trusted the resident maximum as "the producer is about to write this" and parked the request for the target segment (three 30 s cache-miss timeouts; the third tore the connection into `-1017` / `failedToPlayToEndTime` item death and a stage-2 reload, correct target state only ~108 s after the seek command). And the 8 s seek-deadline path (#129) preserved the "progressing" producer because the old position still had forward buffer, blind to the target sitting ~330 s beyond what the march could reach inside the consumer's timeout budget. The forward-wait branch now keys on the active producer's write front (its high water since restart, or its anchor before the first write) instead of the resident maximum, so a request beyond the reachable window re-anchors the producer at once; and the seek-deadline backstop now also re-anchors a progressing producer whose march cannot reach the pending seek target (starvation is no longer the only trigger). Reported by cmcpherson274 (#141).
+
+## [5.9.0] - 2026-07-19
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.9.0))
+
+### Fixed
+
+- **Handing an HLS playlist (`.m3u8`) URL to `load(isLive:)` on the generic path no longer hangs forever with no error.** The documented HLS entry points (`LoadOptions.nativeRemoteHLS` and `HLSLiveIngestReader`) were bypassed, so the playlist URL routed onto the raw-byte live reader. A live origin serves the finite `#EXTM3U` body at HTTP 200 and closes the connection, which the endless-feed reader read as a dropped live stream and reconnected, re-fetching the same body forever. Those reconnects looked productive (a full body at 200, and every `find_stream_info` probe seek reset the unproductive-reconnect streak), so the reconnect give-up counters (#71) never tripped, `avformat_open_input` never returned, and `load()` sat at `.loading` with no terminal state (reporter saw 262 reconnect cycles over 5.75 minutes). The raw-byte reader now inspects the first bytes of a live source and fails closed when they are an HLS playlist tag (a raw media container never opens with `#`; TS syncs on `0x47`), before the reconnect loop is ever entered. Reported by cmcpherson274 (#140).
+
+### Added
+
+- **`AetherEngineError.hlsPlaylistOnRawLivePath`.** `load()` now throws this typed, catchable error (with an actionable `LocalizedError` description) when an `.m3u8` playlist is misrouted onto the raw live path, pointing the caller at `LoadOptions.nativeRemoteHLS` / `HLSLiveIngestReader` instead of looping silently.
+
 ## [5.8.9] - 2026-07-19
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.8.9))

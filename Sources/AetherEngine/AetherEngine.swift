@@ -206,10 +206,26 @@ public final class AetherEngine: ObservableObject {
     /// Exposed for diagnostic overlays; hosts should not branch on it.
     @Published public internal(set) var playbackBackend: PlaybackBackend = .none
 
-    /// iOS: master enable for background playback (PiP + background audio). Default on; no user setting yet.
+    /// Master enable for background playback (iOS: PiP + background audio; tvOS: PiP keepalive). Default on.
     public var backgroundPlaybackEnabled = true
-    /// iOS: set by the host from the AVKit PiP delegate; the keepalive policy + pause-safety read it.
-    public var pictureInPictureActive = false
+    /// Set by the host from its PiP delegate (iOS: AVKit; tvOS: host-built AVPictureInPictureController);
+    /// the keepalive policy + pause-safety read it.
+    public var pictureInPictureActive = false {
+        didSet {
+            // SW-PiP Phase C: flip the frame compositor with the PiP state so subtitles appear in the
+            // window and never double-draw under the fullscreen host overlay.
+            softwareHost?.updateSubtitleCompositor(cues: subtitleCues + secondarySubtitleCues, enabled: pictureInPictureActive)
+            #if os(tvOS)
+            // PiP window closed while backgrounded: nothing keeps the app running anymore, so run the
+            // wedge-safe teardown now, before idle suspension (mirrors the iOS pause-while-backgrounded path).
+            if oldValue && !pictureInPictureActive && isBackgrounded,
+               !audioAVPlayerActive, audioHost == nil, softwareHost == nil,
+               state == .playing || state == .paused {
+                Task { @MainActor in await self.teardownVideoForBackground() }
+            }
+            #endif
+        }
+    }
     /// #127: seconds a PAUSED session survives backgrounding (iOS) before the wedge-safe teardown runs,
     /// held under a background-task assertion so a quick app switch resumes without a pipeline rebuild.
     /// 0 restores the immediate teardown. Ignored on tvOS. Keep well under the ~30 s system allowance,
@@ -224,9 +240,18 @@ public final class AetherEngine: ObservableObject {
 
     /// #127: latest host seek issued while the native item was pre-ready; replayed at readiness.
     var pendingPreReadySeekSeconds: Double?
-    #if os(iOS)
-    /// True between didEnterBackground and didBecomeActive; gates the pause-while-backgrounded teardown.
+    /// AE#158: set by load() when the running item must survive until the new master attaches (PiP
+    /// next-episode handover); consumed and reset by the loopback host.load callsite (inPlaceSwap).
+    var pendingInPlaceItemHandover = false
+    /// SW-PiP bridge, the software-path analog of `currentAVPlayer`: set when a SW session has its
+    /// display layer, nil on teardown. Hosts build their sample-buffer PiP ContentSource from it.
+    @Published public internal(set) var softwarePiPSource: SoftwarePiPSource?
+    #if os(iOS) || os(tvOS)
+    /// True between didEnterBackground and didBecomeActive; gates the pause-while-backgrounded teardown
+    /// (iOS) and the PiP-closed-while-backgrounded teardown (tvOS).
     private var isBackgrounded = false
+    #endif
+    #if os(iOS)
     /// #127: pending grace-window teardown (sleep task + the background-task assertion holding it).
     private var backgroundGraceTask: Task<Void, Never>?
     private var backgroundGraceAssertion: UIBackgroundTaskIdentifier = .invalid
@@ -243,6 +268,34 @@ public final class AetherEngine: ObservableObject {
         enabled && (pipActive || state == .playing)
     }
 
+    /// tvOS keepalive: ONLY an active PiP window keeps the app genuinely running in the background (there
+    /// is no tvOS background-audio case for video sessions); everything else keeps the wedge-safe
+    /// unconditional teardown that protects mediaserverd across multi-hour suspensions.
+    nonisolated static func shouldKeepVideoAliveTV(enabled: Bool, pipActive: Bool) -> Bool {
+        enabled && pipActive
+    }
+
+    /// AE#158: a system PiP window closes the moment its source layer's player drops its item (the #93
+    /// in-PiP recovery reload hit the same nil-item gap), so a native->native load while PiP is active
+    /// keeps the old item attached through the load gap and swaps in place once the new master is ready.
+    nonisolated static func shouldHandOverItemInPlace(pipActive: Bool, priorBackendWasNative: Bool) -> Bool {
+        pipActive && priorBackendWasNative
+    }
+
+    /// SW-PiP: playable range for the sample-buffer PiP UI on the PTS axis of the enqueued frames
+    /// (the source axis; sourceTime = currentTime + container start offset). Live or unknown
+    /// duration reports indefinite so the window shows live UI instead of a bogus scrubber.
+    nonisolated static func softwarePiPTimeRange(isLive: Bool, sourceTime: Double, currentTime: Double, duration: Double) -> CMTimeRange {
+        guard !isLive, duration.isFinite, duration > 0 else {
+            return CMTimeRange(start: .negativeInfinity, duration: .positiveInfinity)
+        }
+        let sourceStart = sourceTime - currentTime
+        return CMTimeRange(
+            start: CMTime(seconds: sourceStart, preferredTimescale: 600),
+            duration: CMTime(seconds: duration, preferredTimescale: 600)
+        )
+    }
+
     /// What to do with the active video pipeline when the app enters the background. Pure so the lifecycle
     /// policy is unit-testable. Mirrors the spirit of the native keepalive onto the software path.
     enum BackgroundAction: Equatable {
@@ -251,15 +304,21 @@ public final class AetherEngine: ObservableObject {
         case teardownVideo           // release the video pipeline before idle suspension
     }
 
-    /// - keepVideoAlive: result of shouldKeepVideoAlive. Pass false on tvOS (the wedge-safe unconditional teardown).
+    /// - keepVideoAlive: result of shouldKeepVideoAlive / shouldKeepVideoAliveTV.
+    /// - pipActive: a live PiP window renders the SW layer's frames, so the SW host must keep
+    ///   decoding video in background instead of dropping to audio-only (SW-PiP Phase A).
     nonisolated static func backgroundAction(
         isAudioBackend: Bool,
         hasSoftwareHost: Bool,
         keepVideoAlive: Bool,
+        pipActive: Bool,
         state: PlaybackState
     ) -> BackgroundAction {
         if isAudioBackend { return .doNothing }
-        if keepVideoAlive { return hasSoftwareHost ? .enterSoftwareAudioOnly : .doNothing }
+        if keepVideoAlive {
+            if hasSoftwareHost { return pipActive ? .doNothing : .enterSoftwareAudioOnly }
+            return .doNothing
+        }
         guard state == .playing || state == .paused else { return .doNothing }
         return .teardownVideo
     }
@@ -332,6 +391,12 @@ public final class AetherEngine: ObservableObject {
     var softwareSubtitlePacketStore: SubtitlePacketStore?
     var subtitleDrainDecoders: [SubtitleChannel: EmbeddedSubtitleDecoder] = [:]
     var subtitleDrainCursors: [SubtitleChannel: SubtitleDrainCursor] = [:]
+    /// #151: subtitle-only forward side reader filling the session packet store up to
+    /// playhead + subtitleDrainLeadSeconds independent of the producer's forward park, so the
+    /// drainer's lead window holds cues for host-applied ADVANCE sync offsets (text and bitmap).
+    /// nil while idle (subs off, live session, EOF reached).
+    var subtitleForwardPrefetchTask: Task<Void, Never>?
+    var subtitleForwardPrefetchDemuxer: Demuxer?
     /// #121: session-monotonic id source for cues entering the retained overlay stores
     /// (`subtitleCues` / `secondarySubtitleCues`). The overlay decoder is rebuilt on every seek
     /// (`.resetAndDecode`), restarting its own `nextCueID` at zero, so decoder-local ids cannot stay
@@ -344,6 +409,7 @@ public final class AetherEngine: ObservableObject {
     nonisolated static let subtitleDrainBackscanSeconds: Double = 15
     nonisolated static let subtitleDrainJumpThresholdSeconds: Double = 2.5
     nonisolated static let subtitleDrainTickNanoseconds: UInt64 = 500_000_000
+    nonisolated static let subtitleForwardPrefetchParkPollNanoseconds: UInt64 = 500_000_000
 
     @Published public internal(set) var isLoadingSubtitles: Bool = false
     @Published public internal(set) var isSubtitleActive: Bool = false
@@ -771,6 +837,10 @@ public final class AetherEngine: ObservableObject {
 
     /// Whole-file decode tasks filling native stores for load-declared external tracks (#88).
     var externalNativeStoreFillTask: Task<Void, Never>? = nil
+
+    /// AE#154: publishes the remote-HLS bypass item's legible options as `subtitleTracks`.
+    /// Session-scoped; cancelled on load()/stop() alongside the other subtitle tasks.
+    var remoteHLSSubtitleDiscoveryTask: Task<Void, Never>? = nil
 
     /// Deferred lazy-reader start while a producer restart is in flight (#93 residual): the
     /// readers' side demuxer competed with the restart for the starved link. Cancelled by
@@ -1506,11 +1576,16 @@ public final class AetherEngine: ObservableObject {
         // registration survives the seam (issue #15). Captured before stopInternal resets playbackBackend;
         // the SW dispatch branch releases it if this source routes software.
         let priorBackendWasNative = (playbackBackend == .native)
+        // AE#158: while a PiP window is live, the running item must survive this load's teardown or the
+        // system closes the window; the loopback host.load callsite finishes the handover (inPlaceSwap).
+        let handOverInPlace = Self.shouldHandOverItemInPlace(pipActive: pictureInPictureActive,
+                                                             priorBackendWasNative: priorBackendWasNative)
+        pendingInPlaceItemHandover = handOverInPlace
         // #128 follow-up: preserve the previous session's display criteria across the load seam. Nil-ing it
         // here bounces the panel through SDR before apply() re-negotiates the same mode on video->video
         // reloads. Sessions that never reach apply() clear a stale criteria via loadDisplayCriteriaAction
         // (audio-only fast path, suppressed hosts); a load() that throws before routing leaves it for stop().
-        stopInternal(resetDisplayCriteria: false, keepNativeHost: priorBackendWasNative)
+        stopInternal(resetDisplayCriteria: false, keepNativeHost: priorBackendWasNative, keepCurrentItem: handOverInPlace)
         // #35/#93: a genuinely new item has not rendered yet; re-arm the cold-startup wedge suspension.
         // Scrub/seek/producer-restart never route through load(), so mid-stream #93 detection stays armed.
         hasRenderedFirstFrameMirror.set(false)
@@ -1559,6 +1634,8 @@ public final class AetherEngine: ObservableObject {
         activeSecondaryExternalSubtitleTrackID = nil
         externalNativeStoreFillTask?.cancel()
         externalNativeStoreFillTask = nil
+        remoteHLSSubtitleDiscoveryTask?.cancel()
+        remoteHLSSubtitleDiscoveryTask = nil
         stallRecoveryWindowUntil = .distantPast
         stallRecoveryReasserts = 0
         stallReengageTask?.cancel()
@@ -1643,6 +1720,7 @@ public final class AetherEngine: ObservableObject {
         // would strip the successor's abort handle.
         defer { if inFlightProbeDemuxer === probe { inFlightProbeDemuxer = nil } }
         var probeOpened = false
+        var probeFailure: Error?
         do {
             // Detach avformat_open_input + find_stream_info off @MainActor (~6 s on a slow CDN).
             // AetherEngine#10: a @MainActor async body without a suspension point blocks the main thread
@@ -1698,6 +1776,7 @@ public final class AetherEngine: ObservableObject {
             // Ownership transfers to loadNative/loadSoftware, which adopt the probe for reuse
             // or open fresh if the probe failed.
         } catch {
+            probeFailure = error
             EngineLog.emit("[AetherEngine] probe failed (\(error)); proceeding without criteria", category: .engine)
         }
 
@@ -1714,6 +1793,35 @@ public final class AetherEngine: ObservableObject {
         if case .custom = source, !probeOpened {
             state = .error("Failed to load: custom source probe failed")
             throw DemuxerError.openFailed(code: -1)
+        }
+
+        // AE#140: an HLS playlist URL misrouted onto the raw-byte live path. The AVIOReader detected the
+        // #EXTM3U body and failed closed instead of looping its endless-feed reconnect forever. Surface a
+        // typed, actionable rejection so the host routes m3u8 through LoadOptions.nativeRemoteHLS or
+        // HLSLiveIngestReader, not the generic isLive raw path.
+        if let readerError = probeFailure as? AVIOReaderError, case .hlsPlaylistOnRawLivePath = readerError {
+            state = .error("HLS playlist supplied to the raw live path. Use LoadOptions.nativeRemoteHLS or HLSLiveIngestReader for m3u8 sources.")
+            throw AetherEngineError.hlsPlaylistOnRawLivePath
+        }
+
+        // AE#154: a non-live HLS playlist on the loopback path. FFmpeg (--disable-network) can never
+        // demux it (see AVIOReaderError.hlsPlaylistOnVODPath); remote HLS is AVPlayer's native
+        // domain, so reroute this load onto the nativeRemoteHLS bypass instead of surfacing the
+        // former bare AVERROR_INVALIDDATA. loadedOptions flips so every downstream consumer
+        // (audio-tap reader selection, seek paths) sees a genuine remote-HLS session.
+        if RemoteHLSMediaSelection.shouldReroute(probeFailure: probeFailure, isCustomSource: isCustomSource),
+           case .url(let hlsURL) = source {
+            EngineLog.emit("[AetherEngine] AE#154: HLS playlist on the VOD loopback path; rerouting to the native remote-HLS bypass", category: .engine)
+            loadedOptions.nativeRemoteHLS = true
+            do {
+                try await loadRemoteHLS(url: hlsURL, options: loadedOptions, startPosition: startPosition)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                state = .error("Failed to load: \(error.localizedDescription)")
+                throw error
+            }
+            return nil
         }
 
         // Live fail-fast: a failed probe means the AVIOReader burned its full reconnect budget.
@@ -2014,10 +2122,30 @@ public final class AetherEngine: ObservableObject {
         // can deinterlace it; tvOS AVPlayer does not. Decision is pure and unit-tested in
         // VideoRoutingPolicyTests. deint=interlaced passes progressive frames through untouched, so a
         // mis-signalled progressive stream only pays an unnecessary SW decode, never a wrong deinterlace.
+        // #150: some live TS channels are interlaced at the SPS level (frame_mbs_only_flag=0) but the
+        // demuxer's field_order probe stays UNKNOWN, silently defeating the #107 rule; consult the SPS
+        // from codecpar extradata as the tie-breaker.
+        var spsIndicatesInterlaced = false
+        if detectedCodecID == AV_CODEC_ID_H264, detectedFieldOrder == AV_FIELD_UNKNOWN,
+           probeOpened,
+           let vStream = probe.stream(at: probe.videoStreamIndex),
+           let codecpar = vStream.pointee.codecpar,
+           let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
+            let bytes = Array(UnsafeBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
+            spsIndicatesInterlaced = VideoRoutingPolicy.spsIndicatesInterlaced(extradata: bytes)
+            if spsIndicatesInterlaced {
+                EngineLog.emit(
+                    "[AetherEngine] fieldOrder=UNKNOWN but SPS frame_mbs_only_flag=0; "
+                    + "treating as interlaced for routing (#150)",
+                    category: .engine
+                )
+            }
+        }
         var useSoftwarePath = VideoRoutingPolicy.requiresSoftwarePath(
             codecID: detectedCodecID,
             fieldOrder: detectedFieldOrder,
-            av1Available: VTCapabilityProbe.av1Available
+            av1Available: VTCapabilityProbe.av1Available,
+            spsIndicatesInterlaced: spsIndicatesInterlaced
         )
         // #2: an H.264 / HEVC format AVPlayer accepts at the HLS CODECS level but VideoToolbox can't
         // hardware-decode (H.264 High 4:2:2/4:4:4/High-10, HEVC Rext on Intel Macs / older Apple TV) reaches
@@ -2444,17 +2572,28 @@ public final class AetherEngine: ObservableObject {
                 }
                 let wasStarved = seekIsWedged(
                     renderedTime: avpReal, bufferedEnd: host.bufferedEnd)
+                // AE#141: a progressing producer is only worth preserving when its march can
+                // actually deliver the pending target. A far-forward target beyond coverage
+                // (640 s target, march at ~316 s) rides 3x30 s serve timeouts into item death
+                // if left to "land late"; the old-position buffer health cannot see that.
+                let targetBeyondCoverage: Bool = {
+                    guard let target = pendingRecoverySeekClockTarget,
+                          let session = nativeVideoSession else { return false }
+                    return !session.producerCoversPlaylistTime(target)
+                }()
+                let needsReanchor = Self.shouldReanchorProducerAfterSeekDeadline(
+                    isStarved: wasStarved, targetBeyondProducerCoverage: targetBeyondCoverage)
                 nativeClockSeconds = avpReal
                 // currentTime on the 0-based display axis (AE#105 origin); sourceTime stays source PTS for subs.
                 clock.currentTime = PresentationAxis.display(sourcePTS: avpReal + playlistShiftSeconds,
                                                              origin: sourcePresentationOrigin)
                 clock.sourceTime = avpReal + playlistShiftSeconds
                 setProgrammaticSeek(inFlight: false, target: nil)
-                reconcileNativeSeekTransport(host: host, isStarved: wasStarved)
+                reconcileNativeSeekTransport(host: host, isStarved: needsReanchor)
                 let recoveryAnchor = Self.recoveryAnchorPosition(
                     frozenPosition: avpReal, pendingSeekTarget: pendingRecoverySeekClockTarget,
                     currentRendered: avpReal)
-                if Self.shouldReanchorProducerAfterSeekDeadline(isStarved: wasStarved) {
+                if needsReanchor {
                     reanchorProducerToPlaylistTime(recoveryAnchor)
                     // The playhead will jump when the restarted producer lets the pending seek land.
                     reanchorSubtitleOverlays()
@@ -2463,12 +2602,17 @@ public final class AetherEngine: ObservableObject {
                 // pendingRecoverySeekClockTarget deliberately survives this reconcile: the UI
                 // clock gives up the phantom target, but recovery keeps aiming there until rendered
                 // output reaches it or organic playback proves AVPlayer abandoned the seek.
+                let reason = wasStarved
+                    ? "starved"
+                    : (targetBeyondCoverage
+                        ? "old position still buffered, target beyond producer coverage"
+                        : "old position still buffered")
                 EngineLog.emit(
                     "[AetherEngine] seek did not land within \(Self.nativeSeekReconcileBudgetSeconds)s "
-                    + "(\(wasStarved ? "starved" : "old position still buffered"), "
+                    + "(\(reason), "
                     + "rendered=\(String(format: "%.2f", avpReal))s "
                     + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); reconciled clock"
-                    + (wasStarved
+                    + (needsReanchor
                         ? " and re-anchored producer at \(String(format: "%.2f", recoveryAnchor))s"
                         : " without restarting the progressing producer"),
                     category: .engine
@@ -2536,8 +2680,12 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
-    nonisolated static func shouldReanchorProducerAfterSeekDeadline(isStarved: Bool) -> Bool {
-        isStarved
+    /// #129 kept a progressing producer at the seek deadline (restarting discards useful fill);
+    /// AE#141 narrows that: preservation only pays when the march can reach the pending target.
+    nonisolated static func shouldReanchorProducerAfterSeekDeadline(
+        isStarved: Bool, targetBeyondProducerCoverage: Bool
+    ) -> Bool {
+        isStarved || targetBeyondProducerCoverage
     }
 
     nonisolated static func shouldCatchUpDeadlineLanding(
@@ -2579,6 +2727,8 @@ public final class AetherEngine: ObservableObject {
         activeSecondaryExternalSubtitleTrackID = nil
         externalNativeStoreFillTask?.cancel()
         externalNativeStoreFillTask = nil
+        remoteHLSSubtitleDiscoveryTask?.cancel()
+        remoteHLSSubtitleDiscoveryTask = nil
         // Font attachments are session-scoped but must survive stopInternal (audio-track-switch skips the probe;
         // clearing in stopInternal would leave the session with an empty font list after any audio switch).
         fontAttachments = []
@@ -2886,7 +3036,7 @@ public final class AetherEngine: ObservableObject {
     ///   never settles and burns the full settle timeout (~12 s of
     ///   black-screen latency per audio switch on the old fixed 5 s
     ///   poll; capped at ~2 s since #117, but still worth skipping).
-    func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false) {
+    func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false, keepCurrentItem: Bool = false) {
         // Bump generation to invalidate in-flight load() checkpoints.
         loadGeneration &+= 1
         resumeAfterInterruption = false
@@ -2908,7 +3058,12 @@ public final class AetherEngine: ObservableObject {
         liveTelemetrySampler = nil
         diagnostics.liveTelemetry = nil
         nativeCancellables.removeAll()
-        nativeHost?.tearDown()
+        // AE#158: keepCurrentItem defers the item detach to the next host.load(inPlaceSwap:) so a
+        // system PiP window never sees a nil-item gap across a native->native load. Only meaningful
+        // together with keepNativeHost; load() computes it via shouldHandOverItemInPlace.
+        if !keepCurrentItem {
+            nativeHost?.tearDown()
+        }
         if !keepNativeHost {
             nativeHost = nil
             currentAVPlayer = nil
@@ -2932,6 +3087,7 @@ public final class AetherEngine: ObservableObject {
 
         softwareCancellables.removeAll()
         softwareHost?.stop()
+        softwarePiPSource = nil
         softwareHost = nil
 
         // Clear audioHost so music<->video handoffs start from a clean slate; the engine is a process-wide
@@ -3047,19 +3203,25 @@ public final class AetherEngine: ObservableObject {
                 self.isBackgrounded = true
                 // Keep the video pipeline alive for PiP / background audio while the app stays running.
                 // Wedge-safe: a pause while backgrounded tears down via pause() below, so nothing crosses
-                // an idle suspension. tvOS keeps the unconditional teardown.
+                // an idle suspension.
                 let keepAlive = Self.shouldKeepVideoAlive(enabled: self.backgroundPlaybackEnabled,
                                                           pipActive: self.pictureInPictureActive,
                                                           state: self.state)
                 let supportsGrace = true
                 #else
-                let keepAlive = false  // tvOS: wedge-safe unconditional teardown
+                self.isBackgrounded = true
+                // tvOS: only an active PiP window defers the wedge-safe teardown (the system keeps the app
+                // running while its PiP window lives); no grace window, no background-audio case. The
+                // pictureInPictureActive didSet tears down the moment PiP ends while still backgrounded.
+                let keepAlive = Self.shouldKeepVideoAliveTV(enabled: self.backgroundPlaybackEnabled,
+                                                            pipActive: self.pictureInPictureActive)
                 let supportsGrace = false
                 #endif
                 let action = Self.backgroundAction(
                     isAudioBackend: self.audioAVPlayerActive || self.audioHost != nil,
                     hasSoftwareHost: self.softwareHost != nil,
                     keepVideoAlive: keepAlive,
+                    pipActive: self.pictureInPictureActive,
                     state: self.state
                 )
                 switch Self.backgroundStep(
@@ -3082,20 +3244,20 @@ public final class AetherEngine: ObservableObject {
             }
         }
         lifecycleObservers.append(bgObserver)
-        #if os(iOS)
         let fgObserver = nc.addObserver(
             forName: UIApplication.didBecomeActiveNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
+                #if os(iOS)
                 self.cancelBackgroundGraceWindow()
                 self.softwareHost?.exitBackgroundAudioOnly()
+                #endif
                 self.isBackgrounded = false
             }
         }
         lifecycleObservers.append(fgObserver)
-        #endif
 
         // Foreign-session interruption handling (Sodalite device-verify 2026-07-15): a live-camera
         // PiP re-claims the audio session on every play() and the system pauses AVPlayer ~10ms after
@@ -3263,6 +3425,7 @@ public final class AetherEngine: ObservableObject {
             isAudioBackend: audioAVPlayerActive || audioHost != nil,
             hasSoftwareHost: softwareHost != nil,
             keepVideoAlive: keepAlive,
+            pipActive: pictureInPictureActive,
             state: state
         )
     }
@@ -3272,7 +3435,19 @@ public final class AetherEngine: ObservableObject {
 
 // MARK: - Errors
 
-public enum AetherEngineError: Error {
+public enum AetherEngineError: Error, LocalizedError {
     case noVideoStream
     case noAudioStream
+    /// AE#140: an HLS playlist URL (m3u8) was handed to `load(isLive:)` on the generic raw-byte path.
+    /// Route m3u8 sources through `LoadOptions.nativeRemoteHLS` or `HLSLiveIngestReader` instead.
+    case hlsPlaylistOnRawLivePath
+
+    public var errorDescription: String? {
+        switch self {
+        case .noVideoStream: return "No video stream in source"
+        case .noAudioStream: return "No audio stream in source"
+        case .hlsPlaylistOnRawLivePath:
+            return "HLS playlist supplied to the raw live path. Use LoadOptions.nativeRemoteHLS or HLSLiveIngestReader for m3u8 sources."
+        }
+    }
 }

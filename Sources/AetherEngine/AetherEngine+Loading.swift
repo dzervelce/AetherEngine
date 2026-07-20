@@ -128,7 +128,9 @@ extension AetherEngine {
     }
 
     /// Lean native-HLS live path: AVPlayerItem from the remote URL on the reused NativeAVPlayerHost. No Demuxer, no HLSVideoEngine, no loopback, no display-criteria handshake (AVKit drives match-content). Live-window surfaces come from `host.seekableEnd`.
-    func loadRemoteHLS(url: URL, options: LoadOptions) async throws {
+    /// `startPosition` (AE#154): resume anchor for VOD playlists on the loopback reroute; nil keeps
+    /// the historical no-initial-seek behavior every live caller relies on.
+    func loadRemoteHLS(url: URL, options: LoadOptions, startPosition: Double? = nil) async throws {
         playbackBackend = .native
 
         let host: NativeAVPlayerHost
@@ -215,14 +217,20 @@ extension AetherEngine {
         // User-Agent / Authorization headers, so LoadOptions.httpHeaders rides into the AVURLAsset (#119).
         // forwardBufferDuration: 0 = system-adaptive; the 4 s VOD floor caused a 3-4 s black screen on live startup.
         host.load(url: url,
-                  startPosition: nil,
+                  startPosition: startPosition,
                   perFrameHDR: true,
-                  skipInitialSeek: true,
+                  // AE#154: a VOD resume anchor seeks; nil keeps the live no-initial-seek contract.
+                  skipInitialSeek: startPosition == nil,
                   forwardBufferDuration: 0,
                   // This lean path has no live-reopen / readiness watchdog; let AVPlayer's "gave up"
                   // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
                   surfaceEndFailures: true,
                   httpHeaders: options.httpHeaders)
+
+        // AE#154: surface the item's legible AVMediaSelectionGroup as `subtitleTracks` so hosts with
+        // their own picker see the external WebVTT renditions AVPlayer renders on this bypass.
+        // Selection routes back through `selectSubtitleTrack(index:)` / `clearSubtitle()`.
+        publishRemoteHLSSubtitleTracks(host: host)
 
         // VOD path triggers play() at the tail of load(); this lean path early-returns, so self-start here. AVKit drives match-content; automaticallyWaitsToMinimizeStalling handles play-before-ready. Without this call the item reaches readyToPlay but timeControlStatus stays .paused.
         // State stays .loading; flips to .playing only when timeControlStatus sink sees AVPlayer rendering.
@@ -838,11 +846,16 @@ extension AetherEngine {
         // forwardBufferDuration default (4 s): deep buffer lets AVPlayer race to the live edge and hit the transcode warm-up gap head-on (-12888); 4 s PACES consumption. Verified: 8 s worsened startup pause (8-10 s vs ~1 s).
         // Live REJOIN: skip initial seek so AVPlayer picks edge-minus-holdback instead; seek-to-0 against the re-served backlog wedged the reloaded item in waitingToPlay (device repro: tvOS 26, Jellyfin stream.ts). See LiveReloadPolicy.
         lastNativeVideoStartPosition = startPosition ?? 0
+        // AE#158: consume-and-reset so only the load() that armed the handover swaps in place; audio-switch
+        // and recovery reloads keep their own contracts.
+        let inPlaceHandover = pendingInPlaceItemHandover
+        pendingInPlaceItemHandover = false
         host.load(url: playbackURL,
                   startPosition: startPosition,
                   perFrameHDR: true,
                   skipInitialSeek: LiveReloadPolicy.skipInitialSeek(
-                      isLive: isLive, isRejoin: liveRejoin))
+                      isLive: isLive, isRejoin: liveRejoin),
+                  inPlaceSwap: inPlaceHandover)
         forceNativeLegibleDeselectedUntilHostSelects()
     }
 
@@ -898,6 +911,17 @@ extension AetherEngine {
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
+        // SW-PiP: publish the bridge once the session owns its layer (the layer object is stable for
+        // the session; the host attaches it to the view and, on PiP start, to the system window).
+        softwarePiPSource = SoftwarePiPSource(layer: host.displayLayer, isLive: isLive, engine: self)
+        // SW-PiP Phase C: mirror the published cues (primary + secondary) into the renderer's frame
+        // compositor; the PiP flag gates actual drawing (fullscreen stays host-overlay-only).
+        Publishers.CombineLatest($subtitleCues, $secondarySubtitleCues)
+            .sink { [weak self, weak host] primary, secondary in
+                guard let self, let host else { return }
+                host.updateSubtitleCompositor(cues: primary + secondary, enabled: self.pictureInPictureActive)
+            }
+            .store(in: &softwareCancellables)
         // #131: no demuxable CC track on the SW path either: arm an A53 tap fed by decoded-frame
         // side data. Same lazy synthetic-track surfacing as the producer path.
         // Same synthetic-entry exclusion as setupClosedCaptionTapIfNeeded (via `demuxableClosedCaptionTrack`):
