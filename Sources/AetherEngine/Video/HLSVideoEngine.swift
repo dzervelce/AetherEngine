@@ -57,6 +57,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// master-playlist routing is safe regardless of `matchContentEnabled` (AetherEngine#4).
     private let panelIsInHDRMode: Bool
 
+    /// EXPLICIT host policy (LoadOptions.panelIsPreconfiguredForDolbyVision): the Apple TV's base
+    /// format is DV, so retained-DV routes need no mode transition. The ONLY authorizer of dvh1
+    /// primary / SUPPLEMENTAL signaling — hardware DV capability alone is NOT sufficient (mid-
+    /// session entry into DV renders black on real panels with no error to fall back on).
+    let panelPreconfiguredDV: Bool
+
     /// `dvModeAvailable || keepDvh1TagWithoutDV`; DV routing branches key off this.
     var effectiveDvMode: Bool { dvModeAvailable || keepDvh1TagWithoutDV }
 
@@ -516,6 +522,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         keepDvh1TagWithoutDV: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
+        panelPreconfiguredDV: Bool = false,
         audioSourceStreamIndexOverride: Int32? = nil,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLiveSession: Bool = false,
@@ -539,6 +546,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
+        self.panelPreconfiguredDV = panelPreconfiguredDV
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
         self.audioBridgeMode = audioBridgeMode
         self.isLiveSession = isLiveSession
@@ -1252,12 +1260,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #15: a SUBTITLES rendition lives only in a master; the pure decision below forces the
         // master for routing-safe subtitled sources so PiP can show subtitles.
         let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
+        // Routes that RETAIN DV under the explicit preconfigured-DV policy (P5 always retains;
+        // P8.1/P8.4 retain only under the policy — see CodecRoutePolicy). The panel already sits
+        // in DV, so the master serves unconditionally; EDR/latch probes are proven liars here.
+        let retainedDVForced = panelPreconfiguredDV && effectiveDvMode
+            && (dvVariant == .profile5 || dvVariant == .profile81 || dvVariant == .profile84)
         let useMasterPlaylist = Self.resolveUseMasterPlaylist(
             videoRange: videoRange, effectiveDvMode: effectiveDvMode,
             panelIsInHDRMode: panelIsInHDRMode, displaySupportsHDR: displaySupportsHDR,
             hasNativeSubs: hasNativeSubs,
             builtInPanelEngagesOnDemand: Self.builtInPanelEngagesOnDemand,
-            frameRateKnown: frameRate != nil)
+            frameRateKnown: frameRate != nil,
+            forceMasterForRetainedDV: retainedDVForced)
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL
             : srv.mediaPlaylistURL
@@ -1266,7 +1280,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "server URL not ready")
         }
         self.servingMasterPlaylist = useMasterPlaylist
-        EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(videoRange != .sdr || effectiveDvMode) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant))")
+        EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) preconfiguredDV=\(panelPreconfiguredDV) retainedDVForced=\(retainedDVForced) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(videoRange != .sdr || effectiveDvMode) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant))")
         return url
     }
 
@@ -1314,7 +1328,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         displaySupportsHDR: Bool,
         hasNativeSubs: Bool,
         builtInPanelEngagesOnDemand: Bool,
-        frameRateKnown: Bool
+        frameRateKnown: Bool,
+        forceMasterForRetainedDV: Bool = false
     ) -> Bool {
         let sourceIsHDR = videoRange != .sdr || effectiveDvMode
         let panelReadyForHDR = panelIsInHDRMode
@@ -1322,6 +1337,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #130: a PQ/HLG master without FRAME-RATE is unloadable regardless of panel state.
         let masterManifestViable = (videoRange == .sdr) || frameRateKnown
         guard masterManifestViable else { return false }
+        // Preconfigured-DV policy: the panel already sits in DV, and EDR/latch probes are proven
+        // unreliable — a retained-DV route serves the master unconditionally (frame-rate guard
+        // above still applies). AVKit derives its criteria from it as the sole writer.
+        if forceMasterForRetainedDV { return true }
         // Gate on the ACTUAL videoRange, not sourceIsHDR: sourceIsHDR is inflated by
         // effectiveDvMode (a device DV capability) even for SDR content, which wrongly sent SDR
         // sources on DV-capable devices to media-direct, so the WebVTT rendition never appeared (#15).
@@ -1351,7 +1370,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     static func presentedPlainHDRBase(
         codecpar: UnsafePointer<AVCodecParameters>,
         codecID: AVCodecID,
-        effectiveDvMode: Bool
+        effectiveDvMode: Bool,
+        panelPreconfiguredDV: Bool
     ) -> VideoFormat? {
         guard codecID != AV_CODEC_ID_AV1 else { return .sdr }
         let plainBase: VideoFormat
@@ -1366,10 +1386,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         let profile = Int(record.dv_profile)
         let compat = Int(record.dv_bl_signal_compatibility_id)
-        if profile == 5 { return nil }                               // always dvh1 primary
-        if profile == 8, compat == 1, effectiveDvMode { return nil }  // P8.1 direct DV on a DV panel
-        // P7 routes hvc1-primary (+SUPPLEMENTAL on DV panels) — its PQ base IS the plain base.
-        return plainBase                                              // 7, 8.2, 8.4, non-DV P8.1, HDR10/HLG/SDR
+        // Retained-DV routes (never preflighted) exist ONLY under the explicit preconfigured-DV
+        // policy; without it P8.1/P8.4 present their stripped HDR10/HLG base. P5 has no
+        // compatible base, so it never gets a plain-HDR preflight either way.
+        if profile == 5 { return nil }
+        if profile == 8, compat == 1, effectiveDvMode, panelPreconfiguredDV { return nil }
+        if profile == 8, compat == 4, effectiveDvMode, panelPreconfiguredDV { return nil }
+        return plainBase                                              // 7, 8.2, stripped P8.1/P8.4, HDR10/HLG/SDR
     }
 
     /// Standalone DOVIDecoderConfigurationRecord read for `presentedPlainHDRBase`, which runs before an

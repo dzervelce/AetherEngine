@@ -327,9 +327,14 @@ extension HLSVideoEngine {
             // Non-DV panel: strip dvvC (hvc1 + dvvC trips -11868 even without SUPPLEMENTAL, 2026-05-26).
             // "P8.6" malformed compat (#53): rewriteDoviConfigTo81 normalizes container to compat=1;
             //   on non-DV panel the strip path handles it without rewrite.
+            // Retained direct DV requires the EXPLICIT preconfigured-DV policy, not mere hardware
+            // capability: entering DV mid-session renders black on real panels (healthy playback,
+            // no error, unfallbackable — device-refuted 2026-07-19). Without the policy the
+            // stripped HDR10 base plays instead.
+            let retainDV = effectiveDvMode && panelPreconfiguredDV
             let compat = Int(dvRecord?.dv_bl_signal_compatibility_id ?? 1)
             let needsCompatRewrite = compat != 1
-            if needsCompatRewrite && effectiveDvMode {
+            if needsCompatRewrite && retainDV {
                 EngineLog.emit(
                     "[HLSVideoEngine] HEVC DV Profile 8 with invalid compat="
                     + "\(compat) (\"P8.6\"); normalizing container dvcC to "
@@ -337,7 +342,7 @@ extension HLSVideoEngine {
                     category: .session
                 )
             }
-            if effectiveDvMode {
+            if retainDV {
                 return CodecRoute(
                     codecTagOverride: "dvh1",
                     videoRange: .pq,
@@ -364,9 +369,11 @@ extension HLSVideoEngine {
             // DV panel: hvc1 + dvvC + SUPPLEMENTAL dvh1.08.XX/db4h. db4h marks HLG-base for AVKit criteria.
             // Non-DV panel: strip dvvC (same -11868 risk as P8.1). Plain HLG plays + tonemaps on all panels.
             // Note: dvh1 sample entry is never valid for HLG-base (AVPlayer rejects it, DrHurt#4 Build 160).
+            // Retained DV requires the explicit preconfigured-DV policy (same black-output class
+            // as P8.1; this branch is additionally UNTESTED on device — see policy DAG 2026-07-19).
             let supplemental: String?
             let strip: Bool
-            if effectiveDvMode {
+            if effectiveDvMode && panelPreconfiguredDV {
                 supplemental = "dvh1.08.\(dvLevelStr)/db4h"
                 strip = false
             } else {

@@ -242,6 +242,7 @@ extension AetherEngine {
         keepDvh1TagWithoutDV: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
+        panelIsPreconfiguredForDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
         dvrWindowSeconds: Double? = nil,
@@ -262,6 +263,7 @@ extension AetherEngine {
             keepDvh1TagWithoutDV: keepDvh1TagWithoutDV,
             matchContentEnabled: matchContentEnabled,
             panelIsInHDRMode: panelIsInHDRMode,
+            panelPreconfiguredDV: panelIsPreconfiguredForDolbyVision,
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
             audioBridgeMode: audioBridgeMode,
             isLiveSession: isLive,
@@ -1308,7 +1310,8 @@ extension AetherEngine {
                     matchContentEnabled: loadedOptions.matchContentEnabled,
                     // Latch-aware: the original snapshot predates the pre-switch (EDR read false on
                     // this panel), so a bare re-use would route this reload to media and revert.
-                    panelIsInHDRMode: loadedOptions.panelIsInHDRMode || panelHDRRouteReady,
+                    panelIsInHDRMode: loadedOptions.panelIsInHDRMode || plainHDRRouteReady,
+                    panelIsPreconfiguredForDolbyVision: loadedOptions.panelIsPreconfiguredForDolbyVision,
                     audioBridgeMode: loadedOptions.audioBridgeMode,
                     // isLive required: without it the reload rebuilds as VOD and HLSVideoEngine fails "cannot build segment plan" (device repro: KiKA).
                     isLive: loadedOptions.isLive,

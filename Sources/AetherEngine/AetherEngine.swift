@@ -521,7 +521,7 @@ public final class AetherEngine: ObservableObject {
     /// master route trusts the write and lets AVPlayer's master-rejection fallback be the empirical
     /// verifier. Survives internal reloads (audio switch / next episode re-supply a false EDR snapshot);
     /// cleared on final teardown, background teardown (HDMI reacquisition), and a definitive SDR probe.
-    var panelHDRRouteReady = false
+    var plainHDRRouteReady = false
     /// Source-scoped rejection memo: -11868/-11848 can be source/codec-specific, so only the rejected
     /// URL skips future pre-switches — not the whole process.
     private var rangeRejectedSourceURL: URL?
@@ -955,7 +955,7 @@ public final class AetherEngine: ObservableObject {
         // The optimistic HDR route was empirically refuted for THIS source: drop the latch, publish
         // the truthful SDR outcome, and memo the URL (range rejections can be source/codec-specific;
         // -1002 is a transport failure, never a range refusal).
-        panelHDRRouteReady = false
+        plainHDRRouteReady = false
         videoFormat = .sdr
         if MasterFallbackDecision.isDisplayRejectionCode(rejection.code) {
             rangeRejectedSourceURL = loadedURL
@@ -1089,7 +1089,7 @@ public final class AetherEngine: ObservableObject {
                 }
                 masterFallbackUsed = true
                 // Readiness-gate media fallback: the optimistic HDR route didn't materialize.
-                panelHDRRouteReady = false
+                plainHDRRouteReady = false
                 videoFormat = .sdr
                 session.markServingMediaAfterFallback()
                 nativeSubtitleRenditionsServed = false
@@ -1681,14 +1681,16 @@ public final class AetherEngine: ObservableObject {
                 plainHDRPresentedBase = HLSVideoEngine.presentedPlainHDRBase(
                     codecpar: stream.pointee.codecpar,
                     codecID: detectedCodecID,
-                    effectiveDvMode: Self.displayCapabilities.supportsDolbyVision || options.keepDvh1TagWithoutDV
+                    effectiveDvMode: Self.displayCapabilities.supportsDolbyVision || options.keepDvh1TagWithoutDV,
+                    panelPreconfiguredDV: options.panelIsPreconfiguredForDolbyVision
                 )
                 detectedVideoBitrate = probe.declaredBitrate(stream: stream)
                 lastDetectedVideoCodec = detectedCodecID
+                // The preflight target IS the presented plain base — retained-DV routes (nil here)
+                // must NEVER be preflighted: writing an HDR10 criterion first forces a mid-session
+                // HDR→DV transition, which renders black on real panels (device-refuted twice; the
+                // old synthetic `?? .hdr10` fallback even bounced a DV-idling panel OUT of DV).
                 hdrCompatibilityPreflightBase = plainHDRPresentedBase
-                    ?? ((detectedFormat == .dolbyVision)
-                        && (Self.displayCapabilities.supportsDolbyVision || options.keepDvh1TagWithoutDV)
-                        ? .hdr10 : nil)
             }
             probedAudioTracks = probe.audioTrackInfos()
             probedSubtitleTracks = probe.subtitleTrackInfos()
@@ -1893,7 +1895,7 @@ public final class AetherEngine: ObservableObject {
             }
         case .clearStale:
             if let base = hdrCompatibilityPreflightBase, base != .sdr,
-               !(options.panelIsInHDRMode || panelHDRRouteReady),
+               !(options.panelIsInHDRMode || plainHDRRouteReady),
                rangeRejectedSourceURL != url,
                options.matchContentEnabled,
                Self.displayCapabilities.supportsHDR {
@@ -1936,9 +1938,9 @@ public final class AetherEngine: ObservableObject {
                         }
                         try checkLoadCurrent(gen)
                     }
-                    panelHDRRouteReady = true
+                    plainHDRRouteReady = true
                 case .unchanged:
-                    panelHDRRouteReady = true
+                    plainHDRRouteReady = true
                 case .applied:
                     // Also covers "Match Content disabled" / no window / format-description failure —
                     // no criterion was negotiated, so the route must not latch.
@@ -1970,23 +1972,23 @@ public final class AetherEngine: ObservableObject {
         //      and HLSVideoEngine master-vs-media routing so they stay in step.
         //
         //      Suppressed-criteria hosts route off the caller's snapshot OR the optimistic
-        //      `panelHDRRouteReady` latch (a successfully written pre-switch criterion) OR a live
+        //      `plainHDRRouteReady` latch (a successfully written pre-switch criterion) OR a live
         //      headroom read. Headroom is corroborating, never gating — this panel reads 1.00 while
         //      physically in HDR; AVPlayer's master-rejection fallback verifies the optimistic route.
         let panelHDRAfterHandshake: Bool
         if options.suppressDisplayCriteria {
             panelHDRAfterHandshake = options.panelIsInHDRMode
-                || panelHDRRouteReady
+                || plainHDRRouteReady
                 || displayCriteria.currentPanelIsHDR()
         } else {
             panelHDRAfterHandshake = displayCriteria.currentPanelIsHDR()
         }
         if options.suppressDisplayCriteria, panelHDRAfterHandshake, effectiveFormat != .sdr {
-            panelHDRRouteReady = true
+            plainHDRRouteReady = true
         }
         if effectiveFormat == .sdr {
             // A definitive SDR source must not leave a stale HDR-ready claim for a later HDR load.
-            panelHDRRouteReady = false
+            plainHDRRouteReady = false
         }
         #if os(iOS)
         // The iPhone built-in display has no HDMI Match-Content handshake; it renders HDR/DV natively
@@ -2116,6 +2118,7 @@ public final class AetherEngine: ObservableObject {
                     keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,
                     matchContentEnabled: options.matchContentEnabled,
                     panelIsInHDRMode: panelHDRAfterHandshake,
+                    panelIsPreconfiguredForDolbyVision: options.panelIsPreconfiguredForDolbyVision,
                     audioBridgeMode: options.audioBridgeMode,
                     isLive: options.isLive,
                     dvrWindowSeconds: options.dvrWindowSeconds,
@@ -2955,7 +2958,7 @@ public final class AetherEngine: ObservableObject {
             displayCriteria.reset()
             // Genuine final teardown: the mode claim and the source-scoped rejection memo die with
             // the session. Reload seams (resetDisplayCriteria: false) preserve both.
-            panelHDRRouteReady = false
+            plainHDRRouteReady = false
             rangeRejectedSourceURL = nil
         }
         playbackBackend = .none
@@ -3164,7 +3167,7 @@ public final class AetherEngine: ObservableObject {
         let bgTask = app.beginBackgroundTask(withName: "AetherEngine.bgVideoTeardown")
         stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
         // Suspend drops the HDMI link; reacquisition invalidates any active-mode assumption.
-        panelHDRRouteReady = false
+        plainHDRRouteReady = false
         rangeRejectedSourceURL = nil
         // Session torn down; host will reload + repause on foreground return.
         state = .paused

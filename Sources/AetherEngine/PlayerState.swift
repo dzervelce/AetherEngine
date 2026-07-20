@@ -138,6 +138,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// Mirror of `UIScreen.main.currentEDRHeadroom > 1`. Default `false` (conservative SDR branch). When in HDR, master playlist VIDEO-RANGE=PQ and SUPPLEMENTAL-CODECS=dvh1 are accepted upfront for the HDR10-to-DV upgrade.
     public var panelIsInHDRMode: Bool
 
+    /// EXPLICIT host policy: the Apple TV's base video format is set to Dolby Vision, so the panel
+    /// sits in DV without any mid-session mode transition. This is the ONLY input that authorizes
+    /// retained-DV routes (dvh1 primary / SUPPLEMENTAL) — no EDR probe, mode-switch notification,
+    /// or prior-success memo can establish it (all device-refuted as unreliable). Default false:
+    /// DV sources present their stripped HDR10/HLG base instead. Must come from a persisted user
+    /// preference, not runtime detection.
+    public var panelIsPreconfiguredForDolbyVision: Bool
+
     /// Bridge encoder for codecs that cannot stream-copy into fMP4 (TrueHD, DTS, DTS-HD MA, MP3, Opus, EAC3-from-MKV-without-dec3-extradata).
     ///
     /// - `.surroundCompat` (default): EAC3 128 kbps/ch. Works on soundbars (Sonos Arc, Samsung HW-Q, Bose). Lossy; caps 7.1 to 5.1.
@@ -245,6 +253,7 @@ public struct LoadOptions: Sendable, Equatable {
         keepDvh1TagWithoutDV: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
+        panelIsPreconfiguredForDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
         audioOnly: Bool = false,
@@ -271,6 +280,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
+        self.panelIsPreconfiguredForDolbyVision = panelIsPreconfiguredForDolbyVision
         self.audioBridgeMode = audioBridgeMode
         self.isLive = isLive
         self.audioOnly = audioOnly
