@@ -241,6 +241,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var loggedFirstDiscontinuity: Bool = false
 
     private let targetSegmentDurationSeconds: Double
+    /// AE#222: real audio frame handed to every muxer this producer builds, so moov (with its packet-derived
+    /// dec3/dac3/dmlp) is written at init instead of at the first cut. nil on a normal session.
+    private let audioMoovPrimeFrame: [UInt8]?
+    /// Latched when a cut deferred for want of an audio sample entry; the pump then scans forward for one
+    /// real audio frame and exits with `.needsAudioSampleEntryPrime` so the host can rebuild primed.
+    private var cutDeferredAwaitingAudioSampleEntry: Bool = false
+    private var _capturedAudioMoovPrimeFrame: [UInt8]?
+    /// Frame captured by the pump's prime scan; read by the host after the pump exits.
+    var capturedAudioMoovPrimeFrame: [UInt8]? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _capturedAudioMoovPrimeFrame
+    }
     private var currentMuxer: MP4SegmentMuxer?
     private var currentMuxerSegmentIndex: Int = .min
 
@@ -289,11 +302,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Gate uses AV_PKT_FLAG_KEY (not libavformat's keyframe index) because MKV SimpleBlock keyframe bit can be off.
     /// Audio gate waits for video: without this, a non-IDR-keyframe miss puts video 10+ s past audio ("asynchron").
-    private let restartTargetVideoDts: Int64
+    private let restartTargetVideoPts: Int64
     private var restartTargetAudioDts: Int64
     private var audioWaitForVideo: Bool
     private var firstActualVideoDts: Int64 = Int64.min
     private var firstActualAudioDts: Int64 = Int64.min
+
+    /// #240: link arbitration. The pump claims the link while it is pulling from the source and
+    /// releases it while parked, so the subtitle side readers (a second full copy of the stream on
+    /// Matroska) can tell "the video path needs the bytes" from "the buffer is full". Set once
+    /// before `start()`; nil for hosts that drive the engine without one (`aetherctl`, tests).
+    var sideReaderLinkGate: SideReaderLinkGate?
 
     /// Forward-only producer restart counter; surfaced in live telemetry. Written on pump thread, read under packetCounterLock.
     var restartCount: Int {
@@ -359,9 +378,49 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Read rate (pkt/s) threshold classifying a no-cut stall as cutter-wedge vs. source-starvation.
     /// Healthy 1080p25: ~60 pkt/s. Rate-based to avoid misreading a trickle that accumulated a high count (Alex Berlin: 137 pkts/13 s = 10.5 pkt/s).
     private static let liveWedgeProgressRateThreshold: Double = 40
+    /// #177: minimum video PTS advance (seconds) within a no-cut window for the stall to be
+    /// reclassified as slow-but-healthy delivery (hold + re-arm) instead of a cutter wedge (retune).
+    private static let liveSlowDeliveryPtsAdvanceSeconds: Double = 2
+    /// #177: consecutive holds before a slow-delivery stall escalates to the host retune anyway.
+    static let liveSlowDeliveryMaxHolds = 6
+
+    /// #177 outcome of one no-cut watchdog evaluation.
+    enum NoCutStallAction: Equatable {
+        case keepReading
+        case holdForSlowDelivery
+        case exitForRetune
+    }
+
+    /// #177 pure decision: a wedge-classified no-cut stall whose video PTS is still advancing is a
+    /// source delivering just below real-time (a 6 s segment simply has not fully arrived inside the
+    /// 10 s timeout), not a stuck cutter. Retuning it re-joins behind the live edge, drains the buffer,
+    /// and loops. Hold and re-arm instead, bounded by `liveSlowDeliveryMaxHolds`. A genuine SSAI wedge
+    /// reads at full rate with frozen video PTS and still exits immediately; the source-starvation
+    /// classification is untouched (its 35 s window with barely-advancing PTS is a dead source).
+    static func noCutStallAction(
+        stalledFor: TimeInterval,
+        readRate: Double,
+        videoPtsAdvanceSeconds: Double,
+        consecutiveHolds: Int
+    ) -> NoCutStallAction {
+        let isWedge = readRate >= liveWedgeProgressRateThreshold
+        let timeout = isWedge ? liveSegmentStallTimeoutSeconds : liveSourceStarvationTimeoutSeconds
+        guard stalledFor > timeout else { return .keepReading }
+        if isWedge,
+           videoPtsAdvanceSeconds >= liveSlowDeliveryPtsAdvanceSeconds,
+           consecutiveHolds < liveSlowDeliveryMaxHolds {
+            return .holdForSlowDelivery
+        }
+        return .exitForRetune
+    }
     private var lastPregateVideoLog: Int = 0
     private var lastPregateAudioLog: Int = 0
     private static let pregateLogInterval = 200
+    /// AE#222 prime-scan bounds. 128 MiB is ~17 s of 60 Mbit/s UHD video, well past any real interleave gap
+    /// (the reported source's audio starts ~4 s in), and the timeout covers a slow source rather than a
+    /// far-away audio track.
+    private static let moovPrimeScanByteCap = 128 * 1024 * 1024
+    private static let moovPrimeScanTimeoutSeconds: TimeInterval = 30
 
     /// Desired tfdt for each stream: 0 for baseIndex==0; plan[baseIndex].startSeconds for restarts.
     private let desiredFirstVideoTfdtPts: Int64
@@ -545,6 +604,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// past this many consecutive pre-sync packets).
     private static let bridgeMajorSyncSkipCap = 256
 
+    /// #207: byte bound for an opt-in whole-source window. The segment ceiling is only a sanity bound,
+    /// so the race-ahead parks once it has filled the session retention budget (`PrefetchDiskBudget`).
+    /// 0 disables the park (live, and any host that never opted in stays far below its budget anyway).
+    private let prefetchDiskBudgetBytes: Int
+
     /// #65 stall diag: only log a park once it exceeds ~2 segment durations of zero playback progress, so normal
     /// backpressure (releases within one segment) stays silent and a real wedge surfaces its frozen tuple.
     private static let backpressureWedgeLogThresholdSeconds = 12
@@ -553,6 +617,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Set above the log threshold so the diag tuple surfaces first. The host then re-anchors the producer on
     /// AVPlayer's real position; a slow-but-advancing consumer never trips the detector (see BackpressureWedgeDetector).
     private static let backpressureWedgeBreakThresholdSeconds = 24
+
+    /// #207: a disk park is normal steady state for an opt-in prefetch, so it stays quiet until it has
+    /// held long enough to be worth a line, then repeats every 30 s.
+    private static let prefetchDiskParkLogThresholdSeconds = 10
 
     /// #93 retest fast path: break the park once the consumer fetch target AND the rendered clock have
     /// both been frozen this long while the consumer wants to play (rrgomes: the clock is provably flat
@@ -585,6 +653,45 @@ final class HLSSegmentProducer: @unchecked Sendable {
         packetCounterLock.lock()
         _packetsWrittenCount &+= 1
         packetCounterLock.unlock()
+    }
+
+    /// AE#169 round 3: pregate observability for the engine's starved-EOF re-anchor arm. A pump
+    /// whose scan-forward gate never opened wrote nothing; the last keyframe it dropped BELOW the
+    /// target is the true final random-access point the engine can re-anchor production on.
+    private var _videoGateOpened = false
+    private var _lastPregateDroppedKeyframePts: Int64 = Int64.min
+    var videoGateOpened: Bool {
+        packetCounterLock.lock()
+        defer { packetCounterLock.unlock() }
+        return _videoGateOpened
+    }
+    var lastPregateDroppedKeyframePts: Int64 {
+        packetCounterLock.lock()
+        defer { packetCounterLock.unlock() }
+        return _lastPregateDroppedKeyframePts
+    }
+    var hasRestartTarget: Bool { restartTargetVideoPts != Int64.min }
+    private func markVideoGateOpened() {
+        packetCounterLock.lock()
+        _videoGateOpened = true
+        packetCounterLock.unlock()
+    }
+    private func notePregateDroppedKeyframe(pts: Int64) {
+        packetCounterLock.lock()
+        if pts > _lastPregateDroppedKeyframePts { _lastPregateDroppedKeyframePts = pts }
+        packetCounterLock.unlock()
+    }
+
+    /// AE#169 round 3 pure decision: whether a video packet opens the restart scan-forward gate.
+    /// The gate target is a plan-boundary PTS (`segmentPlan[baseIndex].startPts`), so the packet
+    /// is judged by presentation time. Comparing DTS dropped the exact IRAP the restart seeked
+    /// for (a keyframe's DTS sits a reorder delay below its own PTS; same defect class as the #92
+    /// cutter fix): mid-file the next IRAP rescued the miss one GOP late, but at the file tail no
+    /// later IRAP exists, so the unbounded VOD gate starved to EOF with zero packets written.
+    static func videoGateTargetSatisfied(pts: Int64, dts: Int64, targetPts: Int64) -> Bool {
+        if targetPts == Int64.min { return true }
+        let ts = pts != Int64.min ? pts : dts
+        return ts != Int64.min && ts >= targetPts
     }
 
     var muxerLifetimeFragmentBytes: Int {
@@ -622,6 +729,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         case stopRequested
         case readError(code: Int32)
         case muxerFailed
+        /// AE#222: the first cut could not write moov because the audio sample entry is packet-derived
+        /// (E-AC-3/AC-3/TrueHD) and the source's first segment carries no audio packet. The pump captured a
+        /// real audio frame on its way out (`capturedAudioMoovPrimeFrame`); the host rebuilds with it as the
+        /// muxer's moov prime, which keeps the stream-copy (and any Atmos) instead of falling back.
+        case needsAudioSampleEntryPrime
         /// No AV_PKT_FLAG_KEY video packet within timeout; live only (VOD waits unbounded).
         case keyframeStarvation
         /// Backward PTS reset to session origin after unplanned reconnect: server replay-from-start, exits terminally.
@@ -639,6 +751,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             case .stopRequested: return "stopRequested"
             case .readError(let code): return "readError(\(code))"
             case .muxerFailed: return "muxerFailed"
+            case .needsAudioSampleEntryPrime: return "needsAudioSampleEntryPrime"
             case .keyframeStarvation: return "keyframeStarvation"
             case .sourceReplay: return "sourceReplay"
             case .segmentStall: return "segmentStall"
@@ -758,7 +871,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         targetSegmentDurationSeconds: Double = 6.0,
         videoFallbackDurationPts: Int64,
         audioFallbackDurationPts: Int64 = 0,
-        restartTargetVideoDts: Int64 = Int64.min,
+        restartTargetVideoPts: Int64 = Int64.min,
         closedCaptionStreamIndex: Int32 = -1,
         subtitleTapStreamIndices: Set<Int32> = [],
         subtitlePacketStreamIndices: Set<Int32> = [],
@@ -768,9 +881,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
         isLive: Bool = false,
         packedSideAudioStartPts: Int64? = nil,
         packedSideAudioFallbackDurationPts: Int64 = 0,
-        bufferAheadSegments: Int = 10
+        bufferAheadSegments: Int = 10,
+        prefetchDiskBudgetBytes: Int = 0,
+        audioMoovPrimeFrame: [UInt8]? = nil
     ) throws {
+        self.audioMoovPrimeFrame = audioMoovPrimeFrame
         self.bufferAheadSegments = bufferAheadSegments
+        self.prefetchDiskBudgetBytes = prefetchDiskBudgetBytes
         self.demuxer = demuxer
         self.sideAudioDemuxer = sideAudioDemuxer
         // Packed side audio: synthesize timestamps from ID3 PRIV anchor; TS-side sessions use real timestamps.
@@ -813,7 +930,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.liveCurrentSegmentIndex = baseIndex
         self.videoFallbackDurationPts = videoFallbackDurationPts
         self.audioFallbackDurationPts = audioFallbackDurationPts
-        self.restartTargetVideoDts = restartTargetVideoDts
+        self.restartTargetVideoPts = restartTargetVideoPts
         // Audio target set dynamically once video gate opens (rescaled to audio TB).
         self.restartTargetAudioDts = Int64.min
         // Audio always waits for video: some MKV remuxes (Bluey BD) have a non-IDR first packet;
@@ -1033,6 +1150,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func awaitBackpressureRelease(target: Int, head: Int, context: String) -> Bool {
         // Already broken on this session (e.g. a teardown-flush ensureMuxer call): stay broken, don't re-park.
         if isBackpressureWedgeBroken() { return false }
+        // #240: parked means the forward buffer is full and the link is free. Released here rather
+        // than at the call sites so it is balanced whatever the park returns.
+        sideReaderLinkGate?.videoFetchEnded()
+        defer { sideReaderLinkGate?.videoFetchBegan() }
         var parked = 0
         var nextLogAt = Self.backpressureWedgeLogThresholdSeconds
         // #65 Piece A: a genuine VOD wedge is the consumer fetch target frozen past the break threshold.
@@ -1091,6 +1212,50 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     category: .session
                 )
                 return false
+            }
+        }
+        return false
+    }
+
+    /// #207 disk park. The segment window is a sanity bound; the real bound on an opt-in whole-source
+    /// prefetch is the session retention budget, which `pruneOutsideWindow` cannot enforce because it
+    /// never evicts the hard window. Parks the pump while the race-ahead has filled that budget AND the
+    /// consumer still has a safe lead, so the footprint tracks the budget instead of the source length.
+    /// Deliberately has no wedge breaker: the park only ever holds with `PrefetchDiskBudget
+    /// .minAheadSegments` of produced content ahead of the consumer, and the extras eviction that
+    /// follows the advancing playhead releases it. Returns true on release, false when stop was
+    /// requested.
+    private func awaitPrefetchDiskBudgetRelease(head: Int, context: String) -> Bool {
+        guard prefetchDiskBudgetBytes > 0 else { return true }
+        // #240: same release as the backpressure park; a parked pump is not using the link.
+        sideReaderLinkGate?.videoFetchEnded()
+        defer { sideReaderLinkGate?.videoFetchBegan() }
+        var parked = 0
+        var nextLogAt = Self.prefetchDiskParkLogThresholdSeconds
+        while !checkShouldStop() {
+            if cache.awaitPrefetchDiskHeadroom(head: head,
+                                               budgetBytes: prefetchDiskBudgetBytes,
+                                               timeout: 1.0) {
+                if parked >= Self.prefetchDiskParkLogThresholdSeconds {
+                    EngineLog.emit(
+                        "[HLSSegmentProducer] #207 prefetch disk park released (\(context)) head=\(head) "
+                        + "after=\(parked)s cacheTarget=\(cache.targetIndex) "
+                        + "forward=\(cache.forwardBytes / (1 << 20)) MiB",
+                        category: .session
+                    )
+                }
+                return true
+            }
+            parked += 1
+            if parked >= nextLogAt {
+                nextLogAt += 30
+                EngineLog.emit(
+                    "[HLSSegmentProducer] #207 prefetch disk PARK (\(context)) head=\(head) "
+                    + "cacheTarget=\(cache.targetIndex) forward=\(cache.forwardBytes / (1 << 20)) MiB "
+                    + "budget=\(prefetchDiskBudgetBytes / (1 << 20)) MiB parked=\(parked)s "
+                    + "(opt-in prefetch full; resumes as playback advances)",
+                    category: .session
+                )
             }
         }
         return false
@@ -1192,7 +1357,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 audio: muxerAudio,
                 // Cap the muxer's in-RAM interleaver at ~2 segments so a long/degenerate segment or an
                 // audio stream that decodes to nothing can't buffer the whole span and fill the disk (#64).
-                maxBufferedFragmentSeconds: 2 * targetSegmentDurationSeconds,
+                // Floored at 8s (the historical 2 x 4s value): a sub-second fastZap cut target (AE#195)
+                // must not shrink the cap below typical TS A/V interleave skew.
+                maxBufferedFragmentSeconds: max(8.0, 2 * targetSegmentDurationSeconds),
+                // AE#222: only set on a session that already proved its first segment carries no audio.
+                audioMoovPrimeFrame: audioMoovPrimeFrame,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {
@@ -1248,17 +1417,81 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
+    /// AE#222 prime scan: read forward from wherever the pump stopped until the muxed audio stream yields one
+    /// packet, and copy its bytes. That single frame is all movenc needs to build the real `dec3` / `dac3` /
+    /// `dmlp` sample entry, so the rebuilt session keeps its stream-copy (Atmos included) instead of bridging.
+    ///
+    /// Scoped to single-demuxer stream-copy audio: a bridged session's muxed frames come from the encoder, not
+    /// the source, and feeding the bridge here would consume the very encoder state a restart depends on (#99
+    /// root cause B). Bounded so a source whose audio never arrives (or arrives absurdly late) gives up and
+    /// leaves the host's fallbacks in charge instead of stalling the session on an unbounded read.
+    private func scanForAudioMoovPrimeFrame() -> [UInt8]? {
+        guard let audio = audioConfig, audio.bridge == nil, sideAudioDemuxer == nil else { return nil }
+        let deadline = Date().addingTimeInterval(Self.moovPrimeScanTimeoutSeconds)
+        var bytesRead = 0
+        var packetsRead = 0
+
+        while true {
+            if checkShouldStop() { return nil }
+            if bytesRead >= Self.moovPrimeScanByteCap || Date() > deadline {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] AE#222 prime scan gave up after \(packetsRead) packet(s) / "
+                    + "\(bytesRead / (1024 * 1024)) MiB without an audio packet",
+                    category: .session
+                )
+                return nil
+            }
+            let pkt: UnsafeMutablePointer<AVPacket>?
+            do {
+                pkt = try demuxer.readPacket()
+            } catch {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] AE#222 prime scan read failed: \(error)",
+                    category: .session
+                )
+                return nil
+            }
+            guard let packet = pkt else {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] AE#222 prime scan hit EOF after \(packetsRead) packet(s) "
+                    + "without an audio packet",
+                    category: .session
+                )
+                return nil
+            }
+            var owned: UnsafeMutablePointer<AVPacket>? = packet
+            defer { trackedPacketFree(&owned) }
+            packetsRead += 1
+            bytesRead += Int(max(packet.pointee.size, 0))
+
+            guard packet.pointee.stream_index == audio.sourceStreamIndex,
+                  packet.pointee.size > 0,
+                  let data = packet.pointee.data
+            else { continue }
+
+            let frame = [UInt8](UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
+            EngineLog.emit(
+                "[HLSSegmentProducer] AE#222 prime scan captured a \(frame.count) B audio frame after "
+                + "\(packetsRead) packet(s) / \(bytesRead / (1024 * 1024)) MiB "
+                + "(srcDts=\(packet.pointee.dts))",
+                category: .session
+            )
+            return frame
+        }
+    }
+
     private func advanceMuxer(to newIdx: Int) -> MP4SegmentMuxer? {
         guard let muxer = currentMuxer else { return nil }
 
-        if let result = muxer.cutFragmentForNextSegment(newIdx) {
+        switch muxer.cutFragmentForNextSegment(newIdx) {
+        case .completed(let path, let bytesWritten):
             EngineLog.emit(
-                "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s captured (\(result.bytesWritten) B)",
+                "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s captured (\(bytesWritten) B)",
                 category: .session, level: .verbose
             )
             cache.adopt(index: currentMuxerSegmentIndex,
-                        stagingPath: result.path,
-                        byteCount: result.bytesWritten)
+                        stagingPath: path,
+                        byteCount: bytesWritten)
             if isLive {
                 reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
                                            nextIndex: newIdx)
@@ -1272,7 +1505,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 )
                 return nil
             }
-        } else {
+        case .deferredAwaitingAudioSampleEntry:
+            // AE#222: not a failure. moov cannot carry dec3/dac3/dmlp until one audio packet has been muxed,
+            // and this source's first segment has none (its audio blocks sit behind seconds of video in file
+            // order). Nothing was written, so the pump exits to let the host rebuild with a prime frame; the
+            // scan for that frame happens on the way out.
+            cutDeferredAwaitingAudioSampleEntry = true
+            EngineLog.emit(
+                "[HLSSegmentProducer] AE#222 seg-\(currentMuxerSegmentIndex).m4s cut deferred: audio sample "
+                + "entry needs a parsed packet and none has been muxed; scanning forward for a prime frame",
+                category: .session
+            )
+            return nil
+        case .failed:
             // Failed cut: muxer has no open staging fd, every byte is silently discarded. Fatal.
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s cut FAILED; "
@@ -1284,6 +1529,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         currentMuxerSegmentIndex = newIdx
         let backpressureTarget = newIdx - bufferAheadSegments
         if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance") { return nil }
+        if !awaitPrefetchDiskBudgetRelease(head: newIdx, context: "advance") { return nil }
         if checkShouldStop() { return nil }
         // Read-ahead gate (see allocateMuxer): cap distance ahead of the real playhead, floored at
         // baseIndex for deadlock-free startup bursts.
@@ -1528,9 +1774,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     // MARK: - Pump
 
     private func runPumpLoop() {
-        if restartTargetVideoDts > Int64.min {
+        if restartTargetVideoPts > Int64.min {
             bumpRestartCount()
         }
+        // #240: a running pump is pulling from the source. Claimed for the whole loop and released
+        // on every exit path; the two park helpers hand it back for the duration of their wait.
+        sideReaderLinkGate?.videoFetchBegan()
+        defer { sideReaderLinkGate?.videoFetchEnded() }
         let pumpStart = DispatchTime.now()
         var packetsRead = 0
         var lastError: Int32 = 0
@@ -1544,6 +1794,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         var lastForeignStreamIndexSinceFinalize: Int32 = -1
         var firstVideoPtsSinceFinalize: Int64 = Int64.min
         var lastVideoPtsSinceFinalize: Int64 = Int64.min
+        // #177 slow-delivery holds: a hold re-arms the watchdog window without a finalize.
+        var noCutHoldRearmedAt: Date? = nil
+        var consecutiveNoCutHolds = 0
         var vodLedgerLastRoutedSeg = Int.min  // #65 ledger: last VOD segment index logged at the routing site
 
         do {
@@ -1580,20 +1833,47 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     lastForeignStreamIndexSinceFinalize = -1
                     firstVideoPtsSinceFinalize = Int64.min
                     lastVideoPtsSinceFinalize = Int64.min
+                    noCutHoldRearmedAt = nil
+                    consecutiveNoCutHolds = 0
                 }
                 if isLive, let lastFinalize = lastLiveSegmentFinalizeAt {
-                    let stalledFor = Date().timeIntervalSince(lastFinalize)
+                    // #177: a hold re-arms the window; the watchdog measures from the later anchor.
+                    let stalledFor = Date().timeIntervalSince(noCutHoldRearmedAt ?? lastFinalize)
                     let progress = packetsRead - packetsReadAtLastFinalize
                     let readRate = stalledFor > 0 ? Double(progress) / stalledFor : 0
-                    let isWedge = readRate >= Self.liveWedgeProgressRateThreshold
-                    let timeout = isWedge
-                        ? Self.liveSegmentStallTimeoutSeconds
-                        : Self.liveSourceStarvationTimeoutSeconds
-                    if stalledFor > timeout {
-                        let ptsAdvance = (lastVideoPtsSinceFinalize != Int64.min
-                            && firstVideoPtsSinceFinalize != Int64.min && sourceVideoTbSeconds > 0)
-                            ? Double(lastVideoPtsSinceFinalize - firstVideoPtsSinceFinalize) * sourceVideoTbSeconds
-                            : -1
+                    let ptsAdvance = (lastVideoPtsSinceFinalize != Int64.min
+                        && firstVideoPtsSinceFinalize != Int64.min && sourceVideoTbSeconds > 0)
+                        ? Double(lastVideoPtsSinceFinalize - firstVideoPtsSinceFinalize) * sourceVideoTbSeconds
+                        : -1
+                    switch Self.noCutStallAction(
+                        stalledFor: stalledFor,
+                        readRate: readRate,
+                        videoPtsAdvanceSeconds: ptsAdvance,
+                        consecutiveHolds: consecutiveNoCutHolds
+                    ) {
+                    case .keepReading:
+                        break
+                    case .holdForSlowDelivery:
+                        consecutiveNoCutHolds += 1
+                        EngineLog.emit(
+                            "[HLSSegmentProducer] slow live delivery hold "
+                            + "\(consecutiveNoCutHolds)/\(Self.liveSlowDeliveryMaxHolds): video PTS "
+                            + "+\(String(format: "%.1f", ptsAdvance))s in \(Int(stalledFor))s "
+                            + "(rate=\(String(format: "%.1f", readRate))pkt/s); not a wedge, "
+                            + "re-arming watchdog instead of retuning",
+                            category: .session
+                        )
+                        noCutHoldRearmedAt = Date()
+                        packetsReadAtLastFinalize = packetsRead
+                        videoPktsSinceFinalize = 0
+                        audioPktsSinceFinalize = 0
+                        videoKeyframesSinceFinalize = 0
+                        foreignPktsSinceFinalize = 0
+                        lastForeignStreamIndexSinceFinalize = -1
+                        firstVideoPtsSinceFinalize = Int64.min
+                        lastVideoPtsSinceFinalize = Int64.min
+                    case .exitForRetune:
+                        let isWedge = readRate >= Self.liveWedgeProgressRateThreshold
                         EngineLog.emit(
                             "[HLSSegmentProducer] no-cut stall: no segment finalized for "
                             + "\(Int(stalledFor))s (packetsRead=\(packetsRead), "
@@ -1606,6 +1886,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 ? " lastForeignIdx=\(lastForeignStreamIndexSinceFinalize)" : "")
                             + (ptsAdvance >= 0
                                 ? " videoPtsAdvance=\(String(format: "%.1f", ptsAdvance))s" : "")
+                            + (consecutiveNoCutHolds > 0
+                                ? " holdsExhausted=\(consecutiveNoCutHolds)" : "")
                             + "; exiting for host retune",
                             category: .session
                         )
@@ -1767,7 +2049,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 if Self.shouldBufferPregateAudio(
                     isAudioPkt: isAudioPkt,
                     audioWaitForVideo: audioWaitForVideo,
-                    isHeadOfStream: restartTargetVideoDts == Int64.min,
+                    isHeadOfStream: restartTargetVideoPts == Int64.min,
                     isLive: isLive,
                     bufferedBytes: pregateAudioBufferBytes,
                     packetSize: Int(packet.pointee.size),
@@ -1778,7 +2060,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     pktPtr = nil  // ownership moves to the buffer; freed on replay or teardown
                     continue
                 } else if isAudioPkt, audioWaitForVideo,
-                          restartTargetVideoDts == Int64.min || !isLive,
+                          restartTargetVideoPts == Int64.min || !isLive,
                           !pregateAudioOverflowLogged {
                     pregateAudioOverflowLogged = true
                     EngineLog.emit(
@@ -2092,12 +2374,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // Scan-forward gate: wait for AV_PKT_FLAG_KEY (matroska seek can land 100+ ms early and
                 // SimpleBlock keyframe bit can be off for an IDR in the Cues index). Initial-start also
                 // waits: first packet is not always a sync sample (Bluey MKV: dts=0 pts=33, no key flag,
-                // seg-0 rejected by AVPlayer with -12860 indefinite stall).
+                // seg-0 rejected by AVPlayer with -12860 indefinite stall). The target is a plan-boundary
+                // PTS, so the packet is judged by presentation time (AE#169 round 3): comparing DTS
+                // dropped the anchor IRAP itself under B-frame reorder, and at the file tail no later
+                // IRAP exists to rescue the miss, starving the unbounded VOD gate to EOF.
                 if isVideoPkt {
                     if firstActualVideoDts == Int64.min {
                         let isKey = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
-                        let targetSatisfied = restartTargetVideoDts == Int64.min
-                            || (packet.pointee.dts != Int64.min && packet.pointee.dts >= restartTargetVideoDts)
+                        let targetSatisfied = Self.videoGateTargetSatisfied(
+                            pts: packet.pointee.pts, dts: packet.pointee.dts,
+                            targetPts: restartTargetVideoPts)
                         // #133: on a live H.264 Annex-B mid-stream join, opening on a bare keyframe flag is not
                         // enough. A join packet must carry a decodable IDR access unit (in-band SPS+PPS+IDR);
                         // otherwise the decoder renders references it never received (green frames) or, when the
@@ -2108,6 +2394,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             ? extractJoinVideoConfig(packet) : nil
                         let joinGateSatisfied = !liveH264AnnexBJoin || joinConfig != nil
                         guard isKey, targetSatisfied, joinGateSatisfied else {
+                            if isKey {
+                                let ts = packet.pointee.pts != Int64.min
+                                    ? packet.pointee.pts : packet.pointee.dts
+                                if ts != Int64.min { notePregateDroppedKeyframe(pts: ts) }
+                            }
                             pregateVideoDropCount += 1
                             if pregateVideoDropCount == 1 {
                                 pregateWaitStart = Date()
@@ -2119,8 +2410,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 EngineLog.emit(
                                     "[HLSSegmentProducer] still waiting for \(awaiting): "
                                     + "dropped=\(pregateVideoDropCount) "
-                                    + "lastDts=\(packet.pointee.dts) isKey=\(isKey) "
-                                    + "target=\(restartTargetVideoDts) "
+                                    + "lastDts=\(packet.pointee.dts) lastPts=\(packet.pointee.pts) "
+                                    + "isKey=\(isKey) "
+                                    + "target=\(restartTargetVideoPts) "
                                     + "baseIndex=\(baseIndex)",
                                     category: .session
                                 )
@@ -2153,6 +2445,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             )
                         }
                         firstActualVideoDts = packet.pointee.dts
+                        markVideoGateOpened()
                         firstActualVideoPts = packet.pointee.pts != Int64.min
                             ? packet.pointee.pts
                             : packet.pointee.dts
@@ -2174,7 +2467,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             "[HLSSegmentProducer] video gate open: "
                             + "actual=\(firstActualVideoDts) "
                             + "anchorPts=\(firstActualVideoPts) "
-                            + "target=\(restartTargetVideoDts) "
+                            + "target=\(restartTargetVideoPts) "
                             + "desired=\(desiredFirstVideoTfdtPts) "
                             + "shift=\(videoShiftPts) "
                             // #133 follow-up diag: PID + reconstruct state per epoch, so retest logs separate a
@@ -2289,7 +2582,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     if firstActualAudioDts == Int64.min {
                         firstActualAudioDts = packet.pointee.dts
                         let audioTb = audioConfig?.sourceTimeBase ?? AVRational(num: 1, den: 1000)
-                        if restartTargetVideoDts == Int64.min {
+                        if restartTargetVideoPts == Int64.min {
                             // Head-of-stream: inherit video's shift so the audio-minus-video offset survives (Cars: EAC3 +256 ms).
                             // Snapping to desired=0 would pull the entire audio track ahead of picture.
                             audioShiftPts = av_rescale_q(
@@ -2313,7 +2606,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             )
                         }
                         let gapInAudioTb: Int64
-                        if restartTargetVideoDts == Int64.min {
+                        if restartTargetVideoPts == Int64.min {
                             gapInAudioTb = 0
                         } else {
                             gapInAudioTb = restartTargetAudioDts == Int64.min
@@ -2630,6 +2923,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
             stateLock.unlock()
             if stopped { exitReason = .stopRequested }
             else if wedged { exitReason = .backpressureWedge }
+        }
+
+        // AE#222: a cut that deferred for want of a packet-derived audio sample entry is recoverable, but only
+        // with one real audio frame in hand. Scan for it here, on the way out: the bytes this reads are the
+        // same ones the rebuilt producer will re-read for its own first segments, and every alternative
+        // (bridging to FLAC, stretching the first segment past its plan boundary) either downgrades the audio
+        // or breaks the playlist. If no frame turns up, the reason stays .muxerFailed and the host's existing
+        // fallbacks own the session.
+        if case .muxerFailed = exitReason, cutDeferredAwaitingAudioSampleEntry {
+            if let prime = scanForAudioMoovPrimeFrame() {
+                stateLock.lock()
+                _capturedAudioMoovPrimeFrame = prime
+                stateLock.unlock()
+                exitReason = .needsAudioSampleEntryPrime
+            }
         }
 
         freeMergeLookaheads()

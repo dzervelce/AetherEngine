@@ -120,6 +120,20 @@ public enum DeinterlaceFieldRate: String, Sendable, Equatable {
     case frame
 }
 
+/// Live-join latency profile for loopback live sessions (`LoadOptions.liveJoinProfile`, AetherEngine#195).
+public enum LiveJoinProfile: Sendable, Equatable {
+    /// Historical behavior: ~4s segment cut target, served TARGETDURATION >= 6, live-edge holdback
+    /// (and with it the first-manifest startup cushion, AE#189) >= 18s. The first playlist always
+    /// waits for the full advertised holdback.
+    case standard
+    /// Channel-zapping profile: cut live segments at every keyframe past 0.5s, so TARGETDURATION and
+    /// holdback collapse to the source keyframe cadence. The first playlist prefers the full holdback,
+    /// but after two finalized segments a strict-realtime source gets one observed-segment grace,
+    /// clamped to 0.5...2.0s, before a shallow first window is served. That bounded start can produce
+    /// one early -16832 warning or a short rebuffer.
+    case fastZap
+}
+
 /// Options for `AetherEngine.load(url:options:)`. All flags default to safe values.
 public struct LoadOptions: Sendable, Equatable {
     /// Diagnostic lever: omit BT.2020 / transfer / YCbCr matrix from AVDisplayCriteria so AVPlayer re-reads color from the bitstream. Default off.
@@ -161,8 +175,42 @@ public struct LoadOptions: Sendable, Equatable {
     /// DVR rewind window in seconds; nil = live-only (seek is a no-op). Engine retains roughly this much past content disk-backed. Suggested default: 1800. Ignored when `isLive == false`. Default nil.
     public var dvrWindowSeconds: Double?
 
+    /// LL-HLS blocking-reload (`#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD`) override for live loopback sessions.
+    /// nil (default) = auto: for a `LiveIngestSourceInfo` custom reader the engine derives eligibility from
+    /// the OBSERVED upstream arrival cadence (off until sustained discipline is proven, permanently off once
+    /// a burst is seen), so a relay/IPTV origin that advertises a normal TARGETDURATION but delivers segments
+    /// in irregular batches no longer loops on `-15410`; for a plain-`url:` live source with no cadence signal
+    /// (e.g. a Jellyfin real-time transcode) it stays on. `true`/`false` force it regardless of cadence. The
+    /// TARGETDURATION floor still tracks observed cadence either way. Ignored for `nativeRemoteHLS` and VOD.
+    /// Default nil (AetherEngine#167).
+    public var liveBlockingReload: Bool? = nil
+
+    /// Live-join latency profile for loopback live sessions (raw TS over HTTP, live ingest). `.standard`
+    /// (default) cuts ~4s segments, so the served TARGETDURATION lands at >= 6 and the spec-mandated
+    /// live-edge holdback (`HOLD-BACK` >= 3 x TARGETDURATION, RFC 8216bis) the first manifest is gated on
+    /// (AE#189) becomes >= 18s, which a strict-realtime origin can only fill in wall-clock time (10-18s of
+    /// black on an IPTV zap). `.fastZap` cuts at every keyframe past 0.5s instead: segments quantize to the
+    /// source keyframe cadence, TARGETDURATION follows the real GOP length, and the holdback shrinks with
+    /// it. The first serve still prefers the full holdback, but after two finalized segments a
+    /// strict-realtime source gets one observed-segment grace clamped to 0.5...2.0s, then may serve a
+    /// shallow first window. This bounds black-screen startup but may produce one early `-16832` or a
+    /// short rebuffer. `.standard` retains the full-holdback guarantee. A smaller TARGETDURATION also
+    /// tightens AVPlayer's unchanged-playlist patience and live-edge buffer, so an origin that stalls or
+    /// bursts mid-stream is likelier to rebuffer or error; opt in for zapping UX, keep `.standard` for
+    /// lean-back viewing. Ignored for `nativeRemoteHLS` and VOD. Default `.standard`
+    /// (AetherEngine#195/#208).
+    public var liveJoinProfile: LiveJoinProfile = .standard
+
     /// AVPlayer item from the remote URL directly (Jellyfin live `master.m3u8`): no demuxer probe, no loopback. AVPlayer manages live edge / reconnect. Pair with `isLive: true`. Default `false`.
     public var nativeRemoteHLS: Bool
+
+    /// Reroute a live `nativeRemoteHLS` session onto the loopback live-ingest path when AVPlayer reaches
+    /// readyToPlay but never builds a video track for a master that advertises one. That signature means
+    /// the master delivers HEVC in MPEG-TS segments, which AVFoundation's HLS demuxer does not support
+    /// (the HLS Authoring Spec sanctions HEVC only in fMP4); the ingest path remuxes TS to fMP4 and plays
+    /// the same stream. Live-only (VOD remote HLS is the AE#154 reroute target). `httpHeaders` ride along
+    /// onto the ingest fetches. Default `true` (AetherEngine#168).
+    public var nativeRemoteHLSIngestFallback: Bool
 
     /// Emit raw ASS event lines (`ReadOrder,Layer,Style,...,Text` including override tags) instead of plain-text extraction. Opt-in for hosts that render ASS styling themselves; pair with `TrackInfo.assHeader`. Only affects ASS / SSA codecs. Default `false` (AetherEngine#30).
     public var preserveASSMarkup: Bool
@@ -172,6 +220,15 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
+
+    /// Confirm E-AC-3 JOC (Dolby Atmos) on this session's audio tracks, so `audioTracks` carries an honest
+    /// `TrackInfo.isAtmos` for a badge instead of the pre-decode guess. No container reliably declares JOC, so
+    /// this runs the same bounded decode pass as `AetherEngine.probeDetectingAtmos` (see `AtmosDetectionOptions`
+    /// for the caps) on a second handle to the source, once per E-AC-3 track, and republishes `audioTracks` as
+    /// tracks confirm. It starts only after the session is up and runs at utility priority, so it never delays
+    /// the first frame. Skipped for live sources and for forward-only custom readers, which cannot be re-read.
+    /// Default `false` (#214 follow-up).
+    public var confirmAtmos: Bool = false
 
     /// Preferred subtitle languages (ISO 639-1/2) used ONLY to choose which native WebVTT rendition is marked DEFAULT=YES in the master, so a host-selected legible track renders (AVKit hides a non-default legible selection as mute-only). Read back as `nativeSubtitleDefaultOrdinal`. Unlike `preferredSubtitleLanguages` this does NOT auto-activate the host-overlay subtitle path, so it won't double up with the native render. Default empty (Sodalite#32).
     public var nativeSubtitlePreferredLanguages: [String] = []
@@ -213,9 +270,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// resident (the two are coupled by construction, see `SegmentCache`). Larger values buffer more of
     /// the source up front (network-dropout robustness) at the cost of disk (segments are disk-backed,
     /// mmap reads) and ahead-of-time demux work: 4K HEVC runs ~ 10 MB per segment, so 150 segments can
-    /// occupy ~ 1.5 GB on disk. The engine clamps to 4...150 (below 4 AVPlayer's own ~ 5-7-segment
-    /// prefetch would starve, see `LiveWindowSizing.minSafeSegments`). nil keeps the historical default
-    /// of 10 (~ 40 s). Ignored for `nativeRemoteHLS`, where AVPlayer talks to the remote server directly.
+    /// occupy ~ 1.5 GB on disk. The engine clamps to 4...2700 (below 4 AVPlayer's own ~ 5-7-segment
+    /// prefetch would starve, see `LiveWindowSizing.minSafeSegments`; 2700 ~ 3 h is a sanity bound that
+    /// covers a whole feature film, so a host's "buffer without limit" option can pass `Int.max`).
+    /// Beyond the historical 150 the real bound is bytes, not segments: the prefetch runs until it
+    /// fills the session retention budget (a quarter of the tmp volume's free space, see
+    /// `HLSVideoEngine.vodRetentionBudgetBytes`) and then tracks the playhead, so a large window
+    /// buffers as much of the source as safely fits rather than a fixed count (#207). nil keeps the
+    /// historical default of 10 (~ 40 s). Ignored for `nativeRemoteHLS`, where AVPlayer talks to the
+    /// remote server directly.
     public var forwardBufferSegments: Int?
 
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
@@ -246,6 +309,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (`reloadAtCurrentPosition`). Not settable from the public initializer. When true, the native load path skips its explicit initial seek so AVPlayer picks edge-minus-holdback (see `LiveReloadPolicy`); without it the reloaded item can wedge in `waitingToPlay` against Jellyfin's re-served backlog. Meaningful only when `isLive` is true.
     var isLiveRejoin: Bool = false
 
+    /// ENGINE-INTERNAL (#170): subtitle session state a session-preserving reload
+    /// (`reloadAtCurrentPosition`) carries into this load. Not settable from the public
+    /// initializer. When present, the #88 registration point seeds the previous session's
+    /// external registry id-exactly instead of re-registering `externalSubtitles`, and the
+    /// host's subtitle authority flag carries over. Consumed by the load; never persisted.
+    var subtitleSessionCarryover: SubtitleSessionCarryover? = nil
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -258,10 +328,14 @@ public struct LoadOptions: Sendable, Equatable {
         isLive: Bool = false,
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
+        liveBlockingReload: Bool? = nil,
+        liveJoinProfile: LiveJoinProfile = .standard,
         nativeRemoteHLS: Bool = false,
+        nativeRemoteHLSIngestFallback: Bool = true,
         preserveASSMarkup: Bool = false,
         prepareNativeSubtitles: Bool = false,
         eagerNativeSubtitleReaders: Bool = false,
+        confirmAtmos: Bool = false,
         nativeSubtitlePreferredLanguages: [String] = [],
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
@@ -285,10 +359,14 @@ public struct LoadOptions: Sendable, Equatable {
         self.isLive = isLive
         self.audioOnly = audioOnly
         self.dvrWindowSeconds = dvrWindowSeconds
+        self.liveBlockingReload = liveBlockingReload
+        self.liveJoinProfile = liveJoinProfile
         self.nativeRemoteHLS = nativeRemoteHLS
+        self.nativeRemoteHLSIngestFallback = nativeRemoteHLSIngestFallback
         self.preserveASSMarkup = preserveASSMarkup
         self.prepareNativeSubtitles = prepareNativeSubtitles
         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
+        self.confirmAtmos = confirmAtmos
         self.nativeSubtitlePreferredLanguages = nativeSubtitlePreferredLanguages
         self.probesize = probesize
         self.maxAnalyzeDuration = maxAnalyzeDuration
@@ -332,7 +410,8 @@ public struct SourceProbe: Sendable {
     public let isDolbyVision: Bool
     /// Dolby Vision profile number (5, 7, 8, 10) read from the dvcC/dvvC configuration record; nil when not DV.
     public let dvProfile: Int?
-    public let audioTracks: [TrackInfo]
+    /// Settable inside the module so `probeDetectingAtmos` can enrich one track without rebuilding the struct field by field.
+    public internal(set) var audioTracks: [TrackInfo]
     /// Includes both text and bitmap (PGS / DVB) variants.
     public let subtitleTracks: [TrackInfo]
     public let metadata: MediaMetadata
@@ -441,7 +520,8 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// Container disposition `COMMENT` (director / cast commentary tracks). Applies to audio and subtitle.
     public let isCommentary: Bool
     /// EAC3 with JOC profile (Dolby Atmos). Lets the UI surface "Atmos" instead of the bed channel count (typically 5.1).
-    public let isAtmos: Bool
+    /// Settable inside the module so `probeDetectingAtmos` can confirm it post-decode without rebuilding the struct field by field.
+    public internal(set) var isAtmos: Bool
 
     /// ASS / SSA tracks only: `[Script Info]` + `[V4+ Styles]` + `[Events]` format line from codec extradata. Hosts rendering ASS styling themselves (see `LoadOptions.preserveASSMarkup`) need it to resolve style references. nil for all other track kinds.
     public let assHeader: String?
@@ -551,11 +631,62 @@ public struct SubtitleColor: Sendable, Equatable {
     public init(r: UInt8, g: UInt8, b: UInt8) { self.r = r; self.g = g; self.b = b }
 }
 
-/// One contiguous same-colour span of a rich-text cue.
+/// One contiguous same-styling span of a rich-text cue.
+///
+/// #233: libavcodec converts every text subtitle format to an ASS event line before the engine
+/// sees it, so SRT (`<b>`, `<font color/size/face>`), WebVTT (`<i>/<b>/<u>`), teletext and ASS
+/// itself all arrive carrying the same override tags and populate the same fields here. A run
+/// with no attribute set is plain text; those cues stay `.text` rather than becoming `.richText`.
 public struct SubtitleTextRun: Sendable, Equatable {
     public let text: String
     public let color: SubtitleColor?
-    public init(text: String, color: SubtitleColor?) { self.text = text; self.color = color }
+    public let isBold: Bool
+    public let isItalic: Bool
+    public let isUnderlined: Bool
+    public let isStruckThrough: Bool
+    /// Face requested by `\fn` (SRT `<font face=>`); nil means the host's default.
+    public let fontName: String?
+    /// Size requested by `\fs` (SRT `<font size=>`), in ASS play-resolution points, so it is a
+    /// relative hint rather than a pixel size; nil means the host's default.
+    public let fontSize: Int?
+
+    public init(text: String, color: SubtitleColor?,
+                isBold: Bool = false, isItalic: Bool = false,
+                isUnderlined: Bool = false, isStruckThrough: Bool = false,
+                fontName: String? = nil, fontSize: Int? = nil) {
+        self.text = text
+        self.color = color
+        self.isBold = isBold
+        self.isItalic = isItalic
+        self.isUnderlined = isUnderlined
+        self.isStruckThrough = isStruckThrough
+        self.fontName = fontName
+        self.fontSize = fontSize
+    }
+
+    /// True when the run asks for anything beyond plain text. Drives the `.text` / `.richText`
+    /// choice, so an unstyled track keeps the body it has always had.
+    public var isStyled: Bool {
+        color != nil || isBold || isItalic || isUnderlined || isStruckThrough
+            || fontName != nil || fontSize != nil
+    }
+}
+
+/// Where a text cue asks to be drawn, from the ASS `\an` / `\pos` overrides (#233).
+///
+/// Bitmap cues carry their own geometry on `SubtitleImage`; this is the text equivalent and is nil
+/// for the overwhelming majority of cues, which simply want the host's default placement.
+public struct SubtitleTextPlacement: Sendable, Equatable {
+    /// ASS numpad alignment from `\an`: 1 bottom-left through 9 top-right, 5 centred.
+    public let alignment: Int?
+    /// Anchor from `\pos`, normalized to [0, 1] against the source video frame the same way
+    /// `SubtitleImage.position` is, with y measured from the top.
+    public let position: CGPoint?
+
+    public init(alignment: Int?, position: CGPoint?) {
+        self.alignment = alignment
+        self.position = position
+    }
 }
 
 /// Decoded subtitle cue (start/end in container seconds). Payload is plain text (SubRip / ASS / SSA / WebVTT / mov_text), coloured rich text (teletext / ASS colour tags), or a rendered bitmap (PGS / DVB / HDMV) with position normalized against the source video frame.
@@ -566,6 +697,10 @@ public struct SubtitleCue: Identifiable, Sendable {
     public let startTime: Double
     public let endTime: Double
     public let body: Body
+    /// #233: placement the source asked for, from ASS `\an` / `\pos`. nil means the host places the
+    /// cue itself, which is the case for nearly every cue. Text cues only; a bitmap cue carries its
+    /// geometry on `SubtitleImage`.
+    public let placement: SubtitleTextPlacement?
 
     public enum Body: Sendable {
         case text(String)
@@ -573,11 +708,13 @@ public struct SubtitleCue: Identifiable, Sendable {
         case richText([SubtitleTextRun])
     }
 
-    public init(id: Int, startTime: Double, endTime: Double, body: Body) {
+    public init(id: Int, startTime: Double, endTime: Double, body: Body,
+                placement: SubtitleTextPlacement? = nil) {
         self.id = id
         self.startTime = startTime
         self.endTime = endTime
         self.body = body
+        self.placement = placement
     }
 
     /// Plain text for text and rich-text cues (rich runs concatenated); nil for bitmap cues.
@@ -595,6 +732,25 @@ public struct SubtitleCue: Identifiable, Sendable {
     public var isForced: Bool {
         if case .image(let image) = body { return image.isForced }
         return false
+    }
+}
+
+extension SubtitleCue {
+    /// Copy of this cue with only the named fields changed; everything else is carried across.
+    ///
+    /// #233 follow-up (tresby): the store operations rebuild a cue to change one field, and every
+    /// one of them did it by calling the memberwise initializer with the fields it happened to know
+    /// about. `placement` is defaulted there for source compatibility, so each of those call sites
+    /// dropped it and still compiled, and `insertCueSorted` stamps every cue entering the retained
+    /// store, which meant no embedded track could ever deliver a placement to a host. Rebuilding
+    /// through here instead makes the carry-over the default and the drop impossible to write by
+    /// accident, including for whatever field is added to the cue next.
+    func with(id: Int? = nil, endTime: Double? = nil, body: Body? = nil) -> SubtitleCue {
+        SubtitleCue(id: id ?? self.id,
+                    startTime: startTime,
+                    endTime: endTime ?? self.endTime,
+                    body: body ?? self.body,
+                    placement: placement)
     }
 }
 

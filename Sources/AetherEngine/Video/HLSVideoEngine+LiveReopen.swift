@@ -22,12 +22,100 @@ extension HLSVideoEngine {
         return packetsWritten == 0 && cachedSegments == 0
     }
 
+    /// AE#169 round 3 pure decision: a VOD pump that reached EOF with its scan-forward gate never
+    /// opened produced nothing; the plan boundary it targeted has no runtime keyframe at or after
+    /// it (tail Cues drift or a mis-flagged tail IRAP; the gate itself is pts-based since round 3).
+    /// If the gate saw keyframes below the target while dropping, the last of them is the true
+    /// final random-access point and production re-anchors there (bounded), so the tail content
+    /// gets produced and end-of-media completes through the tail-park instead of the forward-wait
+    /// escalation restarting into the same starve until -12889. A head-of-stream pump (no restart
+    /// target) starving means a keyframe-less source, which stays the #126 fatal surface.
+    static func shouldReanchorVODAfterGateStarvation(
+        isLive: Bool,
+        videoGateOpened: Bool,
+        hadRestartTarget: Bool,
+        lastDroppedKeyframePts: Int64
+    ) -> Bool {
+        guard !isLive, !videoGateOpened, hadRestartTarget else { return false }
+        return lastDroppedKeyframePts != Int64.min
+    }
+
+    /// AE#169 round 3 pure decision: the plan segment whose span contains a source pts (the last
+    /// index whose startPts is at or below it). nil when the plan is empty or the pts precedes
+    /// the first boundary (nowhere sane to re-anchor).
+    static func planSegmentIndex(forSourcePts pts: Int64, plan: [Segment]) -> Int? {
+        var result: Int? = nil
+        for (i, seg) in plan.enumerated() {
+            if seg.startPts <= pts { result = i } else { break }
+        }
+        return result
+    }
+
+    /// AE#169 round 2 pure decision: a VOD pump read-error exit that produced media before dying
+    /// is revivable (the source worked; a reconnect-churned read failed). The complement is the
+    /// #126 dead-source fatal surface; live keeps its reopen machinery.
+    static func shouldReviveVODAfterReadError(
+        isLive: Bool,
+        packetsWritten: Int,
+        cachedSegments: Int
+    ) -> Bool {
+        guard !isLive else { return false }
+        return packetsWritten > 0 || cachedSegments > 0
+    }
+
+    /// #167 follow-up pure decision: live pump exits that delegate to host retune leave a provider no
+    /// producer will ever cut into again. Its blocking-reload advert must drop and its held ?_HLS_msn=
+    /// waiters release, or the zombie session (and any item reload against it while the host retunes)
+    /// trips -15410 on a hold that cannot be satisfied. Reopenable exits (URL source, or a #199
+    /// engine-created ingest reader with a fresh-reader factory) resume cutting into the same provider
+    /// and must NOT latch; stop/muxer/backpressure exits have their own arms.
+    static func shouldHaltLiveProduction(
+        reason: HLSSegmentProducer.PumpExitReason,
+        sourceReopenable: Bool
+    ) -> Bool {
+        switch reason {
+        case .segmentStall, .sourceReplay:
+            return true
+        case .eof, .readError, .keyframeStarvation:
+            return !sourceReopenable
+        case .stopRequested, .muxerFailed, .backpressureWedge, .needsAudioSampleEntryPrime:
+            // AE#222 rebuilds into the same provider with a primed muxer, so production continues.
+            return false
+        }
+    }
+
+    /// #199 pure decision: which transport a live pump-exit reopen uses for the fresh source
+    /// connection. URL sources reopen by URL (unchanged); an engine-created ingest reader reopens
+    /// through its fresh-reader factory; a host-provided custom reader has neither and cannot reopen
+    /// in-engine (its exit delegates to host retune as before).
+    enum LiveReopenTransport: Equatable {
+        case url
+        case customFactory
+        case none
+    }
+
+    static func liveReopenTransport(
+        sourceReopenableByURL: Bool, hasCustomSourceReopenFactory: Bool
+    ) -> LiveReopenTransport {
+        if sourceReopenableByURL { return .url }
+        if hasCustomSourceReopenFactory { return .customFactory }
+        return .none
+    }
+
     func handlePumpFinished(_ prod: HLSSegmentProducer,
                                     reason: HLSSegmentProducer.PumpExitReason) {
         // #65 (VOD only): a broken backpressure wedge means AVPlayer is stuck behind a parked producer.
         // Re-anchor the producer on AVPlayer's real position so the segments it is starved for get produced.
         if case .backpressureWedge = reason {
             handleBackpressureWedge()
+            return
+        }
+        // AE#222: the pump deferred its first cut because the audio sample entry is packet-derived
+        // (E-AC-3/AC-3/TrueHD) and this source's first segment carries no audio packet, then captured one real
+        // audio frame on its way out. Rebuild with that frame as the muxer's moov prime, which keeps the
+        // stream-copy (and any Atmos) rather than bridging to FLAC or stretching the first segment.
+        if case .needsAudioSampleEntryPrime = reason {
+            handleAudioSampleEntryPrimeNeeded(prod)
             return
         }
         // #99 failure mode B: a VOD muxer death (e.g. first cut before any bridged audio packet, so
@@ -42,33 +130,71 @@ extension HLSVideoEngine {
         // written, empty segment cache) is a dead source: the playlist exists but no segment
         // will ever land, no restart arm covers readError, and AVPlayer parks in waitingToPlay
         // until the host's first-frame timeout. Surface it as fatal instead of dying silently.
-        // Mid-session read errors (packets/segments already produced) keep the existing
-        // behavior: AVIO absorbs transients, the scrub/wedge arms cover recovery.
-        let deadSourceCandidate: Bool
-        switch reason {
-        case .readError, .eof: deadSourceCandidate = true
-        default: deadSourceCandidate = false
-        }
-        if !isLiveSession, deadSourceCandidate {
-            if Self.isFatalVODPumpExit(
-                reason: reason, isLive: isLiveSession,
+        // AE#169 round 2: a MID-SESSION read error (packets/segments already produced) gets a
+        // bounded revive. The old assumption that the scrub/wedge arms cover it was false for a
+        // request within the forward-wait window of the dead producer's front: the wedge detector
+        // died with the pump and the provider's restart escalation judged by index distance alone,
+        // so the tail request parked 30 s at a time into -12889 (rrgomes' seg719 trace).
+        if case .readError(let code) = reason, !isLiveSession {
+            if Self.shouldReviveVODAfterReadError(
+                isLive: isLiveSession,
                 packetsWritten: prod.packetsWrittenCount,
                 cachedSegments: cache?.count ?? 0
             ) {
-                // .eof carries no errno; report AVERROR_EOF so the host message stays truthful.
-                let code: Int32 = { if case .readError(let c) = reason { return c }; return FFmpegErr.eof }()
+                handleVODReadErrorExit(code)
+            } else {
                 EngineLog.emit(
                     "[HLSVideoEngine] VOD pump died before producing anything "
-                    + "(\(reason), code \(code)); surfacing fatal source failure",
+                    + "(readError \(code)); surfacing fatal source failure",
                     category: .session
                 )
                 onVODSourceFailed?(code)
             }
             return
         }
+        // AE#169 round 3: a VOD pump that reached EOF with its scan-forward gate never opened
+        // wrote nothing because the targeted plan boundary has no runtime keyframe at or after it
+        // (the unproducible tail segment of rrgomes' DV MKV). Re-anchor on the last keyframe the
+        // gate dropped instead of returning, which would leave the forward-wait escalation
+        // restarting into the same starve.
+        if case .eof = reason, Self.shouldReanchorVODAfterGateStarvation(
+            isLive: isLiveSession,
+            videoGateOpened: prod.videoGateOpened,
+            hadRestartTarget: prod.hasRestartTarget,
+            lastDroppedKeyframePts: prod.lastPregateDroppedKeyframePts
+        ) {
+            handleVODGateStarvationExit(prod)
+            return
+        }
+        // Fork: a zero-packet `.eof` VOD exit is the same dead source as the zero-packet readError
+        // (forward-only streaming mode has no reconnect and returns EOF once its first-data wait
+        // expires), and must surface fatally so the host's stream failover can advance instead of
+        // parking forever. Checked AFTER the gate-starvation re-anchor: a starved restart carries a
+        // restart target and takes that arm; this one only fires for a source that never fed a byte.
+        if case .eof = reason, Self.isFatalVODPumpExit(
+            reason: reason, isLive: isLiveSession,
+            packetsWritten: prod.packetsWrittenCount,
+            cachedSegments: cache?.count ?? 0
+        ) {
+            // .eof carries no errno; report AVERROR_EOF so the host message stays truthful.
+            EngineLog.emit(
+                "[HLSVideoEngine] VOD pump died before producing anything "
+                + "(eof); surfacing fatal source failure",
+                category: .session
+            )
+            onVODSourceFailed?(FFmpegErr.eof)
+            return
+        }
         guard isLiveSession else { return }
+        let reopenTransport = Self.liveReopenTransport(
+            sourceReopenableByURL: sourceReopenableByURL,
+            hasCustomSourceReopenFactory: customSourceReopenFactory != nil)
+        if Self.shouldHaltLiveProduction(reason: reason, sourceReopenable: reopenTransport != .none) {
+            provider?.markLiveProductionHalted()
+        }
         switch reason {
-        case .stopRequested, .muxerFailed, .backpressureWedge:
+        case .stopRequested, .muxerFailed, .backpressureWedge, .needsAudioSampleEntryPrime:
+            // needsAudioSampleEntryPrime never reaches here (its arm above returns first).
             return
         case .sourceReplay:
             // Server restarted stream from beginning (Jellyfin transcode respawn); URL reopen would replay stale content. Delegate to host for fresh negotiation.
@@ -89,11 +215,14 @@ extension HLSVideoEngine {
             onLiveSourceReset?()
             return
         case .eof, .readError, .keyframeStarvation:
-            // Custom-reader sources (e.g. live HLS ingest) own their own reconnection; URL reopen burns the backoff budget on guaranteed failures.
-            if !sourceReopenableByURL {
+            // Host-provided custom readers own their own reconnection and no in-engine transport can
+            // rebuild them, so their loss surfaces to the host immediately. #199: engine-created
+            // ingest readers DO have a transport (the fresh-reader factory) and fall through into the
+            // bounded reopen flow below instead of tearing the whole player session down.
+            if reopenTransport == .none {
                 EngineLog.emit(
                     "[HLSVideoEngine] live custom-source pump exited (reason=\(reason)); "
-                    + "URL reopen not possible, requesting host retune",
+                    + "no in-engine reopen transport, requesting host retune",
                     category: .session
                 )
                 onLiveSourceReset?()
@@ -116,6 +245,13 @@ extension HLSVideoEngine {
                 + "\(barrenNow) reopen cycles; giving up (source considered dead)",
                 category: .session
             )
+            if reopenTransport == .customFactory {
+                // #199: same last-resort surface as reopen exhaustion; without it the recoverable
+                // exit reason skipped the halt above and the zombie session would hold blocking
+                // reloads it can never satisfy.
+                provider?.markLiveProductionHalted()
+                onLiveSourceReset?()
+            }
             return
         }
         EngineLog.emit(
@@ -125,6 +261,133 @@ extension HLSVideoEngine {
         Task.detached(priority: .userInitiated) { [weak self] in
             await self?.performLiveReopen(failedProducer: prod)
         }
+    }
+
+    /// AE#169 round 2: revive a VOD session whose pump died on a mid-session read error. Mirrors
+    /// the #99 muxerFailed arm: bounded by its own gate, aimed at the pending seek target or
+    /// AVPlayer's real position, authoritative so it wins the coalescer's pending slot. The
+    /// demuxer whose read just threw is marked suspect so performRestart replaces it via the #79
+    /// fresh-demuxer path instead of seeking the failed connection.
+    func handleVODReadErrorExit(_ code: Int32) {
+        restartLock.lock()
+        let admitted = readErrorReviveGate.admit()
+        let attempts = readErrorReviveGate.attempts
+        let cap = readErrorReviveGate.maxAttempts
+        if admitted { mainDemuxerSuspectDead = true }
+        restartLock.unlock()
+        guard admitted else {
+            EngineLog.emit(
+                "[HLSVideoEngine] #169 VOD readError revive cap reached "
+                + "(\(attempts) failures, cap \(cap)); giving up (source not readable in this session)",
+                category: .session
+            )
+            return
+        }
+        let frozen = currentPlaybackPositionProvider?() ?? 0
+        let anchor = AetherEngine.recoveryAnchorPosition(
+            frozenPosition: frozen, pendingSeekTarget: recoverySeekTargetProvider?(),
+            currentRendered: frozen)
+        let idx = segmentIndexForPlaylistTime(anchor)
+        EngineLog.emit(
+            "[HLSVideoEngine] #169 VOD pump died mid-session (readError \(code)); "
+            + "rebuilding producer on a fresh demuxer at "
+            + "\(String(format: "%.2f", anchor))s -> seg\(idx) "
+            + "(attempt \(attempts)/\(cap))",
+            category: .session
+        )
+        requestRestart(at: idx, authoritative: true)
+    }
+
+    /// AE#169 round 3: re-anchor a VOD session whose pump starved its scan-forward gate to EOF.
+    /// The last keyframe the gate dropped below the target is the final real random-access point
+    /// of the file; producing from its segment folds the tail content into the cache so playback
+    /// reaches end-of-media (via the tail-park completion) instead of dying at -12889 on a
+    /// segment no anchoring can produce. Bounded by its own #99-shaped gate.
+    func handleVODGateStarvationExit(_ prod: HLSSegmentProducer) {
+        let lastKeyPts = prod.lastPregateDroppedKeyframePts
+        restartLock.lock()
+        let plan = segmentPlan
+        let admitted = gateStarvationReviveGate.admit()
+        let attempts = gateStarvationReviveGate.attempts
+        let cap = gateStarvationReviveGate.maxAttempts
+        restartLock.unlock()
+        guard admitted else {
+            EngineLog.emit(
+                "[HLSVideoEngine] #169 VOD gate-starvation re-anchor cap reached "
+                + "(\(attempts) starved pumps, cap \(cap)); giving up "
+                + "(no keyframe at/after the plan boundary in this session)",
+                category: .session
+            )
+            return
+        }
+        guard let idx = Self.planSegmentIndex(forSourcePts: lastKeyPts, plan: plan) else {
+            EngineLog.emit(
+                "[HLSVideoEngine] #169 VOD gate starved to EOF but the dropped keyframe "
+                + "(pts=\(lastKeyPts)) maps to no plan segment; not re-anchoring",
+                category: .session
+            )
+            return
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] #169 VOD gate starved to EOF at seg\(prod.anchoredBaseIndex): "
+            + "no keyframe at/after the plan boundary; re-anchoring on the last real keyframe "
+            + "(pts=\(lastKeyPts)) -> seg\(idx) (attempt \(attempts)/\(cap))",
+            category: .session
+        )
+        requestRestart(at: idx, authoritative: true)
+    }
+
+    /// AE#222: rebuild the session with the captured audio frame as the muxer's moov prime.
+    ///
+    /// The prime is stored on the session, not just handed to the next producer, so every later restart (seek,
+    /// audio switch, revive) gets it too: the same video-first interleave defers the first cut of every fresh
+    /// muxer, not only the session's first one.
+    ///
+    /// Aimed like the other revive arms, at the pending seek target or AVPlayer's real position, so a defer
+    /// that happens after a scrub resumes where the viewer is.
+    func handleAudioSampleEntryPrimeNeeded(_ prod: HLSSegmentProducer) {
+        guard let prime = prod.capturedAudioMoovPrimeFrame, !prime.isEmpty else {
+            // No frame: the source's audio never showed up inside the scan bounds. Nothing here can keep the
+            // stream-copy, so hand the session to the existing muxerFailed recovery.
+            EngineLog.emit(
+                "[HLSVideoEngine] AE#222 first cut deferred but no audio frame was captured; "
+                + "falling back to the muxerFailed recovery",
+                category: .session
+            )
+            if isLiveSession { return }
+            handleVODMuxerFailure()
+            return
+        }
+
+        restartLock.lock()
+        let admitted = audioSampleEntryPrimeGate.admit()
+        let attempts = audioSampleEntryPrimeGate.attempts
+        let cap = audioSampleEntryPrimeGate.maxAttempts
+        if admitted { sessionAudioMoovPrimeFrame = prime }
+        restartLock.unlock()
+
+        guard admitted else {
+            EngineLog.emit(
+                "[HLSVideoEngine] AE#222 moov-prime rebuild cap reached (\(attempts) attempts, cap \(cap)); "
+                + "falling back to the muxerFailed recovery",
+                category: .session
+            )
+            if isLiveSession { return }
+            handleVODMuxerFailure()
+            return
+        }
+
+        let frozen = currentPlaybackPositionProvider?() ?? 0
+        let anchor = AetherEngine.recoveryAnchorPosition(
+            frozenPosition: frozen, pendingSeekTarget: recoverySeekTargetProvider?(),
+            currentRendered: frozen)
+        let idx = segmentIndexForPlaylistTime(anchor)
+        EngineLog.emit(
+            "[HLSVideoEngine] AE#222 rebuilding producer + muxer with a \(prime.count) B audio moov prime at "
+            + "\(String(format: "%.2f", anchor))s -> seg\(idx) (audio stream-copy preserved)",
+            category: .session
+        )
+        requestRestart(at: idx, authoritative: true)
     }
 
     /// #99: revive a VOD session whose pump died with muxerFailed. The restart path rebuilds the
@@ -241,6 +504,9 @@ extension HLSVideoEngine {
     }
 
     private func performLiveReopen(failedProducer: HLSSegmentProducer) async {
+        let transport = Self.liveReopenTransport(
+            sourceReopenableByURL: sourceReopenableByURL,
+            hasCustomSourceReopenFactory: customSourceReopenFactory != nil)
         for attempt in 1...Self.liveReopenMaxAttempts {
             guard currentProducerIs(failedProducer) else { return }
 
@@ -250,14 +516,34 @@ extension HLSVideoEngine {
             let dem = Demuxer()
             registerReopenDemuxer(dem)  // register before blocking open so stop() can abort via markClosed
             defer { unregisterReopenDemuxer(dem) }
+            var freshReader: IOReader?
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: true)
+                switch transport {
+                case .url:
+                    try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: true)
+                case .customFactory:
+                    // #199: fresh engine-created ingest reader over the same channel; the dead
+                    // reader's construction inputs are immutable, so this rejoins at the live edge.
+                    guard let vend = customSourceReopenFactory?() else {
+                        EngineLog.emit(
+                            "[HLSVideoEngine] #199 live reopen attempt \(attempt)/\(Self.liveReopenMaxAttempts): "
+                            + "factory vended no reader",
+                            category: .session
+                        )
+                        continue
+                    }
+                    freshReader = vend.reader
+                    try dem.open(reader: vend.reader, formatHint: vend.formatHint, profile: openProfile, isLive: true)
+                case .none:
+                    return  // handlePumpFinished already delegated this exit to host retune
+                }
             } catch {
                 EngineLog.emit(
                     "[HLSVideoEngine] live reopen attempt \(attempt)/\(Self.liveReopenMaxAttempts) failed: \(error)",
                     category: .session
                 )
                 dem.close()
+                freshReader?.close()
                 continue
             }
             // Reopened producer reuses savedVideoConfig/savedAudioConfig (stream indices + time bases from original probe); layout mismatch means server changed transcode shape.
@@ -268,10 +554,12 @@ extension HLSVideoEngine {
                     category: .session
                 )
                 dem.close()
+                freshReader?.close()
                 continue
             }
 
-            switch finishLiveReopen(failedProducer: failedProducer, dem: dem, attempt: attempt) {
+            switch finishLiveReopen(failedProducer: failedProducer, dem: dem,
+                                    freshReader: freshReader, attempt: attempt) {
             case .done, .aborted:
                 return
             case .retry:
@@ -283,6 +571,13 @@ extension HLSVideoEngine {
             + "source considered permanently lost",
             category: .session
         )
+        if transport == .customFactory {
+            // #199: the in-engine transport is exhausted; surface the loss the way a factory-less
+            // custom source would have immediately, so the host can retune instead of holding a
+            // zombie session whose blocking-reload advert can never be satisfied.
+            provider?.markLiveProductionHalted()
+            onLiveSourceReset?()
+        }
     }
 
     /// NSLock unavailable from async contexts; this synchronous helper wraps the check.
@@ -308,11 +603,13 @@ extension HLSVideoEngine {
 
     private func finishLiveReopen(failedProducer: HLSSegmentProducer,
                                   dem: Demuxer,
+                                  freshReader: IOReader?,
                                   attempt: Int) -> LiveReopenOutcome {
         restartLock.lock()
         guard producer === failedProducer, let prov = provider else {
             restartLock.unlock()
             dem.close()
+            freshReader?.close()
             return .aborted
         }
         let oldDem = demuxer
@@ -329,8 +626,13 @@ extension HLSVideoEngine {
                 self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: outputEnd)
             }
             producer = newProd
+            // #199: the new demuxer reads from the factory-vended reader; take ownership so stop()
+            // and the next reopen close it. The initial load's reader stays engine-owned.
+            let oldReader = reopenCustomReader
+            if freshReader != nil { reopenCustomReader = freshReader }
             restartLock.unlock()
             oldDem?.close()
+            if freshReader != nil { oldReader?.close() }
             newProd.start()
             EngineLog.emit(
                 "[HLSVideoEngine] live reopen succeeded on attempt \(attempt): "
@@ -342,6 +644,7 @@ extension HLSVideoEngine {
             demuxer = oldDem
             restartLock.unlock()
             dem.close()
+            freshReader?.close()
             EngineLog.emit(
                 "[HLSVideoEngine] live reopen attempt \(attempt): producer build failed (\(error))",
                 category: .session

@@ -18,14 +18,18 @@ struct SubtitlePacketStoreTests {
         #expect(got == [10, 20])
     }
 
-    @Test("an EXACT same-pts duplicate append dedupes (producer restart overlap)")
+    /// A restart re-reads the same source bytes, so the overlap it produces is byte-identical:
+    /// that, not the bare timestamp match, is what identifies a duplicate. Distinct payloads on
+    /// one PTS are distinct cues and are all retained (#235, Issue235SamePTSRetentionTests).
+    @Test("a byte-identical re-harvest replaces its entry (producer restart overlap)")
     func dedupOnRestartOverlap() {
         let store = SubtitlePacketStore()
-        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: Data([2, 2]))
-        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: Data([2, 2]))
+        let packet = Data([1, 2, 3, 4])
+        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: packet)
+        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: packet)
         let got = store.entries(streamIndex: 3, from: 0, through: 100)
         #expect(got.count == 1)
-        #expect(got[0].payload == Data([2, 2]))
+        #expect(got[0].payload == packet)
     }
 
     @Test("distinct same-pts packets both survive (#4: not a restart-overlap replay)")
@@ -82,25 +86,6 @@ struct SubtitlePacketStoreTests {
     }
 
     // MARK: - Session-wide budget (#6)
-
-    @Test("session budget evicts an inactive bitmap stream first, protects the active + text streams")
-    func sessionBudgetEvictsInactiveBitmapFirst() {
-        let store = SubtitlePacketStore()
-        store.markBitmapStreams([10, 11, 13])   // 11 stays ACTIVE below; 12 is unmarked (text)
-        store.setActiveStreams([11])
-        // Four streams, one packet each, well under the PER-STREAM cap individually but 4x
-        // over the SESSION cap combined, isolating session-level eviction from per-stream eviction.
-        let chunk = Data(repeating: 0, count: SubtitlePacketStore.sessionByteCap / 4 + 1024)
-        store.append(streamIndex: 10, ptsSeconds: 1, durationSeconds: 1, payload: chunk)   // bitmap, inactive
-        store.append(streamIndex: 11, ptsSeconds: 1, durationSeconds: 1, payload: chunk)   // bitmap, ACTIVE
-        store.append(streamIndex: 12, ptsSeconds: 1, durationSeconds: 1, payload: chunk)   // unmarked (text)
-        store.append(streamIndex: 13, ptsSeconds: 1, durationSeconds: 1, payload: chunk)   // bitmap, inactive
-
-        let inactiveCounts = [10, 13].map { store.entries(streamIndex: $0, from: 0, through: 100).count }
-        #expect(inactiveCounts.filter { $0 == 0 }.count == 1, "exactly one inactive bitmap stream should be evicted")
-        #expect(store.entries(streamIndex: 11, from: 0, through: 100).count == 1, "active stream must keep its data")
-        #expect(store.entries(streamIndex: 12, from: 0, through: 100).count == 1, "text stream must never be session-evicted")
-    }
 
     @Test("isBitmapStream reflects markBitmapStreams")
     func bitmapClassification() {

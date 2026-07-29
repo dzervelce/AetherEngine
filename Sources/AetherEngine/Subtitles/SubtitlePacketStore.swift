@@ -18,6 +18,22 @@ struct StoredSubtitlePacket: Sendable {
     /// decode packet (AV_PKT_FLAG_KEY matters for bitmap acquisition points).
     let flags: Int32
     let payload: Data
+    /// #233: `AV_PKT_DATA_WEBVTT_SETTINGS` as attached by the demuxer. WebVTT cue settings live
+    /// only in packet side data (the decoder never puts them in the ASS line), so a rebuilt packet
+    /// loses the cue's placement unless the string rides along with the payload.
+    let webvttSettings: String?
+
+    /// `sequence` defaults to 0 for entries built outside the store (harvest DTOs, tests);
+    /// `appendLocked` stamps the real store-monotonic value on insertion.
+    init(sequence: UInt64 = 0, ptsSeconds: Double, durationSeconds: Double, flags: Int32,
+         payload: Data, webvttSettings: String? = nil) {
+        self.sequence = sequence
+        self.ptsSeconds = ptsSeconds
+        self.durationSeconds = durationSeconds
+        self.flags = flags
+        self.payload = payload
+        self.webvttSettings = webvttSettings
+    }
 }
 
 final class SubtitlePacketStore: @unchecked Sendable {
@@ -31,22 +47,24 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// on VOD sessions the forward prefetcher (#151) extends it to the drainer's lead window.
     static let perStreamByteCap: Int = 32 * 1024 * 1024
 
-    /// Session-wide ceiling across every retained stream, independent of `perStreamByteCap`. Every
-    /// embedded subtitle stream is tapped from init (only one is ever actively drained at a time),
-    /// so a file with several bitmap tracks could otherwise retain hundreds of MB for tracks nobody
-    /// is watching. Checked after every append; eviction targets the largest INACTIVE bitmap
-    /// stream's oldest packets first (the pump keeps re-harvesting once that stream is selected, so
-    /// its backlog is cheaply replaceable) — never a text stream (tiny) or a stream currently in
-    /// `activeStreamIndices`.
-    static let sessionByteCap: Int = 64 * 1024 * 1024
+    /// #166: the per-stream cap alone is unbounded in aggregate. Both the pump tap and the forward
+    /// prefetcher harvest EVERY embedded subtitle stream (so a track switch backfills instantly,
+    /// #112), so a source with many embedded tracks (99 in the field repro, mostly bitmap) climbed
+    /// toward N x perStreamByteCap (~3.2GB) and the host hit the iOS jetsam limit. This is the
+    /// ceiling on the SUM across all streams: the active drain targets are protected and keep their
+    /// full per-stream window; the coldest non-protected streams evict oldest-first past this budget.
+    /// Sized for the two drain channels (primary + secondary, up to perStreamByteCap each) plus slack
+    /// so a just-switched-away track stays warm for an instant switch-back.
+    static let aggregateByteCap: Int = 96 * 1024 * 1024
 
     /// Ceiling for one in-assembly PGS display set (a 4K set stays far below this); a pending
     /// buffer past it is malformed or mis-parsed and gets dropped rather than grown unbounded.
     static let maxPendingDisplaySetBytes: Int = 16 * 1024 * 1024
 
     /// #151: which reader is writing. The pump and the forward prefetcher can both feed the same
-    /// stream; completed entries dedupe by PTS in appendLocked, but an in-assembly display set
-    /// must stay private to its writer or the two would interleave chunks into one corrupt set.
+    /// stream; a completed entry re-harvested by the other collapses on a byte-identical payload in
+    /// appendLocked (#235: the PTS alone does not identify it), but an in-assembly display set must
+    /// stay private to its writer or the two would interleave chunks into one corrupt set.
     enum Writer: Hashable, Sendable {
         case pump
         case prefetch
@@ -71,12 +89,10 @@ final class SubtitlePacketStore: @unchecked Sendable {
     private var pendingSetByStream: [PendingKey: PendingDisplaySet] = [:]
     private var sequenceCounter: UInt64 = 0
     private var bitmapStreamIndices: Set<Int32> = []
-    private var activeStreamIndices: Set<Int32> = []
 
-    /// Classify which streams are bitmap-coded (PGS/DVB/DVD/XSUB); drives session-budget eviction
-    /// priority (below) and the drainer's PGS-anchor backscan. Set once when the tap arms
-    /// (idempotent - safe to call again on every producer restart). Unclassified streams are
-    /// treated as text: never session-evicted, never anchor-backscanned.
+    /// Classify which streams are bitmap-coded (PGS/DVB/DVD/XSUB); drives the drainer's
+    /// PGS-anchor backscan. Set once when the tap arms (idempotent - safe to call again on every
+    /// producer restart). Unclassified streams are treated as text: never anchor-backscanned.
     func markBitmapStreams(_ indices: Set<Int32>) {
         lock.lock(); bitmapStreamIndices = indices; lock.unlock()
     }
@@ -87,82 +103,156 @@ final class SubtitlePacketStore: @unchecked Sendable {
         return bitmapStreamIndices.contains(streamIndex)
     }
 
-    /// Streams the drainer is currently decoding (primary + secondary channel targets); protected
-    /// from session-wide eviction even while over budget. Updated by the engine every drain tick.
-    func setActiveStreams(_ indices: Set<Int32>) {
-        lock.lock(); activeStreamIndices = indices; lock.unlock()
+    /// Instance caps (default to the static ceilings). Injectable so tests can drive eviction with
+    /// tiny payloads instead of allocating gigabytes.
+    private let perStreamCap: Int
+    private let aggregateCap: Int
+
+    /// #166 aggregate-budget bookkeeping. `totalBytes` mirrors the sum of `bytesByStream` (kept
+    /// incrementally so the per-append check is O(1)). `protectedStreams` are the active drain
+    /// targets, never evicted by aggregate pressure. `lastTouchByStream` orders non-protected
+    /// streams coldest-first for eviction; a monotonic counter (no wall clock) drives it.
+    private var totalBytes: Int = 0
+    private var protectedStreams: Set<Int32> = []
+    private var lastTouchByStream: [Int32: UInt64] = [:]
+    private var touchCounter: UInt64 = 0
+
+    init(perStreamByteCap: Int = SubtitlePacketStore.perStreamByteCap,
+         aggregateByteCap: Int = SubtitlePacketStore.aggregateByteCap) {
+        self.perStreamCap = perStreamByteCap
+        self.aggregateCap = aggregateByteCap
+    }
+
+    /// Total retained compressed subtitle bytes across every stream. Introspection for the
+    /// aggregate-budget invariant (and available to `memprobe`-style diagnostics).
+    var totalRetainedBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return totalBytes
+    }
+
+    /// #166: mark the currently selected drain targets (primary + secondary). Protected streams are
+    /// exempt from aggregate eviction, so a switch back to them still backfills from a full window.
+    /// The engine calls this whenever `subtitleDrainTargets` changes.
+    func setProtectedStreams(_ indices: Set<Int32>) {
+        lock.lock(); defer { lock.unlock() }
+        protectedStreams = indices
     }
 
     func append(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
-                flags: Int32 = 0, payload: Data) {
+                flags: Int32 = 0, payload: Data, webvttSettings: String? = nil) {
         lock.lock(); defer { lock.unlock() }
         appendLocked(streamIndex: streamIndex, ptsSeconds: ptsSeconds,
-                     durationSeconds: durationSeconds, flags: flags, payload: payload)
+                     durationSeconds: durationSeconds, flags: flags, payload: payload,
+                     webvttSettings: webvttSettings)
     }
 
     /// Same-PTS packets are DISTINCT subtitle events in general (multiple simultaneous PGS objects
     /// in one display set, or two independent text lines), not necessarily a producer-restart
-    /// replay - only an EXACT duplicate (identical pts + duration + flags + payload) is the replay
-    /// case and gets deduped; everything else is inserted as its own entry, ordered after any
-    /// existing same-pts run so arrival order matches `sequence` order.
+    /// replay - only a byte-identical payload on the same pts is the replay case and collapses
+    /// (#235); everything else is inserted as its own entry, ordered after any existing same-pts
+    /// run so arrival order matches `sequence` order.
     private func appendLocked(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
-                              flags: Int32, payload: Data) {
+                              flags: Int32, payload: Data, webvttSettings: String? = nil) {
+        let before = bytesByStream[streamIndex] ?? 0
         var entries = entriesByStream[streamIndex] ?? []
-        var bytes = bytesByStream[streamIndex] ?? 0
-
-        let upperBound = entries.firstIndex { $0.ptsSeconds > ptsSeconds } ?? entries.count
-        var lowerBound = upperBound
-        while lowerBound > 0, entries[lowerBound - 1].ptsSeconds == ptsSeconds {
-            lowerBound -= 1
+        var bytes = before
+        // #235: several packets legitimately share a PTS. ASS/SSA authors overlapping lines on
+        // identical Start/End, and a karaoke or layered-style track puts a whole burst of distinct
+        // Dialogue events on one timestamp. Only a byte-identical payload is the pump and the
+        // prefetcher re-harvesting the same packet (#151), and only that collapses. Anything else
+        // joins the end of the run, so a shared timestamp reaches the drainer in harvest order:
+        // the drainer decodes a window in array order and later events layer over earlier ones.
+        var probe = Self.lowerBound(entries, ptsSeconds)
+        var duplicateIndex: Int?
+        while probe < entries.count, entries[probe].ptsSeconds == ptsSeconds {
+            if entries[probe].payload == payload {
+                duplicateIndex = probe
+                break
+            }
+            probe += 1
         }
-        if entries[lowerBound..<upperBound].contains(where: {
-            $0.durationSeconds == durationSeconds && $0.flags == flags && $0.payload == payload
-        }) {
-            return
+        // Sequence stamping: a fresh insert gets the next store-monotonic value; a byte-identical
+        // replacement KEEPS the original's sequence, so a re-harvest of a packet the drain cursor
+        // already passed cannot resurface above its sequence floor and be decoded twice.
+        let sequence: UInt64
+        if let duplicateIndex {
+            sequence = entries[duplicateIndex].sequence
+        } else {
+            sequenceCounter += 1
+            sequence = sequenceCounter
         }
-
-        sequenceCounter += 1
-        let entry = StoredSubtitlePacket(sequence: sequenceCounter,
+        let entry = StoredSubtitlePacket(sequence: sequence,
                                          ptsSeconds: ptsSeconds,
                                          durationSeconds: durationSeconds,
                                          flags: flags,
-                                         payload: payload)
-        entries.insert(entry, at: upperBound)
+                                         payload: payload,
+                                         webvttSettings: webvttSettings)
+        if let duplicateIndex {
+            bytes -= entries[duplicateIndex].payload.count
+            entries[duplicateIndex] = entry
+        } else {
+            entries.insert(entry, at: probe)
+        }
         bytes += payload.count
-        while bytes > Self.perStreamByteCap, entries.count > 1 {
+        while bytes > perStreamCap, entries.count > 1 {
             bytes -= entries.removeFirst().payload.count
         }
         entriesByStream[streamIndex] = entries
         bytesByStream[streamIndex] = bytes
-        enforceSessionBudgetLocked()
+        totalBytes += bytes - before
+        touchCounter &+= 1
+        lastTouchByStream[streamIndex] = touchCounter
+        enforceAggregateCapLocked(justTouched: streamIndex)
     }
 
-    /// Session-wide eviction (called under `lock`, after every append). Evicts the oldest packet
-    /// from the largest INACTIVE bitmap stream's backlog, repeating until the session total is
-    /// back under budget or no eligible candidate remains; text streams and `activeStreamIndices`
-    /// are never touched here, so this can leave the session over budget when the active stream(s)
-    /// alone exceed it - by design, the drainer needs that data.
-    private func enforceSessionBudgetLocked() {
-        var total = bytesByStream.values.reduce(0, +)
-        guard total > Self.sessionByteCap else { return }
-        var candidates = bitmapStreamIndices.subtracting(activeStreamIndices)
-        while total > Self.sessionByteCap, !candidates.isEmpty {
-            guard let idx = candidates.max(by: { (bytesByStream[$0] ?? 0) < (bytesByStream[$1] ?? 0) }),
-                  (bytesByStream[idx] ?? 0) > 0 else { break }
-            guard var entries = entriesByStream[idx], !entries.isEmpty else {
-                candidates.remove(idx)
-                continue
+    /// First index at or past `ptsSeconds` in a PTS-sorted run. Harvest is near-monotonic, but the
+    /// forward prefetcher (#151) backfills far behind the frontier, so the position is searched
+    /// rather than assumed. Searched in log time rather than scanned from the front: the scan made
+    /// one append O(n) and a session's harvest O(n^2) in retained packets, which #235 turned from
+    /// academic into load-bearing, since a dense ASS track now keeps every event on a shared
+    /// timestamp instead of collapsing the burst to one entry.
+    static func lowerBound(_ entries: [StoredSubtitlePacket], _ ptsSeconds: Double) -> Int {
+        var low = 0
+        var high = entries.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if entries[mid].ptsSeconds < ptsSeconds {
+                low = mid + 1
+            } else {
+                high = mid
             }
-            let removed = entries.removeFirst()
-            bytes(idx, delta: -removed.payload.count)
-            entriesByStream[idx] = entries
-            total -= removed.payload.count
-            if entries.isEmpty { candidates.remove(idx) }
         }
+        return low
     }
 
-    private func bytes(_ streamIndex: Int32, delta: Int) {
-        bytesByStream[streamIndex] = (bytesByStream[streamIndex] ?? 0) + delta
+    /// #166: bound retained bytes across ALL streams. Evict oldest entries from the coldest
+    /// (least-recently-touched) NON-protected stream first, then the next coldest, until the total
+    /// is back under `aggregateCap` or only protected streams remain. Protected streams (the active
+    /// drain targets) and the stream just written keep their per-stream window; a fully drained
+    /// cold stream is dropped and re-harvested from the pump/prefetcher if it is selected later.
+    private func enforceAggregateCapLocked(justTouched: Int32) {
+        guard totalBytes > aggregateCap else { return }
+        let candidates = bytesByStream.keys
+            .filter { !protectedStreams.contains($0) && $0 != justTouched }
+            .sorted { (lastTouchByStream[$0] ?? 0) < (lastTouchByStream[$1] ?? 0) }
+        for idx in candidates {
+            guard totalBytes > aggregateCap else { break }
+            guard var entries = entriesByStream[idx] else { continue }
+            var bytes = bytesByStream[idx] ?? 0
+            while totalBytes > aggregateCap, !entries.isEmpty {
+                let removed = entries.removeFirst().payload.count
+                bytes -= removed
+                totalBytes -= removed
+            }
+            if entries.isEmpty {
+                entriesByStream[idx] = nil
+                bytesByStream[idx] = nil
+                lastTouchByStream[idx] = nil
+            } else {
+                entriesByStream[idx] = entries
+                bytesByStream[idx] = bytes
+            }
+        }
     }
 
     /// Shared pump-side harvest for both hosts: convert a raw AVPacket into a stored entry on
@@ -186,21 +276,24 @@ final class SubtitlePacketStore: @unchecked Sendable {
                      flags: packet.pointee.flags,
                      payload: Data(bytes: data, count: Int(packet.pointee.size)),
                      assembleSplitDisplaySets: assembleSplitDisplaySets,
-                     writer: writer)
+                     writer: writer,
+                     webvttSettings: WebVTTCueSettings.settings(onPacket: packet))
     }
 
     /// Testable core of `harvest`. ptsSeconds nil = packet carried no PTS (AV_NOPTS_VALUE):
     /// dropped on the per-packet path, folded into the pending set on the assembly path.
     func harvestChunk(streamIndex: Int32, ptsSeconds: Double?, durationSeconds: Double,
                       flags: Int32, payload: Data, assembleSplitDisplaySets: Bool,
-                      writer: Writer = .pump) {
+                      writer: Writer = .pump, webvttSettings: String? = nil) {
         lock.lock(); defer { lock.unlock() }
         guard assembleSplitDisplaySets else {
             guard let ptsSeconds else { return }
             appendLocked(streamIndex: streamIndex, ptsSeconds: ptsSeconds,
-                         durationSeconds: durationSeconds, flags: flags, payload: payload)
+                         durationSeconds: durationSeconds, flags: flags, payload: payload,
+                         webvttSettings: webvttSettings)
             return
         }
+        // The assembly path below is PGS display sets; those carry no WebVTT settings.
         // Mirror the decoder's SUP-wrapper rule: strip a leading "PG" 10-byte header so
         // concatenated chunks form one clean [type][len BE][body] segment run.
         var chunk = payload
@@ -329,8 +422,10 @@ final class SubtitlePacketStore: @unchecked Sendable {
         for (idx, entries) in entriesByStream {
             let kept = entries.drop { $0.ptsSeconds < cutoff }
             if kept.count != entries.count {
+                let newBytes = kept.reduce(0) { $0 + $1.payload.count }
+                totalBytes += newBytes - (bytesByStream[idx] ?? 0)
                 entriesByStream[idx] = Array(kept)
-                bytesByStream[idx] = kept.reduce(0) { $0 + $1.payload.count }
+                bytesByStream[idx] = newBytes
             }
         }
     }
@@ -340,5 +435,9 @@ final class SubtitlePacketStore: @unchecked Sendable {
         entriesByStream.removeAll()
         bytesByStream.removeAll()
         pendingSetByStream.removeAll()
+        lastTouchByStream.removeAll()
+        protectedStreams.removeAll()
+        totalBytes = 0
+        touchCounter = 0
     }
 }

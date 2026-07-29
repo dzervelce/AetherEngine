@@ -29,6 +29,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Native VideoToolbox gets this from the container automatically; the software path must attach it explicitly.
     private var streamSAR = AVRational(num: 1, den: 1)
 
+    /// #177: first sane non-square SAR of the stream. Once latched, every frame attaches this value;
+    /// interlaced sources can oscillate SAR per-field and a garbage AVCodecContext value (1088:1 seen
+    /// in the field) must never flicker the display geometry. Guarded by `lock` (set inside emit).
+    private var latchedSAR: AVRational?
+    private var loggedSARLatch = false
+
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolWidth = 0
     private var poolHeight = 0
@@ -70,6 +76,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// the VT branch in emit()). Created lazily on the first hw frame; guarded by `lock`.
     private var transferSession: VTPixelTransferSession?
     private var loggedTransferFailure = false
+
+    /// #220: a send failure that survives the drain-and-retry is release-visible once per
+    /// decoder, so a wedge that is a genuine decode error is distinguishable in a field log
+    /// from one that is not.
+    private var loggedSendFailure = false
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
@@ -131,13 +142,57 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
     }
 
+    /// What to do with a packet after `avcodec_send_packet` returned `ret` (#220).
+    enum PacketSendDisposition: Equatable {
+        /// The decoder took the packet.
+        case accepted
+        /// `AVERROR(EAGAIN)`: the packet was NOT consumed. The decoder's output queue is full
+        /// and has to be read before it accepts more input, which is legal at any time under
+        /// frame threading (a packet that yields no frame, reorder delay, thread_count packets
+        /// in flight). Drain, then send the same packet again.
+        case drainAndRetry
+        /// A real decode error. Drop the packet; the decoder stays usable for the next one.
+        case dropped
+    }
+
+    nonisolated static func disposition(forSendResult ret: Int32) -> PacketSendDisposition {
+        if ret >= 0 { return .accepted }
+        return ret == FFmpegErr.eagain ? .drainAndRetry : .dropped
+    }
+
+    /// Feed one packet and deliver whatever the decoder produces.
+    ///
+    /// #220: this used to `return` on any negative send result without draining. EAGAIN is not
+    /// an error, and returning on it both dropped the packet and left the output queue full, so
+    /// every subsequent send hit the same wall: video wedged permanently until a seek flushed
+    /// the decoder, while audio kept playing.
     func decode(packet: UnsafeMutablePointer<AVPacket>) {
         lock.lock()
         guard let ctx = codecContext else { lock.unlock(); return }
+        var sendRet = avcodec_send_packet(ctx, packet)
+        lock.unlock()
 
-        let sendRet = avcodec_send_packet(ctx, packet)
-        guard sendRet >= 0 else { lock.unlock(); return }
+        if Self.disposition(forSendResult: sendRet) == .drainAndRetry {
+            drainDecodedFrames()
+            lock.lock()
+            sendRet = codecContext == nil ? FFmpegErr.einval : avcodec_send_packet(ctx, packet)
+            lock.unlock()
+        }
+        if Self.disposition(forSendResult: sendRet) == .dropped, !loggedSendFailure {
+            loggedSendFailure = true
+            EngineLog.emit("[SWDecoder] send_packet returned \(sendRet); packet dropped (logged once)",
+                           category: .swPlayback)
+        }
+        // Drain regardless: a dropped packet does not invalidate frames the decoder already holds.
+        drainDecodedFrames()
+    }
 
+    /// Pull every frame the decoder can currently produce, through the deinterlacer when one is
+    /// active. Exits on EAGAIN (needs more input) or EOF, the same condition the receive loop
+    /// has always used.
+    private func drainDecodedFrames() {
+        lock.lock()
+        guard let ctx = codecContext else { lock.unlock(); return }
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         guard let f = frame else { lock.unlock(); return }
         lock.unlock()
@@ -498,14 +553,57 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Pixel Aspect Ratio (anamorphic SD)
 
-    /// Attach SAR as kCVImageBufferPixelAspectRatioKey for anamorphic content.
-    /// Prefers frame's own SAR, falls back to streamSAR; skips attachment for square pixels (0:0 or 1:1).
+    /// #177 sanity gate: reject unset (0:x), negative, and garbage SARs. AVCodecContext has been
+    /// seen carrying 1088:1 on live TS; no legitimate pixel aspect ratio needs values above 256.
+    static func saneSAR(_ sar: AVRational) -> AVRational? {
+        guard sar.num > 0, sar.den > 0, sar.num <= 256, sar.den <= 256 else { return nil }
+        return sar
+    }
+
+    /// #177 resolution order: frame -> codec context -> stream, first sane wins. The frame usually
+    /// carries its own (MPEG-2 seq header from frame 1); the codec context covers codecs that only
+    /// populate it there; the container-declared stream SAR is the last resort.
+    static func resolveSAR(frame: AVRational, codecCtx: AVRational, stream: AVRational) -> AVRational? {
+        saneSAR(frame) ?? saneSAR(codecCtx) ?? saneSAR(stream)
+    }
+
+    /// #177 per-stream latch: the first sane non-square SAR wins for the rest of the stream, so
+    /// per-field oscillation on interlaced content cannot flicker the display geometry. Square or
+    /// unknown SAR before any latch attaches nothing (coded dimensions are correct then).
+    static func sarForAttachment(
+        resolved: AVRational?, latched: AVRational?
+    ) -> (attach: AVRational?, latch: AVRational?) {
+        if let latched { return (latched, latched) }
+        guard let resolved, resolved.num != resolved.den else { return (nil, nil) }
+        return (resolved, resolved)
+    }
+
+    /// Attach SAR as kCVImageBufferPixelAspectRatioKey for anamorphic content. The renderer keys
+    /// its CMVideoFormatDescription cache on this attachment (#177), so it must be stable per stream.
     private func attachPixelAspectRatio(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
-        var sar = frame.pointee.sample_aspect_ratio
-        if sar.num <= 0 || sar.den <= 0 {
-            sar = streamSAR
+        let ctxSAR = codecContext?.pointee.sample_aspect_ratio ?? AVRational(num: 0, den: 1)
+        let resolved = Self.resolveSAR(
+            frame: frame.pointee.sample_aspect_ratio,
+            codecCtx: ctxSAR,
+            stream: streamSAR
+        )
+        let (attach, latch) = Self.sarForAttachment(resolved: resolved, latched: latchedSAR)
+        latchedSAR = latch
+        guard let sar = attach else {
+            // Recycled pool buffers can carry a stale attachment from an earlier frame.
+            CVBufferRemoveAttachment(pb, kCVImageBufferPixelAspectRatioKey)
+            return
         }
-        guard sar.num > 0, sar.den > 0, sar.num != sar.den else { return }
+        if !loggedSARLatch {
+            loggedSARLatch = true
+            let frameSAR = frame.pointee.sample_aspect_ratio
+            EngineLog.emit(
+                "[SWDecoder] SAR latched \(sar.num):\(sar.den) "
+                + "(frame=\(frameSAR.num):\(frameSAR.den) ctx=\(ctxSAR.num):\(ctxSAR.den) "
+                + "stream=\(streamSAR.num):\(streamSAR.den))",
+                category: .swPlayback
+            )
+        }
 
         let aspect: NSDictionary = [
             kCVImageBufferPixelAspectRatioHorizontalSpacingKey: Int(sar.num),
