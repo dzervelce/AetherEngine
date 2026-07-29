@@ -2604,7 +2604,7 @@ private func seekCallback(
 
 // MARK: - Errors
 
-enum AVIOReaderError: Error, CustomStringConvertible {
+enum AVIOReaderError: Error, Equatable, CustomStringConvertible {
     case allocationFailed
     case noResponse
     case requestTimeout
